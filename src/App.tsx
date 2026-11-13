@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import ConfigBar from "./components/ConfigBar";
+import HistoryPanel from "./components/HistoryPanel";
 import LogPanel from "./components/LogPanel";
 import PoolPanel from "./components/PoolPanel";
 import ResultsTable from "./components/ResultsTable";
@@ -9,6 +10,7 @@ import { selectSettings, selectUi, useSettingsStore } from "./store/settings";
 import { usePoolStore } from "./store/pool";
 import { useLogsStore } from "./store/logs";
 import { subscribeProbeProgress, useProbeStore } from "./store/probe";
+import { formatBytes, isOverDbLimit, useHistoryStore } from "./store/history";
 
 export default function App() {
   const settings = useSettingsStore(selectSettings);
@@ -16,12 +18,24 @@ export default function App() {
   const saveError = useSettingsStore((state) => state.saveError);
   const load = useSettingsStore((state) => state.load);
   const patch = useSettingsStore((state) => state.patch);
+  const dbBytes = useHistoryStore((state) => state.dbBytes);
+  const probeRunId = useProbeStore((state) => state.batch.runId);
   const dragRef = useRef<{ y: number; h: number } | null>(null);
 
   // 启动时读取本地设置，回填配置、列宽与优选源文本。
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 数据库体积在状态栏与顶栏常驻显示。
+  useEffect(() => {
+    void useHistoryStore.getState().loadSize();
+  }, []);
+
+  // 每跑完一轮测试，库会变大，及时刷新顶栏体积。
+  useEffect(() => {
+    if (probeRunId) void useHistoryStore.getState().loadSize();
+  }, [probeRunId]);
 
   // 读取上次的池；首次使用还没有源清单时自动抓一次 bestcf 页面。
   useEffect(() => {
@@ -130,6 +144,8 @@ export default function App() {
         />
       </div>
 
+      <HistoryPanel />
+
       <footer className="h-7 shrink-0 flex items-center gap-3 px-4 border-t border-line bg-panel text-[12px] text-dim">
         <span className="flex items-center gap-1.5">
           <Dot tone={saveError ? "err" : "ok"} /> {saveError ? "设置未保存" : "就绪"}
@@ -139,7 +155,11 @@ export default function App() {
         <span className="text-line-2">|</span>
         <span className="num">%APPDATA%\com.asonnychen.vpm-search\logs</span>
         <span className="ml-auto num">
-          日志 3 类 · 保留 {settings.logRetention.appDays} 天 · 数据库 12.4 MB
+          日志 3 类 · 保留 {settings.logRetention.appDays} 天 ·{" "}
+          <span className={isOverDbLimit(dbBytes) ? "text-warn" : undefined}>
+            数据库 {formatBytes(dbBytes)}
+            {isOverDbLimit(dbBytes) ? "（超过 50MB，请清理）" : ""}
+          </span>
         </span>
       </footer>
     </div>

@@ -1,6 +1,11 @@
 import { Dot, Divider } from "./ui";
+import { formatBytes, isOverDbLimit, useHistoryStore } from "../store/history";
 
 export default function TopBar() {
+  const dbBytes = useHistoryStore((state) => state.dbBytes);
+  const openPanel = useHistoryStore((state) => state.openPanel);
+  const overLimit = isOverDbLimit(dbBytes);
+
   return (
     <header className="h-12 shrink-0 flex items-center gap-3 px-4 border-b border-line bg-panel relative z-10">
       <div className="flex items-center gap-2.5">
@@ -44,13 +49,32 @@ export default function TopBar() {
       </div>
 
       <div className="ml-auto flex items-center gap-2">
-        <span className="hidden lg:inline-flex items-center gap-1.5 h-7 px-2 border border-line rounded-[3px] text-[12px] text-muted bg-panel-2/60">
+        <span className="inline-flex items-center gap-1.5 h-7 px-2 border border-line rounded-[3px] text-[12px] text-muted bg-panel-2/60">
           <Dot tone="ok" />
           系统代理已绕过
         </span>
-        <span className="inline-flex items-center gap-1.5 h-7 px-2 border border-line rounded-[3px] text-[12px] text-muted bg-panel-2/60">
-          <Dot tone="ok" />
-          DB 12.4 MB
+        <button
+          type="button"
+          onClick={() => void openPanel()}
+          className="inline-flex items-center gap-1.5 h-7 px-2 border border-line rounded-[3px] text-[12px] text-muted bg-panel-2/60 hover:text-accent hover:border-accent-dim"
+          title="按测试轮次回看历史结果"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 7v5l3.5 2" />
+          </svg>
+          历史
+        </button>
+        <span
+          className={
+            overLimit
+              ? "inline-flex items-center gap-1.5 h-7 px-2 border border-warn/50 rounded-[3px] text-[12px] text-warn bg-warn/[0.06]"
+              : "inline-flex items-center gap-1.5 h-7 px-2 border border-line rounded-[3px] text-[12px] text-muted bg-panel-2/60"
+          }
+          title={overLimit ? "数据库超过 50MB，请在历史里按轮次清理" : "数据库体积"}
+        >
+          <Dot tone={overLimit ? "warn" : "ok"} />
+          DB {formatBytes(dbBytes)}
         </span>
         <button
           type="button"

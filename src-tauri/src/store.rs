@@ -229,6 +229,8 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct Store {
     conn: Connection,
+    /// 数据库文件路径；内存库为 `None`，体积按页数统计。
+    path: Option<std::path::PathBuf>,
 }
 
 impl Store {
@@ -240,7 +242,10 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         Self::configure(&conn)?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -250,7 +255,7 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
-        let store = Self { conn };
+        let store = Self { conn, path: None };
         store.migrate()?;
         Ok(store)
     }
@@ -861,6 +866,101 @@ impl Store {
             )
             .optional()?)
     }
+
+    /// 历史入口的轮次列表：按开始时间倒序，附本轮实际落库的地址数。
+    ///
+    /// `result_count` 与 `total` 分开：停止的轮次、独立测速 / 归属地查询
+    /// 都可能让两者不一致，历史里应展示真实存在的行数。
+    pub fn list_test_runs(&self) -> Result<Vec<TestRunSummaryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.started_at, r.finished_at, r.params_json, r.total,
+                    r.ok_count, r.timeout_count, r.fail_count,
+                    (SELECT COUNT(*) FROM test_result tr WHERE tr.run_id = r.id)
+             FROM test_run r
+             ORDER BY r.started_at DESC, r.rowid DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TestRunSummaryRow {
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                finished_at: row.get(2)?,
+                params_json: row.get(3)?,
+                total: row.get::<_, i64>(4)?.max(0) as u32,
+                ok_count: row.get::<_, i64>(5)?.max(0) as u32,
+                timeout_count: row.get::<_, i64>(6)?.max(0) as u32,
+                fail_count: row.get::<_, i64>(7)?.max(0) as u32,
+                result_count: row.get::<_, i64>(8)?.max(0) as u32,
+            })
+        })?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
+    /// 按轮次整轮删除（结果行随外键级联删除），随后 `VACUUM` 让文件真正收缩。
+    ///
+    /// 返回是否删到了该轮；不存在的 runId 返回 `false`，不当作错误。
+    pub fn delete_test_run(&self, run_id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM test_run WHERE id = ?1", [run_id])?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        // 语句缓存会占住数据库，VACUUM 前先释放。
+        self.conn.flush_prepared_statement_cache();
+        self.conn.execute_batch("VACUUM")?;
+        Ok(true)
+    }
+
+    /// 数据库体积（字节）。文件库取文件大小，内存库按页数换算。
+    pub fn database_size_bytes(&self) -> Result<u64> {
+        if let Some(path) = &self.path {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if metadata.len() > 0 {
+                    return Ok(metadata.len());
+                }
+            }
+        }
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(page_count.max(0) as u64 * page_size.max(0) as u64)
+    }
+
+    /// 同一地址跨轮次的延迟与速度序列，按开始时间升序。
+    ///
+    /// 只读事实记录：每一轮一行，不合并、不覆盖。
+    pub fn list_address_history(&self, host: &str, port: u16) -> Result<Vec<AddressRunPoint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tr.run_id, r.started_at, tr.latency_ms, tr.status,
+                    tr.speed_mbps, tr.speed_status
+             FROM test_result tr
+             JOIN test_run r ON r.id = tr.run_id
+             WHERE tr.host = ?1 AND tr.port = ?2
+             ORDER BY r.started_at ASC, r.rowid ASC, tr.id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![host, i64::from(port)], |row| {
+            Ok(AddressRunPoint {
+                run_id: row.get(0)?,
+                started_at: row.get(1)?,
+                latency_ms: row.get::<_, Option<i64>>(2)?.map(|ms| ms.max(0) as u64),
+                status: row.get(3)?,
+                speed_mbps: row.get(4)?,
+                speed_status: row.get(5)?,
+            })
+        })?;
+        let mut points = Vec::new();
+        for row in rows {
+            points.push(row?);
+        }
+        Ok(points)
+    }
 }
 
 /// 一条测试轮次的写入参数。
@@ -925,6 +1025,31 @@ pub struct TestRunRow {
     pub ok_count: u32,
     pub timeout_count: u32,
     pub fail_count: u32,
+}
+
+/// 历史入口的一行：轮次统计 + 实际结果行数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRunSummaryRow {
+    pub id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub params_json: String,
+    pub total: u32,
+    pub ok_count: u32,
+    pub timeout_count: u32,
+    pub fail_count: u32,
+    pub result_count: u32,
+}
+
+/// 同一地址在某一轮的结果，跨轮对比用。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddressRunPoint {
+    pub run_id: String,
+    pub started_at: String,
+    pub latency_ms: Option<u64>,
+    pub status: String,
+    pub speed_mbps: Option<f64>,
+    pub speed_status: String,
 }
 
 /// `pool_source` 的一行，直接给前端用。
@@ -1346,6 +1471,208 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.list_geo_cache().unwrap().len(), 1);
+    }
+
+    fn seed_run(
+        store: &Store,
+        id: &str,
+        started_at: &str,
+        params_json: &str,
+        rows: &[(&str, u16, crate::probe::ProbeOutcome)],
+    ) {
+        let mut ok = 0;
+        let mut timeout = 0;
+        let mut fail = 0;
+        for (_, _, outcome) in rows {
+            match outcome.status {
+                crate::probe::ProbeStatus::Ok => ok += 1,
+                crate::probe::ProbeStatus::Timeout => timeout += 1,
+                crate::probe::ProbeStatus::Fail => fail += 1,
+                crate::probe::ProbeStatus::Untested => {}
+            }
+        }
+        store
+            .insert_test_run(&TestRunRecord {
+                id,
+                started_at,
+                finished_at: started_at,
+                params_json,
+                total: rows.len() as u32,
+                ok_count: ok,
+                timeout_count: timeout,
+                fail_count: fail,
+            })
+            .unwrap();
+        for (host, port, outcome) in rows {
+            store
+                .insert_test_result(
+                    id,
+                    &crate::probe::Endpoint::new((*host).to_string(), *port),
+                    "别名",
+                    outcome,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn 历史轮次列表带统计参数与地址数() {
+        let store = Store::open_in_memory().unwrap();
+        seed_run(
+            &store,
+            "run-old",
+            "2026-11-12T08:00:00.000Z",
+            r#"{"samples":3,"concurrency":10}"#,
+            &[
+                ("104.16.1.1", 8443, crate::probe::ProbeOutcome::ok(88)),
+                (
+                    "104.16.1.2",
+                    8443,
+                    crate::probe::ProbeOutcome::timeout("10s 内未收到响应"),
+                ),
+            ],
+        );
+        seed_run(
+            &store,
+            "run-new",
+            "2026-11-13T08:00:00.000Z",
+            r#"{"mode":"speed"}"#,
+            &[(
+                "104.16.1.1",
+                8443,
+                crate::probe::ProbeOutcome::fail("连接被拒绝"),
+            )],
+        );
+
+        let runs = store.list_test_runs().unwrap();
+        assert_eq!(runs.len(), 2);
+        // 最近的轮次排在最前。
+        assert_eq!(runs[0].id, "run-new");
+        assert_eq!(runs[1].id, "run-old");
+        assert_eq!(runs[1].total, 2);
+        assert_eq!(
+            (runs[1].ok_count, runs[1].timeout_count, runs[1].fail_count),
+            (1, 1, 0)
+        );
+        // 地址数按实际落库的结果行统计，与 total 分开。
+        assert_eq!(runs[1].result_count, 2);
+        assert_eq!(runs[0].result_count, 1);
+        assert_eq!(runs[0].params_json, r#"{"mode":"speed"}"#);
+    }
+
+    #[test]
+    fn 同一地址跨轮序列按时间升序并带速度() {
+        let store = Store::open_in_memory().unwrap();
+        // 故意先插较晚的一轮，验证排序靠开始时间而不是写入顺序。
+        seed_run(
+            &store,
+            "run-late",
+            "2026-11-13T08:00:00.000Z",
+            "{}",
+            &[("104.16.1.1", 8443, crate::probe::ProbeOutcome::ok(80))],
+        );
+        store
+            .upsert_test_result_speed(
+                "run-late",
+                &crate::probe::Endpoint::new("104.16.1.1".to_string(), 8443),
+                "别名",
+                &crate::probe::speed::SpeedOutcome::ok(5.5),
+            )
+            .unwrap();
+        seed_run(
+            &store,
+            "run-early",
+            "2026-11-12T08:00:00.000Z",
+            "{}",
+            &[("104.16.1.1", 8443, crate::probe::ProbeOutcome::ok(100))],
+        );
+        // 另一个地址不进入序列。
+        seed_run(
+            &store,
+            "run-other",
+            "2026-11-14T08:00:00.000Z",
+            "{}",
+            &[("104.16.1.2", 8443, crate::probe::ProbeOutcome::ok(20))],
+        );
+
+        let series = store.list_address_history("104.16.1.1", 8443).unwrap();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].run_id, "run-early");
+        assert_eq!(series[0].started_at, "2026-11-12T08:00:00.000Z");
+        assert_eq!(series[0].latency_ms, Some(100));
+        assert_eq!(series[0].speed_mbps, None);
+        assert_eq!(series[1].run_id, "run-late");
+        assert_eq!(series[1].latency_ms, Some(80));
+        assert_eq!(series[1].speed_mbps, Some(5.5));
+        assert_eq!(series[1].speed_status, "ok");
+    }
+
+    #[test]
+    fn 数据库体积统计随写入增长() {
+        let store = Store::open_in_memory().unwrap();
+        let empty = store.database_size_bytes().unwrap();
+        assert!(empty > 0, "空库也应有体积");
+
+        let long_alias = "很长的别名".repeat(80);
+        let hosts: Vec<String> = (0..300).map(|i| format!("104.16.9.{i}")).collect();
+        let rows: Vec<(&str, u16, crate::probe::ProbeOutcome)> = hosts
+            .iter()
+            .map(|host| (host.as_str(), 8443, crate::probe::ProbeOutcome::ok(50)))
+            .collect();
+        seed_run(
+            &store,
+            "run-big",
+            "2026-11-13T08:00:00.000Z",
+            "{}",
+            &rows,
+        );
+        // 别名一并写大，确保页数明显变化。
+        store
+            .conn
+            .execute(
+                "UPDATE test_result SET alias = ?1 WHERE run_id = 'run-big'",
+                [long_alias],
+            )
+            .unwrap();
+
+        let grown = store.database_size_bytes().unwrap();
+        assert!(grown > empty, "写入后体积应增长：{empty} -> {grown}");
+    }
+
+    #[test]
+    fn 按轮删除只删该轮并收缩体积() {
+        let store = Store::open_in_memory().unwrap();
+        let alias = "别名".repeat(200);
+        let hosts: Vec<String> = (0..200).map(|i| format!("104.16.8.{i}")).collect();
+        for run_id in ["run-a", "run-b"] {
+            let rows: Vec<(&str, u16, crate::probe::ProbeOutcome)> = hosts
+                .iter()
+                .map(|host| (host.as_str(), 8443, crate::probe::ProbeOutcome::ok(50)))
+                .collect();
+            seed_run(
+                &store,
+                run_id,
+                "2026-11-13T08:00:00.000Z",
+                "{}",
+                &rows,
+            );
+        }
+        store
+            .conn
+            .execute("UPDATE test_result SET alias = ?1", [alias])
+            .unwrap();
+        let before = store.database_size_bytes().unwrap();
+
+        assert!(store.delete_test_run("run-a").unwrap());
+        assert_eq!(store.count_test_runs().unwrap(), 1);
+        assert_eq!(store.count_test_results().unwrap(), 200);
+        assert!(store.list_test_results("run-a").unwrap().is_empty());
+        assert_eq!(store.list_test_results("run-b").unwrap().len(), 200);
+
+        let after = store.database_size_bytes().unwrap();
+        assert!(after < before, "删除后体积应下降：{before} -> {after}");
+        // 已删除的轮次再删一次返回 false，不报错。
+        assert!(!store.delete_test_run("run-a").unwrap());
     }
 
     #[test]
