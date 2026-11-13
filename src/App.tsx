@@ -8,6 +8,7 @@ import { Dot } from "./components/ui";
 import { selectSettings, selectUi, useSettingsStore } from "./store/settings";
 import { usePoolStore } from "./store/pool";
 import { useLogsStore } from "./store/logs";
+import { subscribeProbeProgress, useProbeStore } from "./store/probe";
 
 export default function App() {
   const settings = useSettingsStore(selectSettings);
@@ -53,6 +54,22 @@ export default function App() {
         if (active) unlisten = fn;
         else fn();
       });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  // 订阅后端推来的批量进度（已完成 / 总数）。
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let active = true;
+    void subscribeProbeProgress((progress) => {
+      useProbeStore.getState().applyProgress(progress);
+    }).then((fn) => {
+      if (active) unlisten = fn;
+      else fn();
+    });
     return () => {
       active = false;
       unlisten?.();

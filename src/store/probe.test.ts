@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createProbeStore,
+  normalizeBatchReport,
   normalizeProbeResult,
   probeKey,
   type ProbePersistence,
@@ -15,6 +16,18 @@ function fakePersistence(
       latencyMs: 120,
       error: null,
     })),
+    startBatch: vi.fn(async () => ({
+      runId: "run-1",
+      total: 2,
+      completed: 2,
+      stopped: false,
+      counts: { ok: 1, timeout: 1, fail: 0, untested: 0 },
+      rows: [
+        { host: "104.16.1.1", port: 8443, alias: "", status: "ok", latencyMs: 80, error: null },
+        { host: "104.16.2.2", port: 8443, alias: "", status: "timeout", latencyMs: null, error: "超时" },
+      ],
+    })),
+    cancelBatch: vi.fn(async () => true),
     ...overrides,
   };
 }
@@ -116,5 +129,133 @@ describe("单条测试", () => {
     expect(result?.status).toBe("fail");
     expect(result?.error).toContain("数据库不可用");
     expect(store.getState().error).toContain("数据库不可用");
+  });
+});
+
+describe("批量测试", () => {
+  it("未测结果原样保留，不伪装成失败", () => {
+    expect(normalizeProbeResult({ status: "untested" })).toEqual({
+      status: "untested",
+      latencyMs: null,
+      error: null,
+    });
+  });
+
+  it("整轮结束后按 host:port 写入每一行", async () => {
+    const persistence = fakePersistence();
+    const store = createProbeStore(persistence);
+
+    await store.getState().startBatch();
+
+    expect(persistence.startBatch).toHaveBeenCalledTimes(1);
+    expect(store.getState().results["104.16.1.1:8443"].status).toBe("ok");
+    expect(store.getState().results["104.16.1.1:8443"].latencyMs).toBe(80);
+    expect(store.getState().results["104.16.2.2:8443"].status).toBe("timeout");
+    expect(store.getState().batch).toMatchObject({
+      running: false,
+      runId: "run-1",
+      completed: 2,
+      total: 2,
+      stopped: false,
+    });
+  });
+
+  it("进度事件更新已完成与总数", () => {
+    const store = createProbeStore(fakePersistence());
+    store.getState().applyProgress({ runId: "run-1", completed: 3, total: 8 });
+
+    expect(store.getState().batch).toMatchObject({
+      running: true,
+      runId: "run-1",
+      completed: 3,
+      total: 8,
+    });
+  });
+
+  it("测试进行中重复触发不会再起一轮", async () => {
+    let release: (value: unknown) => void = () => {};
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+    const persistence = fakePersistence({ startBatch: vi.fn(() => pending) });
+    const store = createProbeStore(persistence);
+
+    const first = store.getState().startBatch();
+    expect(store.getState().batch.running).toBe(true);
+    await store.getState().startBatch();
+
+    expect(persistence.startBatch).toHaveBeenCalledTimes(1);
+    release({
+      runId: "run-1",
+      total: 1,
+      completed: 1,
+      stopped: false,
+      counts: { ok: 1, timeout: 0, fail: 0, untested: 0 },
+      rows: [
+        { host: "104.16.1.1", port: 8443, alias: "", status: "ok", latencyMs: 80, error: null },
+      ],
+    });
+    await first;
+  });
+
+  it("停止按钮只发一次停止信号", async () => {
+    const persistence = fakePersistence();
+    const store = createProbeStore(persistence);
+
+    await store.getState().cancelBatch();
+    await store.getState().cancelBatch();
+
+    expect(persistence.cancelBatch).toHaveBeenCalledTimes(2);
+  });
+
+  it("停止后未开始的行落成未测", async () => {
+    const store = createProbeStore(
+      fakePersistence({
+        startBatch: vi.fn(async () => ({
+          runId: "run-2",
+          total: 3,
+          completed: 1,
+          stopped: true,
+          counts: { ok: 1, timeout: 0, fail: 0, untested: 2 },
+          rows: [
+            { host: "104.16.1.1", port: 8443, alias: "", status: "ok", latencyMs: 80, error: null },
+            { host: "104.16.2.2", port: 8443, alias: "", status: "untested", latencyMs: null, error: null },
+            { host: "104.16.3.3", port: 8443, alias: "", status: "untested", latencyMs: null, error: null },
+          ],
+        })),
+      }),
+    );
+
+    await store.getState().startBatch();
+
+    expect(store.getState().batch.stopped).toBe(true);
+    expect(store.getState().results["104.16.2.2:8443"].status).toBe("untested");
+    expect(store.getState().results["104.16.3.3:8443"].status).toBe("untested");
+  });
+
+  it("后端报错时结束运行状态并保留原因", async () => {
+    const store = createProbeStore(
+      fakePersistence({
+        startBatch: vi.fn(async () => {
+          throw new Error("未找到 sing-box");
+        }),
+      }),
+    );
+
+    await store.getState().startBatch();
+
+    expect(store.getState().batch.running).toBe(false);
+    expect(store.getState().error).toContain("sing-box");
+  });
+
+  it("坏数据归一成空报告", () => {
+    expect(normalizeBatchReport(null)).toEqual({
+      runId: "",
+      total: 0,
+      completed: 0,
+      stopped: false,
+      counts: { ok: 0, timeout: 0, fail: 0, untested: 0 },
+      rows: [],
+    });
   });
 });

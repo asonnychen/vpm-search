@@ -8,6 +8,7 @@ import {
   useSettingsStore,
 } from "../store/settings";
 import { activeTemplate, deleteTemplate } from "../store/template";
+import { selectProbeBatch, useProbeStore } from "../store/probe";
 
 export default function ConfigBar({
   open,
@@ -20,7 +21,15 @@ export default function ConfigBar({
   const templates = useSettingsStore(selectNodeTemplates);
   const speed = useSettingsStore(selectSpeedParams);
   const patch = useSettingsStore((state) => state.patch);
+  const batch = useProbeStore(selectProbeBatch);
+  const startBatch = useProbeStore((state) => state.startBatch);
+  const cancelBatch = useProbeStore((state) => state.cancelBatch);
   const [panel, setPanel] = useState<TemplatePanelMode | null>(null);
+
+  const percent =
+    batch.total > 0
+      ? Math.min(100, Math.round((batch.completed / batch.total) * 100))
+      : 0;
 
   const selected = activeTemplate(templates, settings.activeTemplateId);
 
@@ -59,12 +68,53 @@ export default function ConfigBar({
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Btn variant="secondary">抓取优选源</Btn>
-          <Btn variant="primary">一键测试真连接延迟</Btn>
+          <Btn
+            variant="primary"
+            disabled={batch.running}
+            title={batch.running ? "测试进行中，结束后才能再发起一轮" : "对整池地址跑一轮真连接延迟"}
+            onClick={() => void startBatch()}
+          >
+            {batch.running ? "测试中…" : "一键测试真连接延迟"}
+          </Btn>
           <Btn variant="accent">一键多线程测速</Btn>
-          <Btn variant="danger">停止</Btn>
+          <Btn
+            variant="danger"
+            disabled={!batch.running || batch.stopping}
+            title={batch.running ? "停止后已完成的保留，未开始的标记为未测" : "当前没有正在跑的测试"}
+            onClick={() => void cancelBatch()}
+          >
+            {batch.stopping ? "停止中…" : "停止"}
+          </Btn>
           <Btn variant="secondary">导出 txt</Btn>
         </div>
       </div>
+
+      {batch.running || batch.stopping ? (
+        <div className="flex items-center gap-3 px-4 py-1.5 border-t border-line bg-panel-2/40 text-[12px] text-dim">
+          <span className="whitespace-nowrap">
+            {batch.stopping ? "正在停止，已开始的会跑完" : "批量测试进行中"}
+          </span>
+          <span
+            className="h-1.5 flex-1 max-w-md bg-canvas ring-1 ring-line rounded-full overflow-hidden"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={batch.total}
+            aria-valuenow={batch.completed}
+          >
+            <span
+              className="block h-full bg-accent rounded-full transition-[width] duration-200"
+              style={{ width: `${percent}%` }}
+            />
+          </span>
+          <span className="num text-text w-10 text-right">{percent}%</span>
+          <span className="num whitespace-nowrap">
+            已完成 {batch.completed} / {batch.total}
+          </span>
+          {batch.runId ? (
+            <span className="num text-dim whitespace-nowrap">run {batch.runId}</span>
+          ) : null}
+        </div>
+      ) : null}
 
       {open ? (
         <div className="px-4 pb-3 pt-1 flex flex-wrap items-end gap-x-4 gap-y-3">

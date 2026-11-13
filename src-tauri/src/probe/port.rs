@@ -27,6 +27,16 @@ pub fn pick_free_port() -> Option<u16> {
     pick_free_port_in(PORT_START, PORT_END, is_taken)
 }
 
+/// 挑一个既没被系统占用、也不在 `used` 里的端口。
+///
+/// 槽位池在一个进程启动前就要把多条 lane 的端口一次选好，
+/// 只靠 bind 探测会在两次选择之间重复拿到同一个端口。
+pub fn pick_free_port_avoiding(used: &std::collections::HashSet<u16>) -> Option<u16> {
+    pick_free_port_in(PORT_START, PORT_END, |port| {
+        used.contains(&port) || is_taken(port)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +61,13 @@ mod tests {
     fn 生产区间落在_20000_到_29999() {
         assert_eq!(PORT_START, 20_000);
         assert_eq!(PORT_END, 29_999);
+    }
+
+    #[test]
+    fn 已选端口不会被再次选中() {
+        let used: std::collections::HashSet<u16> = [20_000, 20_001].into_iter().collect();
+        let port = pick_free_port_avoiding(&used).unwrap();
+        assert!(!used.contains(&port));
+        assert!((PORT_START..=PORT_END).contains(&port));
     }
 }

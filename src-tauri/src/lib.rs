@@ -6,6 +6,7 @@ mod store;
 mod template;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -34,6 +35,13 @@ pub struct AppState {
     singbox: Arc<SingboxLog>,
     /// 临时配置目录，测完即删。
     temp_dir: PathBuf,
+    /// 正在跑的一轮批量测试；停止按钮通过它发信号。
+    batch: Mutex<Option<Arc<BatchControl>>>,
+}
+
+/// 一轮批量的停止信号。
+struct BatchControl {
+    cancel: AtomicBool,
 }
 
 impl AppState {
@@ -454,6 +462,10 @@ async fn probe_single(
                     LogLevel::Error,
                     format!("测试 {target} 失败：{}", outcome.error.as_deref().unwrap_or("")),
                 ),
+                probe::ProbeStatus::Untested => (
+                    LogLevel::Info,
+                    format!("测试 {target} 未测"),
+                ),
             };
             log_operation(state.inner(), &app, level, &trace, &text);
         }
@@ -483,6 +495,296 @@ async fn probe_single(
     }
 
     result
+}
+
+/// 一条批量结果的对外形状。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRowDto {
+    host: String,
+    port: u16,
+    alias: String,
+    status: &'static str,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+    /// 三次原始采样，界面详情与历史回看用。
+    samples: Vec<probe::ProbeOutcome>,
+}
+
+/// 一轮批量的完整结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchReportDto {
+    run_id: String,
+    total: usize,
+    completed: usize,
+    stopped: bool,
+    counts: probe::batch::BatchCounts,
+    rows: Vec<BatchRowDto>,
+}
+
+/// 一键测试真连接延迟：整池地址按设置里的并发与采样次数跑一轮。
+///
+/// 停止后已完成的地址保留结论，未开始的地址落库为「未测」。
+#[tauri::command]
+async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
+    let run_id = format!("run-{}", logs::new_span_id());
+    let state = app.state::<AppState>();
+
+    // 读设置与池：只短暂加锁，测试期间不占着数据库。
+    let (template, options, batch, entries) = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        let settings = store.load_settings().map_err(|e| e.to_string())?;
+        let template = settings
+            .node_templates
+            .iter()
+            .find(|template| template.id == settings.active_template_id)
+            .or_else(|| settings.node_templates.first())
+            .cloned()
+            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
+        (
+            template,
+            probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
+            probe::batch::BatchOptions::new(
+                settings.latency_samples as usize,
+                settings.concurrency as usize,
+            ),
+            store.list_pool_entries().map_err(|e| e.to_string())?,
+        )
+    };
+
+    if entries.is_empty() {
+        return Err("池里还没有地址，请先抓取优选源".to_string());
+    }
+
+    let binary = resolve_singbox(&app)?;
+    let items: Vec<probe::batch::BatchItem> = entries
+        .into_iter()
+        .map(|entry| {
+            probe::batch::BatchItem::new(
+                probe::Endpoint::new(entry.host, entry.port),
+                entry.alias,
+            )
+        })
+        .collect();
+
+    // 同一时间只允许一轮；测试中重复触发直接拒绝。
+    let control = Arc::new(BatchControl {
+        cancel: AtomicBool::new(false),
+    });
+    {
+        let mut guard = state
+            .batch
+            .lock()
+            .map_err(|_| "测试状态锁已损坏".to_string())?;
+        if guard.is_some() {
+            return Err("测试正在进行，请先停止或等待结束".to_string());
+        }
+        *guard = Some(control.clone());
+    }
+
+    let started_at = logs::now_iso8601();
+    let started = Instant::now();
+    let params = serde_json::json!({
+        "kind": template.kind,
+        "transport": template.transport,
+        "tls": template.tls,
+        "connectTimeoutS": options.connect_timeout.as_secs(),
+        "requestTimeoutS": options.request_timeout.as_secs(),
+        "samples": batch.samples,
+        "concurrency": batch.concurrency,
+        "total": items.len(),
+    });
+
+    log_operation(
+        state.inner(),
+        &app,
+        LogLevel::Info,
+        &run_id,
+        &format!(
+            "开始批量测试：{} 条，并发 {}，每条 {} 次采样",
+            items.len(),
+            batch.concurrency,
+            batch.samples
+        ),
+    );
+
+    // 槽位池与调度都在阻塞线程里跑，进度通过事件推给界面。
+    let app_for_progress = app.clone();
+    let run_for_progress = run_id.clone();
+    let on_progress = move |progress: probe::batch::BatchProgress| {
+        let _ = app_for_progress.emit(
+            "probe:progress",
+            serde_json::json!({
+                "runId": run_for_progress,
+                "completed": progress.completed,
+                "total": progress.total,
+            }),
+        );
+    };
+    let cancel = control.clone();
+    let singbox = state.singbox.clone();
+    let log_path = state.logs.today_path(LogKind::Singbox);
+    let temp_dir = state.temp_dir.clone();
+    let blocking_items = items.clone();
+    let blocking_template = template.clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let pool = probe::slot::SlotPool::start(
+            binary,
+            singbox,
+            log_path,
+            temp_dir,
+            &blocking_items,
+            &blocking_template,
+            batch.concurrency,
+        )?;
+        let report = probe::batch::run_batch(
+            &pool,
+            &blocking_items,
+            &blocking_template,
+            &options,
+            batch,
+            &cancel.cancel,
+            &on_progress,
+        )?;
+        // 整轮结束（含停止）后立刻回收全部槽位进程与临时配置。
+        drop(pool);
+        Ok::<_, String>(report)
+    })
+    .await;
+
+    // 无论成功、失败、停止还是任务异常，都要把这一轮从「正在跑」里摘掉。
+    if let Ok(mut guard) = state.batch.lock() {
+        *guard = None;
+    }
+
+    let report = joined.map_err(|e| format!("批量测试任务异常结束：{e}"))??;
+    let finished_at = logs::now_iso8601();
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        probe::batch::persist_batch(
+            store,
+            &run_id,
+            &started_at,
+            &finished_at,
+            &params,
+            &report,
+        )?;
+    }
+
+    // 每条地址一个 spanId，traceId 固定为 runId，同一轮可在日志里串起来。
+    for row in &report.rows {
+        let span = logs::new_span_id();
+        let mut record = AppLogRecord::new(
+            match row.outcome.status {
+                probe::ProbeStatus::Ok => LogLevel::Info,
+                probe::ProbeStatus::Timeout => LogLevel::Warn,
+                probe::ProbeStatus::Fail => LogLevel::Error,
+                probe::ProbeStatus::Untested => LogLevel::Info,
+            },
+            "probe",
+            "probe.batch.item",
+        )
+        .trace(&run_id)
+        .span(&span)
+        .params(serde_json::json!({
+            "host": row.endpoint.host,
+            "port": row.endpoint.port,
+            "alias": row.alias,
+            "samples": row.samples.len(),
+        }))
+        .result(serde_json::json!({
+            "status": row.outcome.status.as_str(),
+            "latencyMs": row.outcome.latency_ms,
+        }));
+        if let Some(error) = &row.outcome.error {
+            record = record.error(error, None);
+        }
+        log_app(state.inner(), &app, record);
+    }
+
+    let counts = report.counts();
+    log_app(
+        state.inner(),
+        &app,
+        AppLogRecord::new(LogLevel::Info, "probe", "probe.batch")
+            .trace(&run_id)
+            .duration(duration_ms)
+            .params(params.clone())
+            .result(serde_json::json!({
+                "ok": counts.ok,
+                "timeout": counts.timeout,
+                "fail": counts.fail,
+                "untested": counts.untested,
+                "stopped": report.stopped,
+            })),
+    );
+    log_operation(
+        state.inner(),
+        &app,
+        if report.stopped {
+            LogLevel::Warn
+        } else {
+            LogLevel::Ok
+        },
+        &run_id,
+        &format!(
+            "批量测试结束：成功 {} · 超时 {} · 失败 {} · 未测 {}（{}ms）",
+            counts.ok, counts.timeout, counts.fail, counts.untested, duration_ms
+        ),
+    );
+
+    Ok(BatchReportDto {
+        run_id,
+        total: report.total,
+        completed: report.completed,
+        stopped: report.stopped,
+        counts,
+        rows: report
+            .rows
+            .into_iter()
+            .map(|row| BatchRowDto {
+                host: row.endpoint.host,
+                port: row.endpoint.port,
+                alias: row.alias,
+                status: row.outcome.status.as_str(),
+                latency_ms: row.outcome.latency_ms,
+                error: row.outcome.error,
+                samples: row.samples,
+            })
+            .collect(),
+    })
+}
+
+/// 请求停止当前批量测试；没有在跑时返回 `false`。
+#[tauri::command]
+fn probe_cancel(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let guard = state
+        .batch
+        .lock()
+        .map_err(|_| "测试状态锁已损坏".to_string())?;
+    match guard.as_ref() {
+        Some(control) => {
+            control.cancel.store(true, Ordering::SeqCst);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// 一条优选源，前端直接渲染。
@@ -997,6 +1299,7 @@ pub fn run() {
                 logs: log_writer,
                 singbox,
                 temp_dir,
+                batch: Mutex::new(None),
             });
 
             spawn_daily_log_cleanup(app.handle().clone());
@@ -1012,7 +1315,9 @@ pub fn run() {
             set_source_checked,
             get_logs,
             clear_logs,
-            probe_single
+            probe_single,
+            probe_batch,
+            probe_cancel
         ])
         .on_window_event(|window, event| {
             // 关闭窗口即结束进程，避免残留后台进程；先收掉日志写入线程。

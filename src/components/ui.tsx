@@ -10,12 +10,14 @@ export function Btn({
   onClick,
   className,
   title,
+  disabled = false,
 }: {
   children: ReactNode;
   variant?: "primary" | "accent" | "secondary" | "ghost" | "danger";
   onClick?: () => void;
   className?: string;
   title?: string;
+  disabled?: boolean;
 }) {
   const styles = {
     primary:
@@ -34,9 +36,11 @@ export function Btn({
       type="button"
       title={title}
       onClick={onClick}
+      disabled={disabled}
       className={cn(
         "h-8 px-3 rounded-[3px] text-[12px] tracking-wide transition-colors whitespace-nowrap",
         styles,
+        disabled ? "opacity-45 cursor-not-allowed hover:bg-inherit" : "",
         className,
       )}
     >

@@ -25,10 +25,48 @@ pub fn build_config(endpoint: &Endpoint, template: &NodeTemplate, listen_port: u
     })
 }
 
+/// 一个槽位进程的配置：每条地址一条 lane（mixed 入站 + 对应出站），
+/// 用路由规则把入站流量固定送到自己的出站。
+///
+/// 这样每个槽位只启动一次进程，整轮里反复复用，不必每条地址启停。
+pub fn build_slot_config(lanes: &[(Endpoint, u16)], template: &NodeTemplate) -> Value {
+    let mut inbounds = Vec::with_capacity(lanes.len());
+    let mut outbounds = Vec::with_capacity(lanes.len());
+    let mut rules = Vec::with_capacity(lanes.len());
+
+    for (index, (endpoint, listen_port)) in lanes.iter().enumerate() {
+        let in_tag = format!("in-{index}");
+        let out_tag = format!("out-{index}");
+        inbounds.push(json!({
+            "type": "mixed",
+            "tag": in_tag,
+            "listen": LISTEN_HOST,
+            "listen_port": listen_port,
+        }));
+        outbounds.push(build_outbound_tagged(endpoint, template, &out_tag));
+        rules.push(json!({
+            "inbound": [in_tag],
+            "outbound": out_tag,
+        }));
+    }
+
+    json!({
+        "log": { "level": "info", "timestamp": true },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": { "rules": rules },
+    })
+}
+
 /// 生成一个出站，server 与 port 用优选地址替换。
 pub fn build_outbound(endpoint: &Endpoint, template: &NodeTemplate) -> Value {
+    build_outbound_tagged(endpoint, template, "proxy")
+}
+
+/// 生成一个带指定 tag 的出站。
+pub fn build_outbound_tagged(endpoint: &Endpoint, template: &NodeTemplate, tag: &str) -> Value {
     let mut outbound = Map::new();
-    outbound.insert("tag".to_string(), json!("proxy"));
+    outbound.insert("tag".to_string(), json!(tag));
     outbound.insert("server".to_string(), json!(endpoint.host));
     outbound.insert("server_port".to_string(), json!(endpoint.port));
 
@@ -212,5 +250,31 @@ mod tests {
         value.host.clear();
         let config = build_config(&endpoint(), &value, 20004);
         assert_eq!(config["outbounds"][0]["tls"]["server_name"], "104.16.1.1");
+    }
+
+    #[test]
+    fn 槽位配置为每条地址生成一条入站出站与路由() {
+        let lanes = vec![
+            (Endpoint::new("104.16.1.1", 8443), 20_000),
+            (Endpoint::new("104.16.2.2", 2053), 20_001),
+        ];
+        let config = build_slot_config(&lanes, &template("vless", "ws"));
+
+        assert_eq!(config["inbounds"].as_array().unwrap().len(), 2);
+        assert_eq!(config["inbounds"][0]["tag"], "in-0");
+        assert_eq!(config["inbounds"][0]["listen_port"], 20_000);
+        assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(config["inbounds"][1]["listen_port"], 20_001);
+
+        assert_eq!(config["outbounds"].as_array().unwrap().len(), 2);
+        assert_eq!(config["outbounds"][0]["tag"], "out-0");
+        assert_eq!(config["outbounds"][0]["server"], "104.16.1.1");
+        assert_eq!(config["outbounds"][1]["tag"], "out-1");
+        assert_eq!(config["outbounds"][1]["server_port"], 2053);
+
+        assert_eq!(config["route"]["rules"][0]["inbound"][0], "in-0");
+        assert_eq!(config["route"]["rules"][0]["outbound"], "out-0");
+        assert_eq!(config["route"]["rules"][1]["inbound"][0], "in-1");
+        assert_eq!(config["route"]["rules"][1]["outbound"], "out-1");
     }
 }

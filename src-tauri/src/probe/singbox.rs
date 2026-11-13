@@ -173,44 +173,55 @@ impl SingBoxProber {
     }
 
     fn spawn(&self, config: TempConfig) -> Result<Session, String> {
-        let mut command = Command::new(&self.binary);
-        command
-            .arg("run")
-            .arg("-c")
-            .arg(config.path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Windows 下不要弹出控制台窗口。
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let mut child = command.spawn().map_err(|error| {
+        let child = spawn_singbox(&self.binary, config.path(), &self.log).map_err(|error| {
             format!(
                 "启动 sing-box 失败：{error}。{}",
                 self.log_hint()
             )
         })?;
 
-        // 子进程输出推进 sing-box 日志通道。
-        if let Some(stdout) = child.stdout.take() {
-            let log = self.log.clone();
-            std::thread::spawn(move || pump("stdout", stdout, log));
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let log = self.log.clone();
-            std::thread::spawn(move || pump("stderr", stderr, log));
-        }
-
         Ok(Session {
             child,
             _config: config,
         })
     }
+}
+
+/// 启动一个 sing-box 进程，并把 stdout/stderr 推进日志通道。
+pub(crate) fn spawn_singbox(
+    binary: &Path,
+    config_path: &Path,
+    log: &Arc<SingboxLog>,
+) -> std::io::Result<Child> {
+    let mut command = Command::new(binary);
+    command
+        .arg("run")
+        .arg("-c")
+        .arg(config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Windows 下不要弹出控制台窗口。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command.spawn()?;
+
+    // 子进程输出推进 sing-box 日志通道。
+    if let Some(stdout) = child.stdout.take() {
+        let log = log.clone();
+        std::thread::spawn(move || pump("stdout", stdout, log));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let log = log.clone();
+        std::thread::spawn(move || pump("stderr", stderr, log));
+    }
+
+    Ok(child)
 }
 
 impl Prober for SingBoxProber {
@@ -252,7 +263,7 @@ fn pump(stream: &'static str, pipe: impl std::io::Read, log: Arc<SingboxLog>) {
 }
 
 /// 等本地入站端口可连接；期间进程退出则立刻失败。
-fn wait_until_ready(
+pub(crate) fn wait_until_ready(
     child: &mut Child,
     port: u16,
     timeout: Duration,

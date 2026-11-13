@@ -13,7 +13,7 @@ use crate::settings::{Settings, SETTING_KEYS};
 use crate::sources::parse::{CatalogSource, PoolCandidate};
 
 /// 当前 schema 版本，写进 SQLite 的 `user_version`。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 阶段 2 建好五张表；本期只有 `settings` 真正读写。
 const SCHEMA_V1: &str = r#"
@@ -81,8 +81,12 @@ ALTER TABLE pool_source ADD COLUMN last_error TEXT;
 ALTER TABLE pool_entry ADD COLUMN source_label TEXT NOT NULL DEFAULT '';
 "#;
 
+/// 阶段 7：批量测试每条地址保存三次原始采样。
+const SCHEMA_V4: &str = r#"
+ALTER TABLE test_result ADD COLUMN samples_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
 /// 阶段 5：节点模板补上凭据与传输细节，并记录当前选中的模板。
-///
 /// 旧模板是阶段 2 的 JSON，只含 id / name / kind / transport / tls / sni / path，
 /// 这里逐个补齐缺失字段，保留已有值，不重建、不清空。
 fn migrate_node_templates(tx: &rusqlite::Transaction<'_>) -> Result<()> {
@@ -250,6 +254,9 @@ impl Store {
         }
         if version < 3 {
             migrate_node_templates(&tx)?;
+        }
+        if version < 4 {
+            tx.execute_batch(SCHEMA_V4)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -560,10 +567,22 @@ impl Store {
         alias: &str,
         outcome: &crate::probe::ProbeOutcome,
     ) -> Result<()> {
+        self.insert_test_result_with_samples(run_id, endpoint, alias, outcome, "[]")
+    }
+
+    /// 写入一条测试结果，并保存原始采样（批量测试用）。
+    pub fn insert_test_result_with_samples(
+        &self,
+        run_id: &str,
+        endpoint: &crate::probe::Endpoint,
+        alias: &str,
+        outcome: &crate::probe::ProbeOutcome,
+        samples_json: &str,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO test_result
-                 (run_id, host, port, alias, status, latency_ms, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (run_id, host, port, alias, status, latency_ms, error, samples_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 run_id,
                 endpoint.host,
@@ -572,6 +591,7 @@ impl Store {
                 outcome.status.as_str(),
                 outcome.latency_ms.map(|ms| ms as i64),
                 outcome.error,
+                samples_json,
             ],
         )?;
         Ok(())
@@ -596,19 +616,22 @@ impl Store {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn list_test_results(&self, run_id: &str) -> Result<Vec<TestResultRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT host, port, alias, status, latency_ms, error
+            "SELECT run_id, host, port, alias, status, latency_ms, error, samples_json
              FROM test_result
              WHERE run_id = ?1
              ORDER BY id",
         )?;
         let rows = stmt.query_map([run_id], |row| {
+            let samples_json: String = row.get(7)?;
             Ok(TestResultRow {
-                host: row.get(0)?,
-                port: row.get::<_, i64>(1)?.clamp(0, u16::MAX as i64) as u16,
-                alias: row.get(2)?,
-                status: row.get(3)?,
-                latency_ms: row.get::<_, Option<i64>>(4)?.map(|ms| ms.max(0) as u64),
-                error: row.get(5)?,
+                run_id: row.get(0)?,
+                host: row.get(1)?,
+                port: row.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
+                alias: row.get(3)?,
+                status: row.get(4)?,
+                latency_ms: row.get::<_, Option<i64>>(5)?.map(|ms| ms.max(0) as u64),
+                error: row.get(6)?,
+                samples: serde_json::from_str(&samples_json).unwrap_or_default(),
             })
         })?;
         let mut results = Vec::new();
@@ -616,6 +639,32 @@ impl Store {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    /// 读一轮的统计，用于历史入口与测试断言。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn get_test_run(&self, run_id: &str) -> Result<Option<TestRunRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, started_at, finished_at, params_json, total,
+                        ok_count, timeout_count, fail_count
+                 FROM test_run WHERE id = ?1",
+                [run_id],
+                |row| {
+                    Ok(TestRunRow {
+                        id: row.get(0)?,
+                        started_at: row.get(1)?,
+                        finished_at: row.get(2)?,
+                        params_json: row.get(3)?,
+                        total: row.get::<_, i64>(4)?.max(0) as u32,
+                        ok_count: row.get::<_, i64>(5)?.max(0) as u32,
+                        timeout_count: row.get::<_, i64>(6)?.max(0) as u32,
+                        fail_count: row.get::<_, i64>(7)?.max(0) as u32,
+                    })
+                },
+            )
+            .optional()?)
     }
 }
 
@@ -633,14 +682,31 @@ pub struct TestRunRecord<'a> {
 
 /// `test_result` 的一行。
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TestResultRow {
+    pub run_id: String,
     pub host: String,
     pub port: u16,
     pub alias: String,
     pub status: String,
     pub latency_ms: Option<u64>,
     pub error: Option<String>,
+    /// 批量测试的三次原始采样；单条测试为空数组。
+    pub samples: Vec<crate::probe::ProbeOutcome>,
+}
+
+/// `test_run` 的一行。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRunRow {
+    pub id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub params_json: String,
+    pub total: u32,
+    pub ok_count: u32,
+    pub timeout_count: u32,
+    pub fail_count: u32,
 }
 
 /// `pool_source` 的一行，直接给前端用。

@@ -5,16 +5,18 @@
 //! - 探测请求只经本地 mixed 入站出去，不读取系统代理；
 //! - 连接阶段未建立记「失败」，连上但总超时内没有响应记「超时」。
 
+pub mod batch;
 pub mod config;
 pub mod fake;
 pub mod port;
 pub mod singbox;
+pub mod slot;
 
 pub use singbox::SingBoxProber;
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::template::NodeTemplate;
 
@@ -45,12 +47,16 @@ impl Endpoint {
 }
 
 /// 单次测试的结论。界面按它决定显示延迟、超时还是失败。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// `Untested` 只出现在批量测试被停止时：已经开始的行保留结论，
+/// 还没轮到的行落库为未测，不伪装成失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProbeStatus {
     Ok,
     Timeout,
     Fail,
+    Untested,
 }
 
 impl ProbeStatus {
@@ -60,12 +66,13 @@ impl ProbeStatus {
             ProbeStatus::Ok => "ok",
             ProbeStatus::Timeout => "timeout",
             ProbeStatus::Fail => "fail",
+            ProbeStatus::Untested => "untested",
         }
     }
 }
 
 /// 一条优选地址的测试结果。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeOutcome {
     pub status: ProbeStatus,
@@ -97,6 +104,15 @@ impl ProbeOutcome {
             status: ProbeStatus::Fail,
             latency_ms: None,
             error: Some(error.into()),
+        }
+    }
+
+    /// 被停止时还没开始的行。
+    pub fn untested() -> Self {
+        Self {
+            status: ProbeStatus::Untested,
+            latency_ms: None,
+            error: None,
         }
     }
 }

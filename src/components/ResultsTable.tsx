@@ -9,6 +9,7 @@ import {
 } from "../store/probe";
 import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
 import { activeTemplate, templateColumns } from "../store/template";
+import { sortRows, type SortDir, type SortKey } from "../store/tableSort";
 import { cn } from "./ui";
 
 type RowStatus = "untested" | "ok" | "timeout" | "fail";
@@ -68,7 +69,7 @@ export default function ResultsTable() {
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
-  const [sort, setSort] = useState<{ key: "latency" | "speed"; dir: "asc" | "desc" }>({
+  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({
     key: "latency",
     dir: "asc",
   });
@@ -114,7 +115,7 @@ export default function ResultsTable() {
     return base;
   }, [rows]);
 
-  const toggleSort = (key: "latency" | "speed") =>
+  const toggleSort = (key: SortKey) =>
     setSort((s) =>
       s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
     );
@@ -169,16 +170,9 @@ export default function ResultsTable() {
       return true;
     });
 
-    // 空值（超时 / 失败）始终排在末尾，不参与升降序翻转
-    return list.sort((a, b) => {
-      const av = a[sort.key];
-      const bv = b[sort.key];
-      if (av === null && bv === null) return 0;
-      if (av === null) return 1;
-      if (bv === null) return -1;
-      return sort.dir === "asc" ? av - bv : bv - av;
-    });
-  }, [filter, query, sort, threshold]);
+    // 空值（超时 / 失败 / 未测）始终排在末尾，不参与升降序翻转。
+    return sortRows(list, sort.key, sort.dir);
+  }, [filter, query, sort, threshold, rows]);
 
   const toggle = (id: string) =>
     setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
@@ -266,7 +260,7 @@ export default function ResultsTable() {
 
       {probeError ? (
         <div className="shrink-0 flex items-start gap-2 px-4 py-1.5 border-b border-line bg-danger/[0.06] text-[12px] text-danger">
-          <span className="font-medium">单条测试失败</span>
+          <span className="font-medium">测试失败</span>
           <span className="num break-all opacity-90">{probeError}</span>
         </div>
       ) : null}
