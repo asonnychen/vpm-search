@@ -16,7 +16,7 @@ use serde::Serialize;
 use settings::Settings;
 use sources::fetch::{self, CATALOG_URL};
 use sources::parse::{parse_catalog, source_label, CatalogSource};
-use store::{PoolEntryRow, PoolSourceRow, Store};
+use store::{PoolEntryRow, PoolSourceRow, Store, TestRunSummaryRow};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
@@ -1494,6 +1494,395 @@ fn probe_cancel(state: tauri::State<'_, AppState>) -> Result<bool, String> {    
     }
 }
 
+/// 历史入口的一轮测试：时间、参数快照与统计。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestRunDto {
+    id: String,
+    started_at: String,
+    finished_at: Option<String>,
+    /// 参数快照，字段随测试类型变化；损坏的 JSON 归一成空对象。
+    params: serde_json::Value,
+    total: u32,
+    ok: u32,
+    timeout: u32,
+    fail: u32,
+    /// 本轮实际落库的地址数。
+    address_count: u32,
+}
+
+impl From<TestRunSummaryRow> for TestRunDto {
+    fn from(row: TestRunSummaryRow) -> Self {
+        Self {
+            id: row.id,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            params: serde_json::from_str(&row.params_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            total: row.total,
+            ok: row.ok_count,
+            timeout: row.timeout_count,
+            fail: row.fail_count,
+            address_count: row.result_count,
+        }
+    }
+}
+
+/// 历史结果的一行，字段与主表格的测量列一致。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryResultDto {
+    host: String,
+    port: u16,
+    alias: String,
+    status: String,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+    speed_mbps: Option<f64>,
+    speed_status: String,
+    speed_error: Option<String>,
+    exit_ip: Option<String>,
+    country: Option<String>,
+    zh: Option<String>,
+    en: Option<String>,
+    colo: Option<String>,
+}
+
+impl From<store::TestResultRow> for HistoryResultDto {
+    fn from(row: store::TestResultRow) -> Self {
+        Self {
+            host: row.host,
+            port: row.port,
+            alias: row.alias,
+            status: row.status,
+            latency_ms: row.latency_ms,
+            error: row.error,
+            speed_mbps: row.speed_mbps,
+            speed_status: row.speed_status,
+            speed_error: row.speed_error,
+            exit_ip: row.exit_ip,
+            country: row.geo_country,
+            zh: row.geo_zh,
+            en: row.geo_en,
+            colo: row.colo,
+        }
+    }
+}
+
+/// 某一轮的全部结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestRunDetailDto {
+    run: TestRunDto,
+    results: Vec<HistoryResultDto>,
+}
+
+/// 同一地址在某一轮的结果点。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressPointDto {
+    run_id: String,
+    started_at: String,
+    status: String,
+    latency_ms: Option<u64>,
+    speed_mbps: Option<f64>,
+    speed_status: String,
+}
+
+/// 同一地址的跨轮序列。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressHistoryDto {
+    host: String,
+    port: u16,
+    points: Vec<AddressPointDto>,
+}
+
+/// 列出历史测试轮次：时间、参数快照、成功/超时/失败统计与地址数。
+#[tauri::command]
+fn list_test_runs(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<TestRunDto>, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    let listed = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        store.list_test_runs().map_err(|e| e.to_string())
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &listed {
+        Ok(runs) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Info, "history", "history.runs")
+                .trace(&trace)
+                .duration(duration_ms)
+                .result(serde_json::json!({ "runs": runs.len() })),
+        ),
+        Err(message) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Error, "history", "history.runs")
+                .trace(&trace)
+                .duration(duration_ms)
+                .error(message, None),
+        ),
+    }
+
+    Ok(listed?.into_iter().map(TestRunDto::from).collect())
+}
+
+/// 读取某一轮的全部结果，字段与主表格一致。
+#[tauri::command]
+fn get_test_run_results(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    run_id: String,
+) -> Result<TestRunDetailDto, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    let loaded = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        match store.get_test_run(&run_id).map_err(|e| e.to_string())? {
+            Some(run) => {
+                let results = store
+                    .list_test_results(&run_id)
+                    .map_err(|e| e.to_string())?;
+                Ok((run, results))
+            }
+            None => Err(format!("测试轮次不存在：{run_id}")),
+        }
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &loaded {
+        Ok((_, results)) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Info, "history", "history.results")
+                .trace(&trace)
+                .duration(duration_ms)
+                .params(serde_json::json!({ "runId": run_id }))
+                .result(serde_json::json!({ "results": results.len() })),
+        ),
+        Err(message) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Error, "history", "history.results")
+                .trace(&trace)
+                .duration(duration_ms)
+                .params(serde_json::json!({ "runId": run_id }))
+                .error(message, None),
+        ),
+    }
+
+    let (run, results) = loaded?;
+    Ok(TestRunDetailDto {
+        run: TestRunDto {
+            id: run.id,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            params: serde_json::from_str(&run.params_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            total: run.total,
+            ok: run.ok_count,
+            timeout: run.timeout_count,
+            fail: run.fail_count,
+            address_count: results.len() as u32,
+        },
+        results: results.into_iter().map(HistoryResultDto::from).collect(),
+    })
+}
+
+/// 按轮次整轮删除，删除后顺带刷新体积。
+///
+/// 只允许整轮删除；历史是事实记录，不提供逐条编辑。
+#[tauri::command]
+fn delete_test_run(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    run_id: String,
+) -> Result<bool, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    let deleted = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        let deleted = store.delete_test_run(&run_id).map_err(|e| e.to_string())?;
+        let size = store.database_size_bytes().unwrap_or(0);
+        Ok::<_, String>((deleted, size))
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &deleted {
+        Ok((true, size)) => {
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Info, "history", "history.delete")
+                    .trace(&trace)
+                    .duration(duration_ms)
+                    .params(serde_json::json!({ "runId": run_id }))
+                    .result(serde_json::json!({ "dbBytes": size })),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Warn,
+                &trace,
+                &format!(
+                    "已删除测试轮次 {run_id}，数据库体积 {} MB",
+                    (*size as f64 / 1024.0 / 1024.0 * 10.0).round() / 10.0
+                ),
+            );
+        }
+        Ok((false, _)) => {
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Warn,
+                &trace,
+                &format!("删除测试轮次失败：{run_id} 不存在"),
+            );
+        }
+        Err(message) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Error, "history", "history.delete")
+                .trace(&trace)
+                .duration(duration_ms)
+                .params(serde_json::json!({ "runId": run_id }))
+                .error(message, None),
+        ),
+    }
+
+    let (deleted, _) = deleted?;
+    Ok(deleted)
+}
+
+/// 数据库体积（字节）；界面据此在超过 50MB 时提示按轮次清理。
+#[tauri::command]
+fn get_database_size(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<u64, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    let size = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        store.database_size_bytes().map_err(|e| e.to_string())
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &size {
+        Ok(bytes) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Info, "history", "history.db_size")
+                .trace(&trace)
+                .duration(duration_ms)
+                .result(serde_json::json!({ "bytes": bytes })),
+        ),
+        Err(message) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Error, "history", "history.db_size")
+                .trace(&trace)
+                .duration(duration_ms)
+                .error(message, None),
+        ),
+    }
+    size
+}
+
+/// 同一地址跨轮次的延迟与速度序列，按时间升序。
+#[tauri::command]
+fn get_address_history(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    host: String,
+    port: u16,
+) -> Result<AddressHistoryDto, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    let loaded = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        store
+            .list_address_history(host.trim(), port)
+            .map_err(|e| e.to_string())
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &loaded {
+        Ok(points) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Info, "history", "history.address")
+                .trace(&trace)
+                .duration(duration_ms)
+                .params(serde_json::json!({ "host": host, "port": port }))
+                .result(serde_json::json!({ "points": points.len() })),
+        ),
+        Err(message) => log_app(
+            state.inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Error, "history", "history.address")
+                .trace(&trace)
+                .duration(duration_ms)
+                .params(serde_json::json!({ "host": host, "port": port }))
+                .error(message, None),
+        ),
+    }
+
+    let points = loaded?;
+    Ok(AddressHistoryDto {
+        host,
+        port,
+        points: points
+            .into_iter()
+            .map(|point| AddressPointDto {
+                run_id: point.run_id,
+                started_at: point.started_at,
+                status: point.status,
+                latency_ms: point.latency_ms,
+                speed_mbps: point.speed_mbps,
+                speed_status: point.speed_status,
+            })
+            .collect(),
+    })
+}
+
 /// 一条优选源，前端直接渲染。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2196,7 +2585,12 @@ pub fn run() {
             probe_speed_batch,
             probe_geo_batch,
             probe_cancel,
-            export_txt
+            export_txt,
+            list_test_runs,
+            get_test_run_results,
+            delete_test_run,
+            get_database_size,
+            get_address_history
         ])
         .on_window_event(|window, event| {
             // 关闭窗口即结束进程，避免残留后台进程；先收掉日志写入线程。
