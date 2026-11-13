@@ -244,6 +244,11 @@ impl LogWriter {
         self.dir.join(format!("{}-{date}.log", kind.prefix()))
     }
 
+    /// 某类日志今天的文件路径；错误提示里直接给用户看。
+    pub fn today_path(&self, kind: LogKind) -> PathBuf {
+        self.path_for(kind, &local_date(Local::now()))
+    }
+
     /// 写一条操作日志（人读的中文单行）。
     pub fn write_operation(
         &self,

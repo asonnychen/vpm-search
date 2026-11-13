@@ -126,7 +126,7 @@ export default function ConfigBar({
               unit="s"
               width="92px"
               min={1}
-              max={60}
+              max={10}
               onChange={(connectTimeoutS) => patch({ connectTimeoutS })}
             />
           </Field>

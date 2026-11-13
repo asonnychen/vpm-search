@@ -1,4 +1,5 @@
 mod logs;
+mod probe;
 mod settings;
 mod sources;
 mod store;
@@ -16,18 +17,23 @@ use store::{PoolEntryRow, PoolSourceRow, Store};
 use tauri::{Emitter, Manager};
 
 use logs::{AppLogRecord, LogEntry, LogKind, LogLevel, LogWriter, LogsSnapshot, SingboxLog};
+use probe::Prober;
 
 /// 启动时与界面初次加载读回的日志行数上限。
 const LOG_READ_LIMIT: usize = 500;
+
+/// 随包内置的 sing-box 可执行文件名（Tauri externalBin 按目标三元组命名）。
+const SINGBOX_BINARY: &str = "sing-box-x86_64-pc-windows-msvc.exe";
 
 /// 应用级共享状态：数据库连接、三类日志写入器与 sing-box 日志通道。
 pub struct AppState {
     /// 打开失败时为 `None`，此时命令返回错误但界面照常可用。
     store: Mutex<Option<Store>>,
     logs: Arc<LogWriter>,
-    /// 阶段 6 接入 sing-box 进程后把输出推进来。
-    #[allow(dead_code)]
-    singbox: SingboxLog,
+    /// sing-box 子进程输出统一从这里落盘。
+    singbox: Arc<SingboxLog>,
+    /// 临时配置目录，测完即删。
+    temp_dir: PathBuf,
 }
 
 impl AppState {
@@ -290,6 +296,193 @@ fn parse_node_link(
             Err(message)
         }
     }
+}
+
+/// sing-box 可执行文件的候选路径：打包后与主程序同目录 → 资源目录 → 开发期 binaries。
+fn singbox_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(SINGBOX_BINARY));
+        }
+    }
+    if let Ok(dir) = app.path().resource_dir() {
+        candidates.push(dir.join(SINGBOX_BINARY));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join(SINGBOX_BINARY),
+    );
+    candidates
+}
+
+fn resolve_singbox(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    probe::singbox::pick_existing(&singbox_candidates(app)).ok_or_else(|| {
+        format!(
+            "未找到 sing-box（{SINGBOX_BINARY}），请先运行 scripts/fetch-singbox.ps1"
+        )
+    })
+}
+
+/// 真正的探测在阻塞线程里跑，避免占住异步运行时。
+fn probe_blocking(
+    app: &tauri::AppHandle,
+    endpoint: &probe::Endpoint,
+    alias: &str,
+) -> Result<probe::ProbeOutcome, String> {
+    let state = app.state::<AppState>();
+
+    // 只短暂加锁读模板与超时，测试期间不占着数据库。
+    let (template, connect_timeout_s) = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        let settings = store.load_settings().map_err(|e| e.to_string())?;
+        let template = settings
+            .node_templates
+            .iter()
+            .find(|template| template.id == settings.active_template_id)
+            .or_else(|| settings.node_templates.first())
+            .cloned()
+            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
+        (template, settings.connect_timeout_s)
+    };
+
+    let binary = resolve_singbox(app)?;
+    let options = probe::ProbeOptions::from_connect_timeout_s(connect_timeout_s);
+    let prober = probe::SingBoxProber::new(
+        binary,
+        state.singbox.clone(),
+        state.logs.today_path(LogKind::Singbox),
+        state.temp_dir.clone(),
+    );
+
+    let started_at = logs::now_iso8601();
+    let outcome = prober.measure_latency(endpoint, &template, &options);
+
+    // 结果落库：一条轮次 + 一条结果。写库失败不影响已经测出的结论。
+    let run_id = format!("run-{}", logs::new_span_id());
+    {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        if let Some(store) = guard.as_ref() {
+            probe::persist_single(
+                store,
+                &run_id,
+                &started_at,
+                &probe::SingleProbe {
+                    endpoint,
+                    template: &template,
+                    alias,
+                    options,
+                },
+                &outcome,
+            )?;
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// 单条真连接延迟：为一个优选地址生成临时 sing-box 配置并测一次。
+#[tauri::command]
+async fn probe_single(
+    app: tauri::AppHandle,
+    host: String,
+    port: u16,
+    alias: Option<String>,
+) -> Result<probe::ProbeOutcome, String> {
+    let trace = logs::new_trace_id();
+    let span = logs::new_span_id();
+    let started = Instant::now();
+    let endpoint = probe::Endpoint::new(host.trim().to_string(), port);
+    let alias = alias.unwrap_or_default();
+
+    let result = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        let endpoint = endpoint.clone();
+        let alias = alias.clone();
+        move || probe_blocking(&app, &endpoint, &alias)
+    })
+    .await
+    .map_err(|e| format!("测试任务异常结束：{e}"))?;
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let target = format!("{}:{}", endpoint.host, endpoint.port);
+    let state = app.state::<AppState>();
+
+    match &result {
+        Ok(outcome) => {
+            let mut record = logs::AppLogRecord::new(LogLevel::Info, "probe", "probe.latency")
+                .trace(&trace)
+                .span(&span)
+                .duration(duration_ms)
+                .params(serde_json::json!({
+                    "host": endpoint.host,
+                    "port": endpoint.port,
+                    "alias": alias,
+                }))
+                .result(serde_json::json!({
+                    "status": outcome.status.as_str(),
+                    "latencyMs": outcome.latency_ms,
+                }));
+            if let Some(error) = &outcome.error {
+                record = record.error(error, None);
+            }
+            log_app(state.inner(), &app, record);
+
+            let (level, text) = match outcome.status {
+                probe::ProbeStatus::Ok => (
+                    LogLevel::Ok,
+                    format!(
+                        "测试 {target} 成功：{}ms",
+                        outcome.latency_ms.unwrap_or_default()
+                    ),
+                ),
+                probe::ProbeStatus::Timeout => (
+                    LogLevel::Warn,
+                    format!("测试 {target} 超时：{}", outcome.error.as_deref().unwrap_or("")),
+                ),
+                probe::ProbeStatus::Fail => (
+                    LogLevel::Error,
+                    format!("测试 {target} 失败：{}", outcome.error.as_deref().unwrap_or("")),
+                ),
+            };
+            log_operation(state.inner(), &app, level, &trace, &text);
+        }
+        Err(message) => {
+            log_app(
+                state.inner(),
+                &app,
+                logs::AppLogRecord::new(LogLevel::Error, "probe", "probe.latency")
+                    .trace(&trace)
+                    .span(&span)
+                    .duration(duration_ms)
+                    .params(serde_json::json!({
+                        "host": endpoint.host,
+                        "port": endpoint.port,
+                        "alias": alias,
+                    }))
+                    .error(message, None),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Error,
+                &trace,
+                &format!("测试 {target} 无法开始：{message}"),
+            );
+        }
+    }
+
+    result
 }
 
 /// 一条优选源，前端直接渲染。
@@ -765,7 +958,8 @@ pub fn run() {
             let db_path = app_dir.join("data.db");
 
             let log_writer = Arc::new(LogWriter::new(log_dir));
-            let singbox = SingboxLog::spawn(log_writer.clone());
+            let singbox = Arc::new(SingboxLog::spawn(log_writer.clone()));
+            let temp_dir = app_dir.join("tmp");
 
             let store = match Store::open(&db_path) {
                 Ok(store) => Some(store),
@@ -802,6 +996,7 @@ pub fn run() {
                 store: Mutex::new(store),
                 logs: log_writer,
                 singbox,
+                temp_dir,
             });
 
             spawn_daily_log_cleanup(app.handle().clone());
@@ -816,11 +1011,15 @@ pub fn run() {
             fetch_pool,
             set_source_checked,
             get_logs,
-            clear_logs
+            clear_logs,
+            probe_single
         ])
         .on_window_event(|window, event| {
-            // 关闭窗口即结束进程，避免残留后台进程。
+            // 关闭窗口即结束进程，避免残留后台进程；先收掉日志写入线程。
             if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if let Some(state) = window.try_state::<AppState>() {
+                    state.singbox.shutdown();
+                }
                 window.app_handle().exit(0);
             }
         })

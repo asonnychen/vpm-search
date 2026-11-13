@@ -8,3 +8,6 @@ src-tauri/gen/
 .design-studio/
 .tickets/
 *.log
+
+# 随包内置的 sing-box 由 scripts/fetch-singbox.ps1 下载，不进版本库
+src-tauri/binaries/

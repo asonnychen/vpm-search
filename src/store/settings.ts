@@ -195,7 +195,7 @@ export function normalizeSettings(raw: unknown): Settings {
     nodeTemplates,
     activeTemplateId,
     maxLatencyMs: numberIn(source.maxLatencyMs, DEFAULT_SETTINGS.maxLatencyMs, 1, 10_000),
-    connectTimeoutS: numberIn(source.connectTimeoutS, DEFAULT_SETTINGS.connectTimeoutS, 1, 60),
+    connectTimeoutS: numberIn(source.connectTimeoutS, DEFAULT_SETTINGS.connectTimeoutS, 1, 10),
     requestTimeoutS: numberIn(
       source.requestTimeoutS,
       DEFAULT_SETTINGS.requestTimeoutS,

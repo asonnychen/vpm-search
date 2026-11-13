@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePoolStore } from "../store/pool";
+import {
+  probeKey,
+  selectProbeError,
+  selectProbeResults,
+  selectProbeTesting,
+  useProbeStore,
+} from "../store/probe";
 import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
 import { activeTemplate, templateColumns } from "../store/template";
 import { cn } from "./ui";
@@ -16,6 +23,8 @@ type Row = {
   latency: number | null;
   speed: number | null;
   status: RowStatus;
+  /** 失败或超时的原因，悬浮时显示。 */
+  error: string | null;
 };
 
 const filterDefs = [
@@ -70,19 +79,29 @@ export default function ResultsTable() {
   // 切换模板后这三列立刻跟着变；行数据仍来自池。
   const columns = templateColumns(activeTemplate(templates, activeId));
 
+  // 单条真连接延迟的结果按 `host:port` 覆盖到对应行，未测的行保持 null。
+  const probeResults = useProbeStore(selectProbeResults);
+  const probeTesting = useProbeStore(selectProbeTesting);
+  const probeError = useProbeStore(selectProbeError);
+  const testOne = useProbeStore((state) => state.testOne);
+
   const rows = useMemo<Row[]>(
     () =>
-      poolEntries.map((entry) => ({
-        id: `${entry.host}:${entry.port}`,
-        host: entry.host,
-        port: entry.port,
-        alias: entry.alias,
-        source: entry.source,
-        latency: null,
-        speed: null,
-        status: "untested",
-      })),
-    [poolEntries],
+      poolEntries.map((entry) => {
+        const result = probeResults[probeKey(entry.host, entry.port)];
+        return {
+          id: `${entry.host}:${entry.port}`,
+          host: entry.host,
+          port: entry.port,
+          alias: entry.alias,
+          source: entry.source,
+          latency: result?.latencyMs ?? null,
+          speed: null,
+          status: result?.status ?? "untested",
+          error: result?.error ?? null,
+        };
+      }),
+    [poolEntries, probeResults],
   );
 
   const counts = useMemo(() => {
@@ -245,6 +264,13 @@ export default function ResultsTable() {
         </div>
       </div>
 
+      {probeError ? (
+        <div className="shrink-0 flex items-start gap-2 px-4 py-1.5 border-b border-line bg-danger/[0.06] text-[12px] text-danger">
+          <span className="font-medium">单条测试失败</span>
+          <span className="num break-all opacity-90">{probeError}</span>
+        </div>
+      ) : null}
+
       <div className="flex-1 min-h-0 overflow-auto border border-line rounded-[3px] bg-panel">
         <table className="w-full min-w-[1180px] table-fixed border-separate border-spacing-0 text-[12px] [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th:last-child]:border-r-0 [&_td:last-child]:border-r-0">
           <colgroup>
@@ -362,6 +388,7 @@ export default function ResultsTable() {
             {shown.map((r) => {
               const isSel = selected.includes(r.id);
               const slow = r.latency !== null && r.latency > threshold;
+              const busy = Boolean(probeTesting[r.id]);
               return (
                 <tr
                   key={r.id}
@@ -433,8 +460,15 @@ export default function ResultsTable() {
                   <td className="border-b border-line/60 px-2 py-1.5 num text-[12px] text-dim whitespace-nowrap">
                     {r.source}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    {latencyCell(r, threshold)}
+                  <td
+                    className="border-b border-line/60 px-2 py-1.5 text-right"
+                    title={r.error ?? undefined}
+                  >
+                    {busy ? (
+                      <span className="text-accent text-[12px]">测试中…</span>
+                    ) : (
+                      latencyCell(r, threshold)
+                    )}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
                     {r.speed === null ? (
@@ -450,9 +484,17 @@ export default function ResultsTable() {
                     <div className="flex items-center justify-end gap-1 opacity-80 group-hover:opacity-100">
                       <button
                         type="button"
-                        className="h-5 px-1.5 border border-line rounded-[2px] text-[12px] text-muted hover:text-accent hover:border-accent-dim whitespace-nowrap"
+                        onClick={() => void testOne(r.host, r.port, r.alias)}
+                        disabled={busy}
+                        title={r.error ?? "重测这一条"}
+                        className={cn(
+                          "h-5 px-1.5 border border-line rounded-[2px] text-[12px] whitespace-nowrap",
+                          busy
+                            ? "text-dim cursor-wait"
+                            : "text-muted hover:text-accent hover:border-accent-dim",
+                        )}
                       >
-                        重测
+                        {busy ? "测试中" : "重测"}
                       </button>
                       <button
                         type="button"

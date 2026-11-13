@@ -174,7 +174,7 @@ impl Settings {
     /// 参数校验。命令层只做校验与转发，落库前必须通过这里。
     pub fn validate(&self) -> Result<(), ValidationError> {
         in_range("最大延时", self.max_latency_ms, 1, 10_000)?;
-        in_range("连接超时", self.connect_timeout_s, 1, 60)?;
+        in_range("连接超时", self.connect_timeout_s, 1, 10)?;
         in_range("请求总超时", self.request_timeout_s, 1, 120)?;
         in_range("地址并发", self.concurrency, 1, 32)?;
         in_range("延迟采样", self.latency_samples, 1, 10)?;

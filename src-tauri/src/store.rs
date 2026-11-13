@@ -531,6 +531,116 @@ impl Store {
                 row.get(0)
             })?)
     }
+
+    /// 写入一条测试轮次。阶段 6 的单条测试也各占一轮，阶段 7 的整轮复用此表。
+    pub fn insert_test_run(&self, run: &TestRunRecord<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO test_run
+                 (id, started_at, finished_at, params_json, total, ok_count, timeout_count, fail_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                run.id,
+                run.started_at,
+                run.finished_at,
+                run.params_json,
+                i64::from(run.total),
+                i64::from(run.ok_count),
+                i64::from(run.timeout_count),
+                i64::from(run.fail_count),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 写入一条测试结果。
+    pub fn insert_test_result(
+        &self,
+        run_id: &str,
+        endpoint: &crate::probe::Endpoint,
+        alias: &str,
+        outcome: &crate::probe::ProbeOutcome,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO test_result
+                 (run_id, host, port, alias, status, latency_ms, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                run_id,
+                endpoint.host,
+                i64::from(endpoint.port),
+                alias,
+                outcome.status.as_str(),
+                outcome.latency_ms.map(|ms| ms as i64),
+                outcome.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 阶段 6 只有单条测试，阶段 7 与 11 会用到这两个计数。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn count_test_runs(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM test_run", [], |row| row.get(0))?)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn count_test_results(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM test_result", [], |row| row.get(0))?)
+    }
+
+    /// 读某一轮的全部结果，按写入顺序。阶段 7 与 11 的界面复用。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn list_test_results(&self, run_id: &str) -> Result<Vec<TestResultRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT host, port, alias, status, latency_ms, error
+             FROM test_result
+             WHERE run_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |row| {
+            Ok(TestResultRow {
+                host: row.get(0)?,
+                port: row.get::<_, i64>(1)?.clamp(0, u16::MAX as i64) as u16,
+                alias: row.get(2)?,
+                status: row.get(3)?,
+                latency_ms: row.get::<_, Option<i64>>(4)?.map(|ms| ms.max(0) as u64),
+                error: row.get(5)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+}
+
+/// 一条测试轮次的写入参数。
+pub struct TestRunRecord<'a> {
+    pub id: &'a str,
+    pub started_at: &'a str,
+    pub finished_at: &'a str,
+    pub params_json: &'a str,
+    pub total: u32,
+    pub ok_count: u32,
+    pub timeout_count: u32,
+    pub fail_count: u32,
+}
+
+/// `test_result` 的一行。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestResultRow {
+    pub host: String,
+    pub port: u16,
+    pub alias: String,
+    pub status: String,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
 }
 
 /// `pool_source` 的一行，直接给前端用。
