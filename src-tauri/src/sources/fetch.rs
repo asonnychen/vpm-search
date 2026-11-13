@@ -25,6 +25,8 @@ pub struct FetchedSource {
     pub body: Option<String>,
     /// 失败时的可读原因。
     pub error: Option<String>,
+    /// 本次抓取耗时（毫秒），写进应用日志。
+    pub duration_ms: u64,
 }
 
 /// 合并后的池内容与每个源的抓取结论。
@@ -41,8 +43,10 @@ pub struct PoolBuild {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceOutcome {
     pub url: String,
+    pub name: String,
     pub entry_count: u32,
     pub error: Option<String>,
+    pub duration_ms: u64,
 }
 
 /// 把各源的抓取结果与手动地址合并成最终池内容（按 `host:port` 去重）。
@@ -53,8 +57,10 @@ pub fn assemble(sources: &[FetchedSource], manual_text: &str) -> PoolBuild {
         if let Some(error) = &source.error {
             build.outcomes.push(SourceOutcome {
                 url: source.url.clone(),
+                name: source.name.clone(),
                 entry_count: 0,
                 error: Some(error.clone()),
+                duration_ms: source.duration_ms,
             });
             continue;
         }
@@ -63,8 +69,10 @@ pub fn assemble(sources: &[FetchedSource], manual_text: &str) -> PoolBuild {
         build.skipped += outcome.skipped;
         build.outcomes.push(SourceOutcome {
             url: source.url.clone(),
+            name: source.name.clone(),
             entry_count: outcome.entries.len() as u32,
             error: None,
+            duration_ms: source.duration_ms,
         });
         build
             .candidates
@@ -99,18 +107,23 @@ pub fn assemble(sources: &[FetchedSource], manual_text: &str) -> PoolBuild {
 
 /// 按 URL 抓取一个 txt 源，失败时返回可读原因。
 pub async fn fetch_source(client: &reqwest::Client, source: &CatalogSource) -> FetchedSource {
-    match fetch_text(client, &source.url).await {
+    let started = std::time::Instant::now();
+    let result = fetch_text(client, &source.url).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match result {
         Ok(body) => FetchedSource {
             url: source.url.clone(),
             name: source.name.clone(),
             body: Some(body),
             error: None,
+            duration_ms,
         },
         Err(error) => FetchedSource {
             url: source.url.clone(),
             name: source.name.clone(),
             body: None,
             error: Some(error),
+            duration_ms,
         },
     }
 }
@@ -163,6 +176,7 @@ mod tests {
             name: name.to_string(),
             body: Some(body.to_string()),
             error: None,
+            duration_ms: 12,
         }
     }
 
@@ -174,6 +188,7 @@ mod tests {
                 name: "BestCF·luoli/all.txt".to_string(),
                 body: None,
                 error: Some("HTTP 404".to_string()),
+                duration_ms: 34,
             },
             ok_source(
                 "https://bestcf.pages.dev/domain/all.txt",
@@ -188,6 +203,7 @@ mod tests {
         assert_eq!(build.outcomes[0].error.as_deref(), Some("HTTP 404"));
         assert_eq!(build.outcomes[0].entry_count, 0);
         assert_eq!(build.outcomes[1].entry_count, 2);
+        assert_eq!(build.outcomes[1].duration_ms, 12);
     }
 
     #[test]

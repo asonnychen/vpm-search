@@ -1,13 +1,22 @@
 import { useState } from "react";
-import { appLogs, coreLogs, opLogs, type LogLevel, type LogLine } from "../mock";
-import { Btn, cn } from "./ui";
+import {
+  filterByLevel,
+  formatLogClock,
+  selectLogLevels,
+  selectLogLines,
+  useLogsStore,
+  type ClearReport,
+  type LevelFilter,
+  type LogKind,
+  type LogLevel,
+} from "../store/logs";
+import { selectLogRetention, useSettingsStore } from "../store/settings";
+import { Btn, Num, cn } from "./ui";
 
-type TabId = "op" | "app" | "core";
-
-const tabs: { id: TabId; label: string; lines: LogLine[] }[] = [
-  { id: "op", label: "操作日志", lines: opLogs },
-  { id: "app", label: "应用日志", lines: appLogs },
-  { id: "core", label: "sing-box 日志", lines: coreLogs },
+const tabs: { id: LogKind; label: string }[] = [
+  { id: "operation", label: "操作日志" },
+  { id: "app", label: "应用日志" },
+  { id: "singbox", label: "sing-box 日志" },
 ];
 
 const levelStyle: Record<LogLevel, string> = {
@@ -17,6 +26,15 @@ const levelStyle: Record<LogLevel, string> = {
   ERROR: "text-danger",
 };
 
+const LEVEL_OPTIONS: LevelFilter[] = ["ALL", "INFO", "OK", "WARN", "ERROR"];
+
+/** 三类日志各自的保留天数字段。 */
+const retentionField = {
+  operation: "operationDays",
+  app: "appDays",
+  singbox: "singboxDays",
+} as const;
+
 export default function LogPanel({
   collapsed,
   onToggleCollapse,
@@ -24,20 +42,39 @@ export default function LogPanel({
   collapsed: boolean;
   onToggleCollapse: () => void;
 }) {
-  const [tab, setTab] = useState<TabId>("op");
-  const [level, setLevel] = useState<"ALL" | LogLevel>("ALL");
-  const [cleared, setCleared] = useState<Record<TabId, number | null>>({
-    op: null,
-    app: null,
-    core: null,
-  });
-  const [retention, setRetention] = useState({ op: 30, app: 30, core: 30 });
+  const lines = useLogsStore(selectLogLines);
+  const levels = useLogsStore(selectLogLevels);
+  const setLevel = useLogsStore((state) => state.setLevel);
+  const clear = useLogsStore((state) => state.clear);
+  const retention = useSettingsStore(selectLogRetention);
+  const patch = useSettingsStore((state) => state.patch);
+
+  const [tab, setTab] = useState<LogKind>("operation");
+  const [lastClear, setLastClear] = useState<{ kind: LogKind; report: ClearReport } | null>(
+    null,
+  );
+  const [copied, setCopied] = useState(false);
 
   const current = tabs.find((t) => t.id === tab)!;
-  const isCleared = cleared[tab] !== null;
-  const lines = isCleared
-    ? []
-    : current.lines.filter((l) => level === "ALL" || l.level === level);
+  const visible = filterByLevel(lines[tab], levels[tab]);
+
+  const onClear = async () => {
+    const report = await clear(tab);
+    if (report) setLastClear({ kind: tab, report });
+  };
+
+  const onCopy = async () => {
+    const text = visible
+      .map((line) => `${formatLogClock(line.ts)} ${line.level} ${line.text}`)
+      .join("\n");
+    try {
+      await navigator.clipboard?.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 剪贴板不可用时保持静默，不打断操作。
+    }
+  };
 
   return (
     <section className="flex-1 min-h-0 flex flex-col bg-panel border-t border-line">
@@ -56,53 +93,61 @@ export default function LogPanel({
               )}
             >
               {t.label}
-              <span className="num ml-1.5 text-[12px] text-dim">
-                {cleared[t.id] !== null ? 0 : t.lines.length}
-              </span>
+              <span className="num ml-1.5 text-[12px] text-dim">{lines[t.id].length}</span>
             </button>
           ))}
         </div>
 
         <div className="ml-auto flex items-center gap-1.5">
+          {lastClear && lastClear.kind === tab ? (
+            <span className="text-[12px] text-dim num">
+              已清理 {lastClear.report.entries} 条 / {lastClear.report.files} 个文件
+            </span>
+          ) : null}
+
           <select
-            value={level}
-            onChange={(e) => setLevel(e.target.value as typeof level)}
+            value={levels[tab]}
+            onChange={(e) => setLevel(tab, e.target.value as LevelFilter)}
             className="h-7 bg-panel border border-line rounded-[3px] px-1.5 text-[12px] text-muted outline-none focus:border-accent-dim"
           >
-            <option value="ALL">全部级别</option>
-            <option value="INFO">INFO</option>
-            <option value="OK">OK</option>
-            <option value="WARN">WARN</option>
-            <option value="ERROR">ERROR</option>
+            {LEVEL_OPTIONS.map((level) => (
+              <option key={level} value={level}>
+                {level === "ALL" ? "全部级别" : level}
+              </option>
+            ))}
           </select>
 
-          <div className="h-7 flex items-center gap-1 border border-line rounded-[3px] px-1.5 bg-panel">
+          <div className="h-7 flex items-center gap-1">
             <span className="text-[12px] text-dim">保留</span>
-            <input
-              value={retention[tab]}
-              onChange={(e) =>
-                setRetention((r) => ({
-                  ...r,
-                  [tab]: Number(e.target.value) || 0,
-                }))
-              }
-              className="num w-7 bg-transparent text-[12px] text-text text-center outline-none"
+            <Num
+              value={retention[retentionField[tab]]}
+              unit="天"
+              width="76px"
+              min={1}
+              max={3650}
+              onChange={(value) => {
+                patch({ logRetention: { [retentionField[tab]]: value } });
+                // 保留天数要立即生效，不等防抖。
+                void useSettingsStore.getState().flush();
+              }}
             />
-            <span className="text-[12px] text-dim">天</span>
           </div>
 
           <Btn
             variant="danger"
             className="h-7 px-2 text-[12px]"
-            onClick={() =>
-              setCleared((c) => ({ ...c, [tab]: current.lines.length }))
-            }
+            onClick={() => void onClear()}
             title={`清空${current.label}的界面内容与磁盘文件`}
           >
             清理日志
           </Btn>
-          <Btn variant="ghost" className="h-7 px-2 text-[12px]">
-            复制
+          <Btn
+            variant="ghost"
+            className="h-7 px-2 text-[12px]"
+            onClick={() => void onCopy()}
+            title={`复制当前${current.label}的可见内容`}
+          >
+            {copied ? "已复制" : "复制"}
           </Btn>
           <Btn
             variant="ghost"
@@ -116,45 +161,35 @@ export default function LogPanel({
 
       {collapsed ? null : (
         <div className="flex-1 min-h-0 overflow-auto overscroll-contain px-4 py-1.5 pb-3 num text-[12px] leading-[1.75]">
-          {isCleared ? (
-            <div className="flex flex-col gap-0.5">
-              <div className="text-dim">
-                <span className="text-muted">12:04:02.005</span>
-                <span className="text-warn ml-3">[清理]</span>
-                <span className="ml-3 text-muted">
-                  已清理：{current.label}，删除 {cleared[tab]} 条 / 3 个文件
-                </span>
-              </div>
-              <div className="text-dim">（该类型日志已清空）</div>
+          {visible.length === 0 ? (
+            <div className="text-dim">
+              {lines[tab].length === 0
+                ? `（${current.label}为空）`
+                : `（没有 ${levels[tab]} 级别的${current.label}）`}
             </div>
           ) : (
-            lines.map((l, i) => (
+            visible.map((line, index) => (
               <div
-                key={i}
+                key={`${line.ts}-${index}`}
                 className="grid grid-cols-[92px_64px_1fr] gap-3 hover:bg-panel-2/60 -mx-1 px-1"
               >
-                <span className="text-dim">{l.time}</span>
-                <span
-                  className={cn(
-                    "text-[12px] tracking-wider",
-                    levelStyle[l.level],
-                  )}
-                >
-                  {l.level}
+                <span className="text-dim">{formatLogClock(line.ts)}</span>
+                <span className={cn("text-[12px] tracking-wider", levelStyle[line.level])}>
+                  {line.level}
                 </span>
                 <span
                   className={cn(
                     "min-w-0 whitespace-pre-wrap break-words",
-                    l.level === "ERROR"
+                    line.level === "ERROR"
                       ? "text-danger/90"
-                      : l.level === "WARN"
+                      : line.level === "WARN"
                         ? "text-warn/85"
-                        : l.level === "OK"
+                        : line.level === "OK"
                           ? "text-text/90"
                           : "text-text/75",
                   )}
                 >
-                  {l.text}
+                  {line.text}
                 </span>
               </div>
             ))

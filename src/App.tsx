@@ -7,6 +7,7 @@ import TopBar from "./components/TopBar";
 import { Dot } from "./components/ui";
 import { selectSettings, selectUi, useSettingsStore } from "./store/settings";
 import { usePoolStore } from "./store/pool";
+import { useLogsStore } from "./store/logs";
 
 export default function App() {
   const settings = useSettingsStore(selectSettings);
@@ -38,6 +39,24 @@ export default function App() {
     };
     window.addEventListener("pagehide", flush);
     return () => window.removeEventListener("pagehide", flush);
+  }, []);
+
+  // 启动时读回最近若干行日志，并订阅后端推送的新日志。
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let active = true;
+    void useLogsStore.getState().load();
+    void useLogsStore
+      .getState()
+      .subscribe()
+      .then((fn) => {
+        if (active) unlisten = fn;
+        else fn();
+      });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
