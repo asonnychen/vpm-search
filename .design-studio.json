@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "name": "vpm-search 优选测速终端",
+  "type": "prototype",
+  "url": "http://localhost:5173",
+  "command": "pnpm dev",
+  "entry": "index.html",
+  "harness": { "direction": "auto", "fidelity": "hi-fi", "critiquePolicy": "required" }
+}

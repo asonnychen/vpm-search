@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #fafafa;
+  --color-panel: #ffffff;
+  --color-panel-2: #f4f4f5;
+  --color-line: #e7e7ea;
+  --color-line-2: #d4d4d8;
+  --color-text: #171717;
+  --color-muted: #525252;
+  --color-dim: #737373;
+  --color-accent: #1e40af;
+  --color-accent-strong: #1e3a8a;
+  --color-accent-soft: #eef2ff;
+  --color-accent-dim: #93a5d6;
+  --color-warn: #b45309;
+  --color-danger: #dc2626;
+  --font-sans: "Inter Variable", Inter, "Helvetica Neue", Helvetica,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "微软雅黑", Arial,
+    sans-serif;
+  --font-mono: "Inter Variable", Inter, "Helvetica Neue", Helvetica,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "微软雅黑", Arial,
+    sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  color-scheme: light;
+}
+
+/* 数字只对齐，不换字体：全站一套字体 */
+.num {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #d4d4d8;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #b4b4ba;
+  background-clip: content-box;
+}
+
+@layer base {
+  input,
+  select,
+  textarea,
+  button {
+    font-family: inherit;
+    font-size: 12px;
+    color: inherit;
+  }
+
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  button:focus-visible {
+    outline: 2px solid var(--color-accent-dim);
+    outline-offset: 1px;
+  }
+}
