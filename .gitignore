@@ -3,6 +3,7 @@ dist/
 target/
 src-tauri/target/
 src-tauri/gen/
+*.tsbuildinfo
 .playwright-mcp/
 .design-studio/
 .tickets/
