@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,6 +17,7 @@ use super::batch::{BatchItem, BatchProber};
 use super::config::build_slot_config;
 use super::port::pick_free_port_avoiding;
 use super::singbox::{spawn_singbox, wait_until_ready, TempConfig, STARTUP_TIMEOUT};
+use super::speed::{self, SpeedOptions, SpeedProber};
 use super::{classify, Attempt, Endpoint, ProbeOptions, ProbeOutcome, PROBE_URL};
 
 /// 一条地址在某个槽位进程里的入口。
@@ -210,6 +212,41 @@ impl BatchProber for SlotPool {
         options: &ProbeOptions,
     ) -> ProbeOutcome {
         self.measure(endpoint, options)
+    }
+}
+
+impl SpeedProber for SlotPool {
+    /// 经该地址所属槽位的本地 mixed 入站并发下载，换算成 MB/s。
+    fn speed_sample(
+        &self,
+        endpoint: &Endpoint,
+        options: &ProbeOptions,
+        speed: &SpeedOptions,
+        cancel: &AtomicBool,
+    ) -> Result<f64, String> {
+        let Some(lane) = self.lanes.get(&(endpoint.host.clone(), endpoint.port)) else {
+            return Err("槽位池里没有这条地址".to_string());
+        };
+
+        let result = speed::download_streams(
+            Some(&format!("http://127.0.0.1:{}", lane.port)),
+            options.connect_timeout,
+            speed,
+            cancel,
+        );
+
+        // 槽位进程中途退出时，把日志路径带进失败原因。
+        if result.is_err() {
+            if let Ok(mut child) = self.slots[lane.slot].child.lock() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(format!(
+                        "sing-box 槽位中途退出（{status}），本轮已终止。sing-box 日志：{}",
+                        self.log_path.display()
+                    ));
+                }
+            }
+        }
+        result
     }
 }
 

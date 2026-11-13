@@ -1,11 +1,13 @@
 //! 测试用的假探测器：不启动任何进程，按预设返回结论。
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use crate::template::NodeTemplate;
 
 use super::batch::{BatchItem, BatchProber};
+use super::speed::{SpeedOptions, SpeedProber};
 use super::{Attempt, Endpoint, ProbeOptions, ProbeOutcome, Prober};
 
 /// 按预设尝试结果返回，并记录调用过的地址。
@@ -16,7 +18,10 @@ pub struct FakeProber {
     attempts: Mutex<Vec<Attempt>>,
     /// 按地址预设的采样序列，优先于 `attempts`；批量测试用。
     scripted: Mutex<HashMap<(String, u16), Vec<Attempt>>>,
+    /// 按地址预设的测速结果。
+    speeds: Mutex<HashMap<(String, u16), Result<f64, String>>>,
     calls: Mutex<Vec<(String, u16)>>,
+    speed_calls: Mutex<Vec<(String, u16)>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // 只在测试里构造
@@ -25,7 +30,9 @@ impl FakeProber {
         Self {
             attempts: Mutex::new(attempts),
             scripted: Mutex::new(HashMap::new()),
+            speeds: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
+            speed_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -43,12 +50,34 @@ impl FakeProber {
         Self {
             attempts: Mutex::new(Vec::new()),
             scripted: Mutex::new(scripted),
+            speeds: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
+            speed_calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 预设每条地址的测速结果；没预设的地址返回失败。
+    pub fn with_speeds(
+        self,
+        entries: Vec<((&str, u16), Result<f64, String>)>,
+    ) -> Self {
+        if let Ok(mut speeds) = self.speeds.lock() {
+            for ((host, port), result) in entries {
+                speeds.insert((host.to_string(), port), result);
+            }
+        }
+        self
     }
 
     pub fn calls(&self) -> Vec<(String, u16)> {
         self.calls.lock().map(|calls| calls.clone()).unwrap_or_default()
+    }
+
+    pub fn speed_calls(&self) -> Vec<(String, u16)> {
+        self.speed_calls
+            .lock()
+            .map(|calls| calls.clone())
+            .unwrap_or_default()
     }
 
     fn next_attempt(&self, endpoint: &Endpoint) -> Attempt {
@@ -104,6 +133,25 @@ impl BatchProber for FakeProber {
         options: &ProbeOptions,
     ) -> ProbeOutcome {
         self.measure_latency(endpoint, template, options)
+    }
+}
+
+impl SpeedProber for FakeProber {
+    fn speed_sample(
+        &self,
+        endpoint: &Endpoint,
+        _options: &ProbeOptions,
+        _speed: &SpeedOptions,
+        _cancel: &AtomicBool,
+    ) -> Result<f64, String> {
+        if let Ok(mut calls) = self.speed_calls.lock() {
+            calls.push((endpoint.host.clone(), endpoint.port));
+        }
+        self.speeds
+            .lock()
+            .ok()
+            .and_then(|speeds| speeds.get(&(endpoint.host.clone(), endpoint.port)).cloned())
+            .unwrap_or_else(|| Err("假探测器没有预设测速结果".to_string()))
     }
 }
 

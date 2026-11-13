@@ -4,11 +4,13 @@ import {
   probeKey,
   selectProbeError,
   selectProbeResults,
+  selectProbeSpeeds,
   selectProbeTesting,
   useProbeStore,
 } from "../store/probe";
 import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
 import { activeTemplate, templateColumns } from "../store/template";
+import { useSelectionStore } from "../store/selection";
 import { sortRows, type SortDir, type SortKey } from "../store/tableSort";
 import { cn } from "./ui";
 
@@ -23,9 +25,13 @@ type Row = {
   source: string;
   latency: number | null;
   speed: number | null;
+  /** 测速状态，与延迟状态分开，失败时速度列显示「失败」。 */
+  speedStatus: "ok" | "fail" | "untested";
   status: RowStatus;
   /** 失败或超时的原因，悬浮时显示。 */
   error: string | null;
+  /** 测速失败原因。 */
+  speedError: string | null;
 };
 
 const filterDefs = [
@@ -68,7 +74,10 @@ function latencyCell(row: Row, threshold: number) {
 export default function ResultsTable() {
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<string[]>([]);
+  const selected = useSelectionStore((state) => state.ids);
+  const setIds = useSelectionStore((state) => state.setIds);
+  const setSelected = (updater: string[] | ((prev: string[]) => string[])) =>
+    setIds(typeof updater === "function" ? updater(selected) : updater);
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({
     key: "latency",
     dir: "asc",
@@ -82,6 +91,7 @@ export default function ResultsTable() {
 
   // 单条真连接延迟的结果按 `host:port` 覆盖到对应行，未测的行保持 null。
   const probeResults = useProbeStore(selectProbeResults);
+  const probeSpeeds = useProbeStore(selectProbeSpeeds);
   const probeTesting = useProbeStore(selectProbeTesting);
   const probeError = useProbeStore(selectProbeError);
   const testOne = useProbeStore((state) => state.testOne);
@@ -89,20 +99,24 @@ export default function ResultsTable() {
   const rows = useMemo<Row[]>(
     () =>
       poolEntries.map((entry) => {
-        const result = probeResults[probeKey(entry.host, entry.port)];
+        const key = probeKey(entry.host, entry.port);
+        const result = probeResults[key];
+        const speed = probeSpeeds[key];
         return {
-          id: `${entry.host}:${entry.port}`,
+          id: key,
           host: entry.host,
           port: entry.port,
           alias: entry.alias,
           source: entry.source,
           latency: result?.latencyMs ?? null,
-          speed: null,
+          speed: speed?.mbps ?? null,
+          speedStatus: speed?.status ?? "untested",
           status: result?.status ?? "untested",
           error: result?.error ?? null,
+          speedError: speed?.error ?? null,
         };
       }),
-    [poolEntries, probeResults],
+    [poolEntries, probeResults, probeSpeeds],
   );
 
   const counts = useMemo(() => {
@@ -464,14 +478,19 @@ export default function ResultsTable() {
                       latencyCell(r, threshold)
                     )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    {r.speed === null ? (
-                      <span className="text-dim">—</span>
-                    ) : (
+                  <td
+                    className="border-b border-line/60 px-2 py-1.5 text-right"
+                    title={r.speedError ?? undefined}
+                  >
+                    {r.speedStatus === "fail" ? (
+                      <span className="text-danger text-[12px]">失败</span>
+                    ) : r.speed !== null ? (
                       <span className="num text-text/90">
                         {r.speed.toFixed(1)}
                         <span className="text-dim text-[12px] ml-0.5">MB/s</span>
                       </span>
+                    ) : (
+                      <span className="text-dim">—</span>
                     )}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">

@@ -11,6 +11,7 @@ pub mod fake;
 pub mod port;
 pub mod singbox;
 pub mod slot;
+pub mod speed;
 
 pub use singbox::SingBoxProber;
 

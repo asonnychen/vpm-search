@@ -3,6 +3,7 @@ import {
   createProbeStore,
   normalizeBatchReport,
   normalizeProbeResult,
+  normalizeSpeedReport,
   probeKey,
   type ProbePersistence,
 } from "./probe";
@@ -25,6 +26,17 @@ function fakePersistence(
       rows: [
         { host: "104.16.1.1", port: 8443, alias: "", status: "ok", latencyMs: 80, error: null },
         { host: "104.16.2.2", port: 8443, alias: "", status: "timeout", latencyMs: null, error: "超时" },
+      ],
+    })),
+    speedBatch: vi.fn(async () => ({
+      runId: "run-1",
+      total: 2,
+      completed: 2,
+      stopped: false,
+      counts: { ok: 1, fail: 1, untested: 0 },
+      rows: [
+        { host: "104.16.1.1", port: 8443, alias: "", status: "ok", mbps: 12.3, error: null },
+        { host: "104.16.2.2", port: 8443, alias: "", status: "fail", mbps: null, error: "连接被拒绝" },
       ],
     })),
     cancelBatch: vi.fn(async () => true),
@@ -256,6 +268,81 @@ describe("批量测试", () => {
       stopped: false,
       counts: { ok: 0, timeout: 0, fail: 0, untested: 0 },
       rows: [],
+    });
+  });
+});
+
+describe("测速", () => {
+  it("测速结果写进速度表且不清空已有延迟结果", async () => {
+    const persistence = fakePersistence();
+    const store = createProbeStore(persistence);
+
+    await store.getState().testOne("104.16.1.1", 8443);
+    await store.getState().startSpeedBatch([{ host: "104.16.1.1", port: 8443 }]);
+
+    expect(persistence.speedBatch).toHaveBeenCalledWith([
+      { host: "104.16.1.1", port: 8443 },
+    ]);
+    // 延迟结果仍在，测速单独落进另一张表。
+    expect(store.getState().results["104.16.1.1:8443"].latencyMs).toBe(120);
+    expect(store.getState().speeds["104.16.1.1:8443"]).toEqual({
+      status: "ok",
+      mbps: 12.3,
+      error: null,
+    });
+    expect(store.getState().speeds["104.16.2.2:8443"]).toEqual({
+      status: "fail",
+      mbps: null,
+      error: "连接被拒绝",
+    });
+  });
+
+  it("成功却没有正速度时按失败处理，不显示 0", () => {
+    const report = normalizeSpeedReport({
+      runId: "run-1",
+      rows: [
+        { host: "104.16.1.1", port: 8443, status: "ok", mbps: 0 },
+        { host: "104.16.1.2", port: 8443, status: "ok", mbps: -1 },
+      ],
+    });
+
+    expect(report.rows[0]).toMatchObject({ status: "fail", mbps: null });
+    expect(report.rows[1]).toMatchObject({ status: "fail", mbps: null });
+  });
+
+  it("停止后未测的行不覆盖已有速度", async () => {
+    const first = fakePersistence();
+    const store = createProbeStore(first);
+    await store.getState().startSpeedBatch();
+
+    const second = fakePersistence({
+      speedBatch: vi.fn(async () => ({
+        runId: "run-2",
+        total: 1,
+        completed: 0,
+        stopped: true,
+        counts: { ok: 0, fail: 0, untested: 1 },
+        rows: [
+          { host: "104.16.1.1", port: 8443, alias: "", status: "untested", mbps: null, error: null },
+        ],
+      })),
+    });
+    const restarted = createProbeStore(second);
+    restarted.setState({ speeds: store.getState().speeds });
+    await restarted.getState().startSpeedBatch();
+
+    expect(restarted.getState().speeds["104.16.1.1:8443"].mbps).toBe(12.3);
+  });
+
+  it("测速中标记为 speed 模式并记录进度", () => {
+    const store = createProbeStore(fakePersistence());
+    store.getState().applyProgress({ runId: "run-1", mode: "speed", completed: 2, total: 5 });
+
+    expect(store.getState().batch).toMatchObject({
+      running: true,
+      mode: "speed",
+      completed: 2,
+      total: 5,
     });
   });
 });

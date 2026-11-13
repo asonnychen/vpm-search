@@ -3,6 +3,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use crate::template::NodeTemplate;
 
 use super::config::build_config;
 use super::port::pick_free_port;
+use super::speed::{self, SpeedOptions};
 use super::{classify, Attempt, Endpoint, ProbeOptions, ProbeOutcome, Prober, PROBE_URL};
 
 /// 启动 sing-box 后等待本地入站就绪的上限。
@@ -185,6 +187,40 @@ impl SingBoxProber {
             _config: config,
         })
     }
+
+    /// 为一条地址起一个临时 sing-box 进程并等本地入站就绪，返回会话与端口。
+    fn start_session(
+        &self,
+        endpoint: &Endpoint,
+        template: &NodeTemplate,
+    ) -> Result<(Session, u16), String> {
+        if !self.binary.is_file() {
+            return Err(format!(
+                "未找到 sing-box（{}），请先运行 scripts/fetch-singbox.ps1。{}",
+                self.binary.display(),
+                self.log_hint()
+            ));
+        }
+
+        let port = pick_free_port().ok_or_else(|| {
+            format!("20000–29999 内没有可用端口。{}", self.log_hint())
+        })?;
+
+        let config = build_config(endpoint, template, port);
+        let contents = serde_json::to_string_pretty(&config).unwrap_or_default();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = format!("probe-{}-{unique}.json", std::process::id());
+        let config = TempConfig::create(&self.temp_dir, &name, &contents)
+            .map_err(|error| format!("写入临时配置失败：{error}。{}", self.log_hint()))?;
+
+        let mut session = self.spawn(config)?;
+        wait_until_ready(&mut session.child, port, STARTUP_TIMEOUT)
+            .map_err(|error| format!("{error}。{}", self.log_hint()))?;
+        Ok((session, port))
+    }
 }
 
 /// 启动一个 sing-box 进程，并把 stdout/stderr 推进日志通道。
@@ -232,6 +268,34 @@ impl Prober for SingBoxProber {
         options: &ProbeOptions,
     ) -> ProbeOutcome {
         classify(self.attempt(endpoint, template, options))
+    }
+
+    /// 单地址测速：同一条代理链路上并发下载 4×2.5MB，上限 15 秒。
+    fn measure_speed(
+        &self,
+        endpoint: &Endpoint,
+        template: &NodeTemplate,
+        options: &ProbeOptions,
+    ) -> Result<f64, String> {
+        let (mut session, port) = self.start_session(endpoint, template)?;
+        let speed = SpeedOptions::default();
+        let cancel = AtomicBool::new(false);
+        let result = speed::download_streams(
+            Some(&format!("http://127.0.0.1:{port}")),
+            options.connect_timeout,
+            &speed,
+            &cancel,
+        );
+
+        if result.is_err() {
+            if let Ok(Some(status)) = session.child.try_wait() {
+                return Err(format!(
+                    "sing-box 中途退出（{status}），本轮已终止。{}",
+                    self.log_hint()
+                ));
+            }
+        }
+        result
     }
 }
 

@@ -623,6 +623,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
             "probe:progress",
             serde_json::json!({
                 "runId": run_for_progress,
+                "mode": "latency",
                 "completed": progress.completed,
                 "total": progress.total,
             }),
@@ -771,10 +772,323 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
     })
 }
 
+/// 一条测速目标，界面传选中行时使用。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpeedTarget {
+    host: String,
+    port: u16,
+}
+
+/// 一条测速结果的对外形状。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpeedRowDto {
+    host: String,
+    port: u16,
+    alias: String,
+    status: &'static str,
+    mbps: Option<f64>,
+    error: Option<String>,
+}
+
+/// 一轮测速的完整结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpeedReportDto {
+    run_id: String,
+    total: usize,
+    completed: usize,
+    stopped: bool,
+    counts: probe::speed::SpeedCounts,
+    rows: Vec<SpeedRowDto>,
+}
+
+/// 一键多线程测速：整池地址或指定选中行，经同一代理链路下载并换算 MB/s。
+///
+/// 结果写进最近一轮 `test_result` 的速度字段，延迟列不受影响；
+/// 没有历史轮次时才新建一轮。停止后已开始的行标失败，未开始的行保持原值。
+#[tauri::command]
+async fn probe_speed_batch(
+    app: tauri::AppHandle,
+    targets: Option<Vec<SpeedTarget>>,
+) -> Result<SpeedReportDto, String> {
+    let state = app.state::<AppState>();
+
+    // 读设置与池：只短暂加锁，测速期间不占着数据库。
+    let (template, options, concurrency, entries) = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        let settings = store.load_settings().map_err(|e| e.to_string())?;
+        let template = settings
+            .node_templates
+            .iter()
+            .find(|template| template.id == settings.active_template_id)
+            .or_else(|| settings.node_templates.first())
+            .cloned()
+            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
+        (
+            template,
+            probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
+            settings.concurrency as usize,
+            store.list_pool_entries().map_err(|e| e.to_string())?,
+        )
+    };
+
+    let wanted: Option<std::collections::HashSet<(String, u16)>> = targets.as_ref().map(|list| {
+        list.iter()
+            .map(|target| (target.host.trim().to_string(), target.port))
+            .collect()
+    });
+
+    let items: Vec<probe::batch::BatchItem> = entries
+        .into_iter()
+        .filter(|entry| {
+            wanted
+                .as_ref()
+                .map(|set| set.contains(&(entry.host.clone(), entry.port)))
+                .unwrap_or(true)
+        })
+        .map(|entry| {
+            probe::batch::BatchItem::new(
+                probe::Endpoint::new(entry.host, entry.port),
+                entry.alias,
+            )
+        })
+        .collect();
+
+    if items.is_empty() {
+        return Err("没有可测速的地址，请先抓取优选源或选中行".to_string());
+    }
+
+    let binary = resolve_singbox(&app)?;
+    let speed = probe::speed::SpeedOptions::default();
+
+    // 与延迟测试共用同一个「正在跑」槽位：同一时间只允许一轮。
+    let control = Arc::new(BatchControl {
+        cancel: AtomicBool::new(false),
+    });
+    {
+        let mut guard = state
+            .batch
+            .lock()
+            .map_err(|_| "测试状态锁已损坏".to_string())?;
+        if guard.is_some() {
+            return Err("测试正在进行，请先停止或等待结束".to_string());
+        }
+        *guard = Some(control.clone());
+    }
+
+    let started_at = logs::now_iso8601();
+    let started = Instant::now();
+    let params = serde_json::json!({
+        "mode": "speed",
+        "kind": template.kind,
+        "transport": template.transport,
+        "tls": template.tls,
+        "streams": speed.streams,
+        "sizeMb": speed.total_bytes / 1_000_000,
+        "timeoutS": speed.timeout.as_secs(),
+        "concurrency": concurrency,
+        "total": items.len(),
+    });
+
+    // 挂到最近一轮结果上；没有历史轮次时才新建。
+    let run_id = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        match store.latest_test_run_id().map_err(|e| e.to_string())? {
+            Some(id) => id,
+            None => {
+                let id = format!("run-{}", logs::new_span_id());
+                store
+                    .insert_test_run(&store::TestRunRecord {
+                        id: &id,
+                        started_at: &started_at,
+                        finished_at: &started_at,
+                        params_json: &params.to_string(),
+                        total: items.len() as u32,
+                        ok_count: 0,
+                        timeout_count: 0,
+                        fail_count: 0,
+                    })
+                    .map_err(|e| e.to_string())?;
+                id
+            }
+        }
+    };
+
+    log_operation(
+        state.inner(),
+        &app,
+        LogLevel::Info,
+        &run_id,
+        &format!(
+            "开始测速：{} 条，{} 流 × {}MB，并发 {}，上限 {}s",
+            items.len(),
+            speed.streams,
+            speed.total_bytes / 1_000_000,
+            concurrency,
+            speed.timeout.as_secs()
+        ),
+    );
+
+    let app_for_progress = app.clone();
+    let run_for_progress = run_id.clone();
+    let on_progress = move |progress: probe::batch::BatchProgress| {
+        let _ = app_for_progress.emit(
+            "probe:progress",
+            serde_json::json!({
+                "runId": run_for_progress,
+                "mode": "speed",
+                "completed": progress.completed,
+                "total": progress.total,
+            }),
+        );
+    };
+
+    let cancel = control.clone();
+    let singbox = state.singbox.clone();
+    let log_path = state.logs.today_path(LogKind::Singbox);
+    let temp_dir = state.temp_dir.clone();
+    let blocking_items = items.clone();
+    let blocking_template = template.clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let pool = probe::slot::SlotPool::start(
+            binary,
+            singbox,
+            log_path,
+            temp_dir,
+            &blocking_items,
+            &blocking_template,
+            concurrency,
+        )?;
+        let report = probe::speed::run_speed_batch(
+            &pool,
+            &blocking_items,
+            &options,
+            &speed,
+            concurrency,
+            &cancel.cancel,
+            &on_progress,
+        )?;
+        drop(pool);
+        Ok::<_, String>(report)
+    })
+    .await;
+
+    // 无论成功、失败、停止还是任务异常，都要把这一轮从「正在跑」里摘掉。
+    if let Ok(mut guard) = state.batch.lock() {
+        *guard = None;
+    }
+
+    let report = joined.map_err(|e| format!("测速任务异常结束：{e}"))??;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        probe::speed::persist_speed(store, &run_id, &report.rows)?;
+    }
+
+    for row in &report.rows {
+        let mut record = AppLogRecord::new(
+            match row.outcome.status {
+                probe::ProbeStatus::Ok => LogLevel::Info,
+                probe::ProbeStatus::Fail => LogLevel::Warn,
+                probe::ProbeStatus::Timeout => LogLevel::Warn,
+                probe::ProbeStatus::Untested => LogLevel::Info,
+            },
+            "probe",
+            "probe.speed.item",
+        )
+        .trace(&run_id)
+        .span(&logs::new_span_id())
+        .params(serde_json::json!({
+            "host": row.endpoint.host,
+            "port": row.endpoint.port,
+            "alias": row.alias,
+        }))
+        .result(serde_json::json!({
+            "status": row.outcome.status.as_str(),
+            "mbps": row.outcome.mbps,
+        }));
+        if let Some(error) = &row.outcome.error {
+            record = record.error(error, None);
+        }
+        log_app(state.inner(), &app, record);
+    }
+
+    let counts = report.counts();
+    log_app(
+        state.inner(),
+        &app,
+        AppLogRecord::new(LogLevel::Info, "probe", "probe.speed")
+            .trace(&run_id)
+            .duration(duration_ms)
+            .params(params.clone())
+            .result(serde_json::json!({
+                "ok": counts.ok,
+                "fail": counts.fail,
+                "untested": counts.untested,
+                "stopped": report.stopped,
+            })),
+    );
+    log_operation(
+        state.inner(),
+        &app,
+        if report.stopped {
+            LogLevel::Warn
+        } else {
+            LogLevel::Ok
+        },
+        &run_id,
+        &format!(
+            "测速结束：成功 {} · 失败 {} · 未测 {}（{}ms）",
+            counts.ok, counts.fail, counts.untested, duration_ms
+        ),
+    );
+
+    Ok(SpeedReportDto {
+        run_id,
+        total: report.total,
+        completed: report.completed,
+        stopped: report.stopped,
+        counts,
+        rows: report
+            .rows
+            .into_iter()
+            .map(|row| SpeedRowDto {
+                host: row.endpoint.host,
+                port: row.endpoint.port,
+                alias: row.alias,
+                status: row.outcome.status.as_str(),
+                mbps: row.outcome.mbps,
+                error: row.outcome.error,
+            })
+            .collect(),
+    })
+}
+
 /// 请求停止当前批量测试；没有在跑时返回 `false`。
 #[tauri::command]
-fn probe_cancel(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let guard = state
+fn probe_cancel(state: tauri::State<'_, AppState>) -> Result<bool, String> {    let guard = state
         .batch
         .lock()
         .map_err(|_| "测试状态锁已损坏".to_string())?;
@@ -1317,6 +1631,7 @@ pub fn run() {
             clear_logs,
             probe_single,
             probe_batch,
+            probe_speed_batch,
             probe_cancel
         ])
         .on_window_event(|window, event| {

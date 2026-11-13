@@ -8,7 +8,8 @@ import {
   useSettingsStore,
 } from "../store/settings";
 import { activeTemplate, deleteTemplate } from "../store/template";
-import { selectProbeBatch, useProbeStore } from "../store/probe";
+import { selectProbeBatch, speedTargetsFromIds, useProbeStore } from "../store/probe";
+import { useSelectionStore } from "../store/selection";
 
 export default function ConfigBar({
   open,
@@ -23,8 +24,13 @@ export default function ConfigBar({
   const patch = useSettingsStore((state) => state.patch);
   const batch = useProbeStore(selectProbeBatch);
   const startBatch = useProbeStore((state) => state.startBatch);
+  const startSpeedBatch = useProbeStore((state) => state.startSpeedBatch);
   const cancelBatch = useProbeStore((state) => state.cancelBatch);
+  const selectedIds = useSelectionStore((state) => state.ids);
   const [panel, setPanel] = useState<TemplatePanelMode | null>(null);
+
+  const runningSpeed = batch.running && batch.mode === "speed";
+  const speedScope = selectedIds.length > 0 ? `选中 ${selectedIds.length} 行` : "整池";
 
   const percent =
     batch.total > 0
@@ -74,9 +80,24 @@ export default function ConfigBar({
             title={batch.running ? "测试进行中，结束后才能再发起一轮" : "对整池地址跑一轮真连接延迟"}
             onClick={() => void startBatch()}
           >
-            {batch.running ? "测试中…" : "一键测试真连接延迟"}
+            {batch.running && batch.mode === "latency" ? "测试中…" : "一键测试真连接延迟"}
           </Btn>
-          <Btn variant="accent">一键多线程测速</Btn>
+          <Btn
+            variant="accent"
+            disabled={batch.running}
+            title={
+              batch.running
+                ? "测试进行中，结束后才能再发起一轮"
+                : `对${speedScope}跑一轮多流测速，不影响已有延迟`
+            }
+            onClick={() =>
+              void startSpeedBatch(
+                selectedIds.length > 0 ? speedTargetsFromIds(selectedIds) : undefined,
+              )
+            }
+          >
+            {runningSpeed ? "测速中…" : "一键多线程测速"}
+          </Btn>
           <Btn
             variant="danger"
             disabled={!batch.running || batch.stopping}
@@ -92,7 +113,11 @@ export default function ConfigBar({
       {batch.running || batch.stopping ? (
         <div className="flex items-center gap-3 px-4 py-1.5 border-t border-line bg-panel-2/40 text-[12px] text-dim">
           <span className="whitespace-nowrap">
-            {batch.stopping ? "正在停止，已开始的会跑完" : "批量测试进行中"}
+            {batch.stopping
+              ? "正在停止，已开始的会跑完"
+              : batch.mode === "speed"
+                ? "批量测速进行中"
+                : "批量测试进行中"}
           </span>
           <span
             className="h-1.5 flex-1 max-w-md bg-canvas ring-1 ring-line rounded-full overflow-hidden"

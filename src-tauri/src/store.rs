@@ -13,7 +13,7 @@ use crate::settings::{Settings, SETTING_KEYS};
 use crate::sources::parse::{CatalogSource, PoolCandidate};
 
 /// 当前 schema 版本，写进 SQLite 的 `user_version`。
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// 阶段 2 建好五张表；本期只有 `settings` 真正读写。
 const SCHEMA_V1: &str = r#"
@@ -84,6 +84,12 @@ ALTER TABLE pool_entry ADD COLUMN source_label TEXT NOT NULL DEFAULT '';
 /// 阶段 7：批量测试每条地址保存三次原始采样。
 const SCHEMA_V4: &str = r#"
 ALTER TABLE test_result ADD COLUMN samples_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
+/// 阶段 8：测速结果与延迟同属一条记录，用独立状态区分「没测」与「测速失败」。
+const SCHEMA_V5: &str = r#"
+ALTER TABLE test_result ADD COLUMN speed_status TEXT NOT NULL DEFAULT 'untested';
+ALTER TABLE test_result ADD COLUMN speed_error TEXT;
 "#;
 
 /// 阶段 5：节点模板补上凭据与传输细节，并记录当前选中的模板。
@@ -257,6 +263,9 @@ impl Store {
         }
         if version < 4 {
             tx.execute_batch(SCHEMA_V4)?;
+        }
+        if version < 5 {
+            tx.execute_batch(SCHEMA_V5)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -597,6 +606,64 @@ impl Store {
         Ok(())
     }
 
+    /// 最近一轮测试的 runId；测速独立触发时挂到这一轮上。
+    pub fn latest_test_run_id(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM test_run ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// 把测速结果写进该轮已有的结果行；没有行时才新建。
+    ///
+    /// 只更新 `speed_*` 三列，绝不触碰延迟、状态与采样，
+    /// 因此独立测速不会覆盖已有的延迟结果。
+    pub fn upsert_test_result_speed(
+        &self,
+        run_id: &str,
+        endpoint: &crate::probe::Endpoint,
+        alias: &str,
+        outcome: &crate::probe::speed::SpeedOutcome,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE test_result
+             SET speed_mbps = ?4, speed_status = ?5, speed_error = ?6
+             WHERE run_id = ?1 AND host = ?2 AND port = ?3",
+            rusqlite::params![
+                run_id,
+                endpoint.host,
+                i64::from(endpoint.port),
+                outcome.mbps,
+                outcome.status.as_str(),
+                outcome.error,
+            ],
+        )?;
+        if changed > 0 {
+            return Ok(());
+        }
+
+        self.conn.execute(
+            "INSERT INTO test_result
+                 (run_id, host, port, alias, status, latency_ms,
+                  speed_mbps, speed_status, speed_error)
+             VALUES (?1, ?2, ?3, ?4, 'untested', NULL, ?5, ?6, ?7)",
+            rusqlite::params![
+                run_id,
+                endpoint.host,
+                i64::from(endpoint.port),
+                alias,
+                outcome.mbps,
+                outcome.status.as_str(),
+                outcome.error,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 阶段 6 只有单条测试，阶段 7 与 11 会用到这两个计数。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn count_test_runs(&self) -> Result<i64> {
@@ -616,7 +683,8 @@ impl Store {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn list_test_results(&self, run_id: &str) -> Result<Vec<TestResultRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT run_id, host, port, alias, status, latency_ms, error, samples_json
+            "SELECT run_id, host, port, alias, status, latency_ms, error, samples_json,
+                    speed_mbps, speed_status, speed_error
              FROM test_result
              WHERE run_id = ?1
              ORDER BY id",
@@ -632,6 +700,9 @@ impl Store {
                 latency_ms: row.get::<_, Option<i64>>(5)?.map(|ms| ms.max(0) as u64),
                 error: row.get(6)?,
                 samples: serde_json::from_str(&samples_json).unwrap_or_default(),
+                speed_mbps: row.get(8)?,
+                speed_status: row.get(9)?,
+                speed_error: row.get(10)?,
             })
         })?;
         let mut results = Vec::new();
@@ -693,6 +764,12 @@ pub struct TestResultRow {
     pub error: Option<String>,
     /// 批量测试的三次原始采样；单条测试为空数组。
     pub samples: Vec<crate::probe::ProbeOutcome>,
+    /// 测速结果，MB/s；未测或失败时为 `None`。
+    pub speed_mbps: Option<f64>,
+    /// 测速状态：`ok` / `fail` / `untested`，与延迟状态互不影响。
+    pub speed_status: String,
+    /// 测速失败原因，成功时为 `None`。
+    pub speed_error: Option<String>,
 }
 
 /// `test_run` 的一行。
