@@ -1,16 +1,19 @@
-import { useState } from "react";
 import { sources } from "../mock";
+import { selectLastInput, useSettingsStore } from "../store/settings";
 import { cn } from "./ui";
 
 export default function PoolPanel() {
-  const [open, setOpen] = useState(false);
+  const lastInput = useSettingsStore(selectLastInput);
+  const open = useSettingsStore((state) => state.settings.ui.poolOpen);
+  const patch = useSettingsStore((state) => state.patch);
+  const setOpen = (next: boolean) => patch({ ui: { poolOpen: next } });
 
   return (
     <section className="shrink-0 border-b border-line bg-panel/60">
       <div className="h-9 flex items-center gap-2 px-4">
         <button
           type="button"
-          onClick={() => setOpen((v) => !v)}
+          onClick={() => setOpen(!open)}
           className="flex items-center gap-1.5 text-[12px] text-muted hover:text-text whitespace-nowrap"
         >
           <svg
@@ -34,7 +37,7 @@ export default function PoolPanel() {
         <div className="ml-auto flex items-center gap-2">
           <button
             type="button"
-            onClick={() => setOpen((v) => !v)}
+            onClick={() => setOpen(!open)}
             className="text-[12px] text-muted hover:text-accent px-2 h-6 border border-line rounded-[3px] bg-panel whitespace-nowrap"
           >
             {open ? "收起" : "展开编辑"}
@@ -51,6 +54,8 @@ export default function PoolPanel() {
             </div>
             <textarea
               spellCheck={false}
+              value={lastInput.sourceUrls}
+              onChange={(e) => patch({ lastInput: { sourceUrls: e.target.value } })}
               className="num w-full h-[68px] bg-transparent p-2 text-[12px] leading-5 text-text outline-none resize-none placeholder:text-dim/80"
               placeholder={
                 "https://bestcf.pages.dev/domain/all.txt\nhttps://bestcf.pages.dev/domain/mini.txt\nhttps://bestcf.pages.dev/vps789/top10.txt"
@@ -62,6 +67,8 @@ export default function PoolPanel() {
             </div>
             <textarea
               spellCheck={false}
+              value={lastInput.manualAddresses}
+              onChange={(e) => patch({ lastInput: { manualAddresses: e.target.value } })}
               className="num w-full h-[52px] bg-transparent p-2 text-[12px] leading-5 text-text outline-none resize-none placeholder:text-dim/80"
               placeholder={
                 "162.159.198.1:8443#EDT导航优选域名 | BestCF.pages.dev\nyg6.ygkkk.dpdns.org:443#VPS789优选"
@@ -85,14 +92,18 @@ export default function PoolPanel() {
                       : "border-accent/25 text-text bg-accent-soft",
                   )}
                 >
-                  <span className={cn("inline-block size-2 rounded-[1px] border", s.broken ? "border-line-2" : s.checked ? "border-accent bg-accent" : "border-line-2 bg-transparent")} />
-                  {s.name}
                   <span
                     className={cn(
-                      "text-[12px]",
-                      s.broken ? "text-dim" : "text-accent",
+                      "inline-block size-2 rounded-[1px] border",
+                      s.broken
+                        ? "border-line-2"
+                        : s.checked
+                          ? "border-accent bg-accent"
+                          : "border-line-2 bg-transparent",
                     )}
-                  >
+                  />
+                  {s.name}
+                  <span className={cn("text-[12px]", s.broken ? "text-dim" : "text-accent")}>
                     {s.count || "—"}
                   </span>
                 </span>

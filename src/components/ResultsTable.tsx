@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { MAX_LATENCY, rows, type Row } from "../mock";
+import { rows, type Row } from "../mock";
+import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
 import { cn } from "./ui";
 
 const filters = [
@@ -12,20 +13,20 @@ const filters = [
 
 type FilterId = (typeof filters)[number]["id"];
 
-function latencyCell(row: Row) {
+function latencyCell(row: Row, threshold: number) {
   if (row.status === "timeout") {
     return <span className="text-warn text-[12px]">超时</span>;
   }
   if (row.status === "fail") {
     return <span className="text-danger text-[12px]">失败</span>;
   }
-  const over = row.latency! > MAX_LATENCY;
+  const over = row.latency! > threshold;
   return (
     <span className="inline-flex items-center justify-end gap-1.5">
       <span className="w-10 h-1 bg-panel-2 ring-1 ring-line rounded-full overflow-hidden">
         <span
           className={cn("block h-full rounded-full", over ? "bg-danger" : "bg-accent")}
-          style={{ width: `${Math.min(100, (row.latency! / MAX_LATENCY) * 100)}%` }}
+          style={{ width: `${Math.min(100, (row.latency! / threshold) * 100)}%` }}
         />
       </span>
       <span className={cn("num", over ? "text-danger" : "text-text")}>
@@ -50,17 +51,17 @@ export default function ResultsTable() {
       s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
     );
 
-  // 列宽：拖拽表头右缘调整，索引与列一一对应
-  const COL_WIDTHS = [64, 60, 172, 140, 58, 54, 84, 96, 54, 46, 156, 112, 88, 84];
-  const [widths, setWidths] = useState<number[]>(COL_WIDTHS);
+  // 列宽来自设置 store：拖拽后防抖落库，重启还原。
+  const widths = useSettingsStore(selectColumnWidths);
+  const setColumnWidth = useSettingsStore((state) => state.setColumnWidth);
+  const threshold = useSettingsStore(selectThresholdMs);
   const resizeRef = useRef<{ i: number; x: number; w: number } | null>(null);
 
   useEffect(() => {
     const move = (e: MouseEvent) => {
       const r = resizeRef.current;
       if (!r) return;
-      const next = Math.max(48, r.w + (e.clientX - r.x));
-      setWidths((ws) => ws.map((w, i) => (i === r.i ? next : w)));
+      setColumnWidth(r.i, Math.max(48, r.w + (e.clientX - r.x)));
     };
     const up = () => {
       resizeRef.current = null;
@@ -73,7 +74,7 @@ export default function ResultsTable() {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
     };
-  }, []);
+  }, [setColumnWidth]);
 
   const startResize = (i: number) => (e: React.MouseEvent) => {
     e.preventDefault();
@@ -88,7 +89,7 @@ export default function ResultsTable() {
       if (filter === "ok" && r.status !== "ok") return false;
       if (filter === "timeout" && r.status !== "timeout") return false;
       if (filter === "fail" && r.status !== "fail") return false;
-      if (filter === "slow" && !(r.latency && r.latency > MAX_LATENCY)) return false;
+      if (filter === "slow" && !(r.latency && r.latency > threshold)) return false;
       if (query) {
         const q = query.toLowerCase();
         return (
@@ -110,7 +111,7 @@ export default function ResultsTable() {
       if (bv === null) return -1;
       return sort.dir === "asc" ? av - bv : bv - av;
     });
-  }, [filter, query, sort]);
+  }, [filter, query, sort, threshold]);
 
   const toggle = (id: string) =>
     setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
@@ -315,7 +316,7 @@ export default function ResultsTable() {
           <tbody>
             {shown.map((r) => {
               const isSel = selected.includes(r.id);
-              const slow = r.latency !== null && r.latency > MAX_LATENCY;
+              const slow = r.latency !== null && r.latency > threshold;
               return (
                 <tr
                   key={r.id}
@@ -397,7 +398,7 @@ export default function ResultsTable() {
                     {r.source}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    {latencyCell(r)}
+                    {latencyCell(r, threshold)}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
                     {r.speed === null ? (
@@ -446,7 +447,7 @@ export default function ResultsTable() {
         <span>共 128 条</span>
         <span>成功 8 · 超时 1 · 失败 1</span>
         <span className="text-line-2">|</span>
-        <span>阈值 {MAX_LATENCY}ms</span>
+        <span>阈值 {threshold}ms</span>
         <span className="ml-auto">
           排序：{sort.key === "latency" ? "延迟" : "速度"}
           {sort.dir === "asc" ? " ↑" : " ↓"}
