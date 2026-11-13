@@ -4,7 +4,7 @@
 //! `%APPDATA%\com.asonnychen.vpm-search\data.db`）。
 //! 测试全部使用临时文件数据库，不触碰真实 `%APPDATA%`。
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use std::path::Path;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use crate::settings::{Settings, SETTING_KEYS};
 use crate::sources::parse::{CatalogSource, PoolCandidate};
 
 /// 当前 schema 版本，写进 SQLite 的 `user_version`。
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 阶段 2 建好五张表；本期只有 `settings` 真正读写。
 const SCHEMA_V1: &str = r#"
@@ -80,6 +80,82 @@ const SCHEMA_V2: &str = r#"
 ALTER TABLE pool_source ADD COLUMN last_error TEXT;
 ALTER TABLE pool_entry ADD COLUMN source_label TEXT NOT NULL DEFAULT '';
 "#;
+
+/// 阶段 5：节点模板补上凭据与传输细节，并记录当前选中的模板。
+///
+/// 旧模板是阶段 2 的 JSON，只含 id / name / kind / transport / tls / sni / path，
+/// 这里逐个补齐缺失字段，保留已有值，不重建、不清空。
+fn migrate_node_templates(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'node_templates'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        // 已经损坏的 JSON 交给读取逻辑回落默认值，迁移不覆盖用户数据。
+        return Ok(());
+    };
+    let Some(items) = value.as_array_mut() else {
+        return Ok(());
+    };
+
+    let defaults: [(&str, serde_json::Value); 7] = [
+        ("server", serde_json::json!("")),
+        ("port", serde_json::json!(443)),
+        ("uuid", serde_json::json!("")),
+        ("password", serde_json::json!("")),
+        ("method", serde_json::json!("")),
+        ("host", serde_json::json!("")),
+        ("serviceName", serde_json::json!("")),
+    ];
+    for item in items.iter_mut() {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        for (key, default) in &defaults {
+            object
+                .entry((*key).to_string())
+                .or_insert_with(|| default.clone());
+        }
+    }
+
+    let normalized = serde_json::to_string(&value)?;
+    tx.execute(
+        "UPDATE settings
+         SET value = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE key = 'node_templates'",
+        rusqlite::params![normalized],
+    )?;
+
+    // 首次升级时把当前模板指向第一条，保证界面有选中项。
+    let active_exists: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'active_template_id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if active_exists.is_none() {
+        let first_id = value
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("id"))
+            .and_then(|id| id.as_str())
+            .unwrap_or("")
+            .to_string();
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES ('active_template_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![serde_json::to_string(&first_id)?],
+        )?;
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 #[allow(dead_code)] // 阶段 3 起会用到全部变体
@@ -172,6 +248,9 @@ impl Store {
         if version < 2 {
             tx.execute_batch(SCHEMA_V2)?;
         }
+        if version < 3 {
+            migrate_node_templates(&tx)?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -238,13 +317,30 @@ impl Store {
     /// 读整份设置：缺失或单个字段损坏时只回落该字段的默认值。
     pub fn load_settings(&self) -> Result<Settings> {
         let defaults = Settings::default();
+        let node_templates: Vec<crate::template::NodeTemplate> = self
+            .read_json("node_templates")?
+            .unwrap_or(defaults.node_templates);
+        // 当前模板被删除或 id 不存在时回落到第一条，界面不会出现空选中。
+        let mut active_template_id = self
+            .read_json::<String>("active_template_id")?
+            .unwrap_or(defaults.active_template_id);
+        if !active_template_id.is_empty()
+            && !node_templates
+                .iter()
+                .any(|template| template.id == active_template_id)
+        {
+            active_template_id = node_templates
+                .first()
+                .map(|template| template.id.clone())
+                .unwrap_or_default();
+        }
+
         Ok(Settings {
             last_input: self
                 .read_json("last_input")?
                 .unwrap_or(defaults.last_input),
-            node_templates: self
-                .read_json("node_templates")?
-                .unwrap_or(defaults.node_templates),
+            node_templates,
+            active_template_id,
             max_latency_ms: self
                 .read_json("max_latency_ms")?
                 .unwrap_or(defaults.max_latency_ms),
@@ -467,6 +563,10 @@ fn settings_to_pairs(settings: &Settings) -> Result<Vec<(&'static str, String)>>
             serde_json::to_string(&settings.node_templates)?,
         ),
         (
+            "active_template_id",
+            serde_json::to_string(&settings.active_template_id)?,
+        ),
+        (
             "max_latency_ms",
             serde_json::to_string(&settings.max_latency_ms)?,
         ),
@@ -559,6 +659,87 @@ mod tests {
         settings.log_retention.app_days = 14;
         settings.log_retention.singbox_days = 60;
 
+        store.save_settings(&settings).unwrap();
+        assert_eq!(store.load_settings().unwrap(), settings);
+    }
+
+    #[test]
+    fn 多条模板与当前选中项重启后仍在() {
+        let (_dir, path) = temp_db();
+        let mut first = crate::template::NodeTemplate::default();
+        first.server = "a.example.com".to_string();
+        first.uuid = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let mut second = first.clone();
+        second.id = "t2".to_string();
+        second.name = "备用 Trojan".to_string();
+        second.kind = "trojan".to_string();
+        second.uuid.clear();
+        second.password = "hunter2".to_string();
+        second.port = 8443;
+
+        {
+            let store = Store::open(&path).unwrap();
+            let settings = Settings {
+                node_templates: vec![first.clone(), second.clone()],
+                active_template_id: "t2".to_string(),
+                ..Settings::default()
+            };
+            store.save_settings(&settings).unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let loaded = store.load_settings().unwrap();
+        assert_eq!(loaded.node_templates.len(), 2);
+        assert_eq!(loaded.active_template_id, "t2");
+        assert_eq!(loaded.node_templates[1].password, "hunter2");
+        assert_eq!(
+            loaded.node_templates[0].uuid,
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn 当前模板不存在时回落到第一条() {
+        let store = Store::open_in_memory().unwrap();
+        store.save_settings(&Settings::default()).unwrap();
+        store
+            .set_setting("active_template_id", "\"已经删掉的模板\"")
+            .unwrap();
+
+        let loaded = store.load_settings().unwrap();
+        assert_eq!(loaded.active_template_id, loaded.node_templates[0].id);
+    }
+
+    #[test]
+    fn 从阶段二的旧模板升级会补齐凭据字段() {
+        let (_dir, path) = temp_db();
+        {
+            // 模拟阶段 2/3/4 的库：schema 到 V2，模板只有旧字段。
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('node_templates', ?1)",
+                [r#"[{"id":"old","name":"旧模板","kind":"vless","transport":"ws","tls":true,"sni":"cdn.example.com","path":"/ws"}]"#],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let settings = store.load_settings().unwrap();
+        let template = &settings.node_templates[0];
+        assert_eq!(template.id, "old");
+        assert_eq!(template.sni, "cdn.example.com");
+        assert_eq!(template.path, "/ws");
+        // 新字段补齐为默认值，旧值不丢。
+        assert_eq!(template.port, 443);
+        assert_eq!(template.server, "");
+        assert_eq!(template.uuid, "");
+        assert_eq!(settings.active_template_id, "old");
+
+        // 迁移后保存再读回仍然一致。
         store.save_settings(&settings).unwrap();
         assert_eq!(store.load_settings().unwrap(), settings);
     }

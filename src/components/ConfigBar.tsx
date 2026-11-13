@@ -1,10 +1,13 @@
+import { useState } from "react";
 import { Btn, Field, Num } from "./ui";
+import TemplatePanel, { type TemplatePanelMode } from "./TemplatePanel";
 import {
   selectNodeTemplates,
   selectSettings,
   selectSpeedParams,
   useSettingsStore,
 } from "../store/settings";
+import { activeTemplate, deleteTemplate } from "../store/template";
 
 export default function ConfigBar({
   open,
@@ -17,8 +20,18 @@ export default function ConfigBar({
   const templates = useSettingsStore(selectNodeTemplates);
   const speed = useSettingsStore(selectSpeedParams);
   const patch = useSettingsStore((state) => state.patch);
+  const [panel, setPanel] = useState<TemplatePanelMode | null>(null);
 
-  const activeTemplate = templates[0];
+  const selected = activeTemplate(templates, settings.activeTemplateId);
+
+  const removeSelected = () => {
+    if (!selected) return;
+    const next = deleteTemplate(templates, settings.activeTemplateId, selected.id);
+    patch({
+      nodeTemplates: next.templates,
+      activeTemplateId: next.activeTemplateId,
+    });
+  };
 
   return (
     <section className="shrink-0 border-b border-line bg-panel/40">
@@ -40,7 +53,7 @@ export default function ConfigBar({
           测试配置
         </button>
         <span className="text-[12px] text-dim num hidden sm:inline">
-          {activeTemplate?.name ?? "未选择模板"} · 最大延时 {settings.maxLatencyMs}ms · 并发{" "}
+          {selected?.name ?? "未选择模板"} · 最大延时 {settings.maxLatencyMs}ms · 并发{" "}
           {settings.concurrency} · 超时 {settings.connectTimeoutS}s/
           {settings.requestTimeoutS}s
         </span>
@@ -55,23 +68,45 @@ export default function ConfigBar({
 
       {open ? (
         <div className="px-4 pb-3 pt-1 flex flex-wrap items-end gap-x-4 gap-y-3">
-          <Field label="节点模板" width="210px">
-            <div className="relative">
-              <select
-                value={activeTemplate?.id ?? ""}
-                onChange={() => {}}
-                className="appearance-none w-full h-8 bg-panel border border-line rounded-[3px] px-2 pr-7 text-[12px] outline-none focus:border-accent-dim"
+          <Field label="节点模板" width="300px">
+            <div className="flex items-center gap-1">
+              <div className="relative flex-1">
+                <select
+                  value={selected?.id ?? ""}
+                  onChange={(event) => {
+                    if (event.target.value === "__new__") {
+                      setPanel("new");
+                      return;
+                    }
+                    patch({ activeTemplateId: event.target.value });
+                  }}
+                  className="appearance-none w-full h-8 bg-panel border border-line rounded-[3px] px-2 pr-7 text-[12px] outline-none focus:border-accent-dim"
+                >
+                  {templates.length === 0 ? <option value="">未选择模板</option> : null}
+                  {templates.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.name}
+                    </option>
+                  ))}
+                  <option value="__new__">+ 新建模板…</option>
+                </select>
+                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-dim text-[12px]">
+                  ▼
+                </span>
+              </div>
+              <Btn variant="ghost" title="新建模板" onClick={() => setPanel("new")}>
+                + 新建
+              </Btn>
+              <Btn
+                variant="ghost"
+                title="重命名当前模板"
+                onClick={() => setPanel("rename")}
               >
-                {templates.map((template) => (
-                  <option key={template.id} value={template.id}>
-                    {template.name}
-                  </option>
-                ))}
-                <option value="__new__">+ 新建模板…</option>
-              </select>
-              <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-dim text-[12px]">
-                ▼
-              </span>
+                重命名
+              </Btn>
+              <Btn variant="danger" title="删除当前模板" onClick={removeSelected}>
+                删除
+              </Btn>
             </div>
           </Field>
 
@@ -136,6 +171,14 @@ export default function ConfigBar({
             <span className="num">128</span> 条待测
           </div>
         </div>
+      ) : null}
+
+      {panel ? (
+        <TemplatePanel
+          key={panel}
+          initialMode={panel}
+          onClose={() => setPanel(null)}
+        />
       ) : null}
     </section>
   );

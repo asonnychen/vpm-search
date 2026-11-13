@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePoolStore } from "../store/pool";
 import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
+import { activeTemplate, templateColumns } from "../store/template";
 import { cn } from "./ui";
 
 type RowStatus = "untested" | "ok" | "timeout" | "fail";
 
-/** 表格行来自优选域名池；阶段 5 之前没有模板，类型/传输/TLS 一律留空。 */
+/** 表格行来自优选域名池；类型/传输/TLS 三列来自当前节点模板。 */
 type Row = {
   id: string;
   host: string;
@@ -64,6 +65,10 @@ export default function ResultsTable() {
   });
 
   const poolEntries = usePoolStore((state) => state.entries);
+  const templates = useSettingsStore((state) => state.settings.nodeTemplates);
+  const activeId = useSettingsStore((state) => state.settings.activeTemplateId);
+  // 切换模板后这三列立刻跟着变；行数据仍来自池。
+  const columns = templateColumns(activeTemplate(templates, activeId));
 
   const rows = useMemo<Row[]>(
     () =>
@@ -389,7 +394,7 @@ export default function ResultsTable() {
                     </button>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5">
-                    <span className="text-dim">—</span>
+                    <span className="text-muted">{columns.kind}</span>
                   </td>
                   <td
                     className="border-b border-line/60 px-2 py-1.5 max-w-[260px] truncate text-text/85"
@@ -404,7 +409,7 @@ export default function ResultsTable() {
                     {r.port}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-muted">
-                    <span className="text-dim">—</span>
+                    {columns.transport}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5">
                     <span className="text-dim">—</span>
@@ -416,7 +421,14 @@ export default function ResultsTable() {
                     <span className="text-dim">—</span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    <span className="text-dim text-[12px]">—</span>
+                    <span
+                      className={cn(
+                        "text-[12px]",
+                        columns.tls === "无" ? "text-dim" : "text-muted",
+                      )}
+                    >
+                      {columns.tls}
+                    </span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-[12px] text-dim whitespace-nowrap">
                     {r.source}

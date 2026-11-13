@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::template::NodeTemplate;
+
 /// 表格列数，与 `ResultsTable` 的列一一对应。
 pub const COLUMN_COUNT: usize = 14;
 
@@ -17,9 +19,10 @@ pub const DEFAULT_COLUMN_WIDTHS: [u32; COLUMN_COUNT] = [
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
 
 /// 设置里每个字段在 `settings` 表中的 key。
-pub const SETTING_KEYS: [&str; 11] = [
+pub const SETTING_KEYS: [&str; 12] = [
     "last_input",
     "node_templates",
+    "active_template_id",
     "max_latency_ms",
     "connect_timeout_s",
     "request_timeout_s",
@@ -45,37 +48,6 @@ impl Default for LastInput {
         Self {
             source_urls: String::new(),
             manual_addresses: String::new(),
-        }
-    }
-}
-
-/// 节点模板。本阶段只保存列表，测试链路在阶段 6 才使用它。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeTemplate {
-    pub id: String,
-    pub name: String,
-    /// 协议类型：vless / vmess / trojan / ss。
-    pub kind: String,
-    /// 传输：ws / grpc / h2 / tcp。
-    pub transport: String,
-    pub tls: bool,
-    #[serde(default)]
-    pub sni: String,
-    #[serde(default)]
-    pub path: String,
-}
-
-impl Default for NodeTemplate {
-    fn default() -> Self {
-        Self {
-            id: "default".to_string(),
-            name: "我的 VLESS-WS".to_string(),
-            kind: "vless".to_string(),
-            transport: "ws".to_string(),
-            tls: true,
-            sni: String::new(),
-            path: "/".to_string(),
         }
     }
 }
@@ -145,6 +117,8 @@ impl Default for UiState {
 pub struct Settings {
     pub last_input: LastInput,
     pub node_templates: Vec<NodeTemplate>,
+    /// 当前选中的模板 id；为空表示没有模板。
+    pub active_template_id: String,
     /// 超阈值判定用的最大延时。
     pub max_latency_ms: u32,
     pub connect_timeout_s: u32,
@@ -162,6 +136,7 @@ impl Default for Settings {
         Self {
             last_input: LastInput::default(),
             node_templates: vec![NodeTemplate::default()],
+            active_template_id: NodeTemplate::default().id,
             max_latency_ms: 200,
             connect_timeout_s: 5,
             request_timeout_s: 10,
@@ -243,12 +218,48 @@ impl Settings {
             if template.name.trim().is_empty() {
                 return Err(ValidationError("节点模板名称不能为空".to_string()));
             }
-            if template.kind.trim().is_empty() {
+            if !crate::template::KINDS.contains(&template.kind.as_str()) {
                 return Err(ValidationError(format!(
-                    "节点模板「{}」缺少协议类型",
+                    "节点模板「{}」的协议类型「{}」不支持",
+                    template.name, template.kind
+                )));
+            }
+            if !crate::template::TRANSPORTS.contains(&template.transport.as_str()) {
+                return Err(ValidationError(format!(
+                    "节点模板「{}」的传输方式「{}」不支持",
+                    template.name, template.transport
+                )));
+            }
+            if template.port == 0 {
+                return Err(ValidationError(format!(
+                    "节点模板「{}」的端口必须在 1–65535 之间",
                     template.name
                 )));
             }
+            if self
+                .node_templates
+                .iter()
+                .filter(|other| other.id == template.id)
+                .count()
+                > 1
+            {
+                return Err(ValidationError(format!(
+                    "节点模板 id「{}」重复",
+                    template.id
+                )));
+            }
+        }
+
+        if !self.active_template_id.is_empty()
+            && !self
+                .node_templates
+                .iter()
+                .any(|template| template.id == self.active_template_id)
+        {
+            return Err(ValidationError(format!(
+                "当前节点模板「{}」不在模板列表中",
+                self.active_template_id
+            )));
         }
 
         if self.last_input.source_urls.chars().count() > 64 * 1024

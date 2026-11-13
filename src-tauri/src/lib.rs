@@ -2,6 +2,7 @@ mod logs;
 mod settings;
 mod sources;
 mod store;
+mod template;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -126,7 +127,7 @@ fn save_settings(
         return Err(message);
     }
 
-    let previous_retention = {
+    let previous = {
         let guard = state
             .store
             .lock()
@@ -134,7 +135,6 @@ fn save_settings(
         guard
             .as_ref()
             .and_then(|store| store.load_settings().ok())
-            .map(|settings| settings.log_retention)
     };
 
     let saved = {
@@ -162,11 +162,50 @@ fn save_settings(
                             "operationDays": settings.log_retention.operation_days,
                             "appDays": settings.log_retention.app_days,
                             "singboxDays": settings.log_retention.singbox_days,
-                        }
+                        },
+                        "templates": settings.node_templates.len(),
+                        "activeTemplate": settings
+                            .node_templates
+                            .iter()
+                            .find(|template| template.id == settings.active_template_id)
+                            .map(|template| template.name.clone()),
                     })),
             );
+
+            // 模板的新增 / 重命名 / 删除 / 切换各留一条操作日志，只记名称与数量。
+            let templates_changed = previous
+                .as_ref()
+                .is_none_or(|old| old.node_templates != settings.node_templates);
+            if templates_changed {
+                log_operation(
+                    state.inner(),
+                    &app,
+                    LogLevel::Info,
+                    &trace,
+                    &format!("节点模板已更新：共 {} 条", settings.node_templates.len()),
+                );
+            }
+            let active_changed = previous
+                .as_ref()
+                .is_none_or(|old| old.active_template_id != settings.active_template_id);
+            if active_changed {
+                let name = settings
+                    .node_templates
+                    .iter()
+                    .find(|template| template.id == settings.active_template_id)
+                    .map(|template| template.name.as_str())
+                    .unwrap_or("无");
+                log_operation(
+                    state.inner(),
+                    &app,
+                    LogLevel::Info,
+                    &trace,
+                    &format!("已切换节点模板：{name}"),
+                );
+            }
+
             // 保留天数修改后立即生效；其余设置保存不重复触发清理。
-            if previous_retention != Some(settings.log_retention) {
+            if previous.as_ref().map(|old| old.log_retention) != Some(settings.log_retention) {
                 log_operation(
                     state.inner(),
                     &app,
@@ -199,6 +238,58 @@ fn save_settings(
         ),
     }
     saved
+}
+
+/// 解析一条分享链接成节点模板。失败时返回可读错误，不写入任何东西。
+///
+/// 链接本身含凭据，绝不写进日志；日志只记协议、名称与脱敏后的摘要。
+#[tauri::command]
+fn parse_node_link(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    link: String,
+) -> Result<template::NodeTemplate, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    match template::parse_link(&link) {
+        Ok(mut parsed) => {
+            parsed.id = format!("tpl-{}", logs::new_span_id());
+            let summary = parsed.summary();
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Info, "template", "template.parse")
+                    .trace(&trace)
+                    .duration(started.elapsed().as_millis() as u64)
+                    .params(serde_json::json!({
+                        "kind": parsed.kind,
+                        "transport": parsed.transport,
+                        "tls": parsed.tls,
+                    }))
+                    .result(serde_json::json!({ "template": summary })),
+            );
+            Ok(parsed)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Error, "template", "template.parse")
+                    .trace(&trace)
+                    .duration(started.elapsed().as_millis() as u64)
+                    .error(&message, None),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Error,
+                &trace,
+                &format!("节点模板解析失败：{message}"),
+            );
+            Err(message)
+        }
+    }
 }
 
 /// 一条优选源，前端直接渲染。
@@ -719,6 +810,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            parse_node_link,
             get_pool,
             refresh_source_catalog,
             fetch_pool,
