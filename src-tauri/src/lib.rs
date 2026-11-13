@@ -7,7 +7,7 @@ mod sources;
 mod store;
 mod template;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
@@ -28,6 +28,9 @@ const LOG_READ_LIMIT: usize = 500;
 
 /// 随包内置的 sing-box 可执行文件名（Tauri externalBin 按目标三元组命名）。
 const SINGBOX_BINARY: &str = "sing-box-x86_64-pc-windows-msvc.exe";
+
+/// Tauri 打包时给 sidecar 用的名字：去掉目标三元组后缀。
+const SINGBOX_BUNDLED_BINARY: &str = "sing-box.exe";
 
 /// 应用级共享状态：数据库连接、三类日志写入器与 sing-box 日志通道。
 pub struct AppState {
@@ -313,14 +316,24 @@ fn parse_node_link(
 
 /// sing-box 可执行文件的候选路径：打包后与主程序同目录 → 资源目录 → 开发期 binaries。
 fn singbox_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let resource_dir = app.path().resource_dir().ok();
+    singbox_candidate_paths(exe_dir.as_deref(), resource_dir.as_deref())
+}
+
+/// 纯函数版候选路径，便于测试打包后的文件名差异。
+///
+/// Tauri 打包 sidecar 时会把 `sing-box-<target-triple>.exe` 改名为 `sing-box.exe`，
+/// 所以两种名字都要找，否则安装后会出现「未找到 sing-box」。
+fn singbox_candidate_paths(exe_dir: Option<&Path>, resource_dir: Option<&Path>) -> Vec<PathBuf> {
+    let names = [SINGBOX_BINARY, SINGBOX_BUNDLED_BINARY];
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(SINGBOX_BINARY));
+    for dir in [exe_dir, resource_dir].into_iter().flatten() {
+        for name in names {
+            candidates.push(dir.join(name));
         }
-    }
-    if let Ok(dir) = app.path().resource_dir() {
-        candidates.push(dir.join(SINGBOX_BINARY));
     }
     candidates.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2603,4 +2616,45 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod packaging_tests {
+    use super::*;
+
+    fn 临时目录(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vpm-search-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    #[test]
+    fn 安装后能在主程序同目录找到改名后的_sing_box() {
+        let dir = 临时目录("bundled-singbox");
+        // Tauri 打包 sidecar 时去掉目标三元组后缀，安装目录里就是 sing-box.exe。
+        let bundled = dir.join("sing-box.exe");
+        std::fs::write(&bundled, b"stub").expect("写桩文件");
+
+        let candidates = singbox_candidate_paths(Some(&dir), None);
+        assert_eq!(probe::singbox::pick_existing(&candidates), Some(bundled));
+        std::fs::remove_dir_all(&dir).expect("清临时目录");
+    }
+
+    #[test]
+    fn 开发期的三元组文件名仍然优先() {
+        let dir = 临时目录("dev-singbox");
+        let dev = dir.join(SINGBOX_BINARY);
+        let bundled = dir.join(SINGBOX_BUNDLED_BINARY);
+        std::fs::write(&dev, b"stub").expect("写桩文件");
+        std::fs::write(&bundled, b"stub").expect("写桩文件");
+
+        let candidates = singbox_candidate_paths(Some(&dir), None);
+        assert_eq!(probe::singbox::pick_existing(&candidates), Some(dev));
+        std::fs::remove_dir_all(&dir).expect("清临时目录");
+    }
 }
