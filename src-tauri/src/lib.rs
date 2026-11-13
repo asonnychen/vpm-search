@@ -132,10 +132,13 @@ fn get_settings(
 fn save_settings(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<(), String> {
     let trace = logs::new_trace_id();
     let started = Instant::now();
+
+    // 只读参数先钳回契约值，旧客户端传来的值既不生效也不参与校验。
+    settings.normalize_reserved();
 
     if let Err(e) = settings.validate() {
         let message = e.to_string();
@@ -602,7 +605,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
             template,
             probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
             probe::batch::BatchOptions::new(
-                settings.latency_samples as usize,
+                probe::batch::DEFAULT_SAMPLES,
                 settings.concurrency as usize,
             ),
             store.list_pool_entries().map_err(|e| e.to_string())?,
@@ -1494,17 +1497,69 @@ async fn probe_geo_batch(
 
 /// 请求停止当前批量测试；没有在跑时返回 `false`。
 #[tauri::command]
-fn probe_cancel(state: tauri::State<'_, AppState>) -> Result<bool, String> {    let guard = state
-        .batch
-        .lock()
-        .map_err(|_| "测试状态锁已损坏".to_string())?;
-    match guard.as_ref() {
-        Some(control) => {
-            control.cancel.store(true, Ordering::SeqCst);
-            Ok(true)
+fn probe_cancel(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+
+    let result = (|| -> Result<bool, String> {
+        let guard = state
+            .batch
+            .lock()
+            .map_err(|_| "测试状态锁已损坏".to_string())?;
+        match guard.as_ref() {
+            Some(control) => {
+                control.cancel.store(true, Ordering::SeqCst);
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        None => Ok(false),
+    })();
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(requested) => {
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Info, "probe", "probe.cancel")
+                    .trace(&trace)
+                    .duration(duration_ms)
+                    .result(serde_json::json!({ "requested": requested })),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Info,
+                &trace,
+                if *requested {
+                    "已请求停止当前测试"
+                } else {
+                    "没有正在运行的测试，忽略停止请求"
+                },
+            );
+        }
+        Err(message) => {
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Error, "probe", "probe.cancel")
+                    .trace(&trace)
+                    .duration(duration_ms)
+                    .error(message, None),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Error,
+                &trace,
+                &format!("请求停止测试失败：{message}"),
+            );
+        }
     }
+    result
 }
 
 /// 历史入口的一轮测试：时间、参数快照与统计。
@@ -2290,19 +2345,68 @@ async fn fetch_pool(
 #[tauri::command]
 fn set_source_checked(
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     url: String,
     checked: bool,
 ) -> Result<(), String> {
-    let guard = state
-        .store
-        .lock()
-        .map_err(|_| "存储锁已损坏".to_string())?;
-    let Some(store) = guard.as_ref() else {
-        return Err("数据库不可用".to_string());
-    };
-    store
-        .set_source_checked(&url, checked)
-        .map_err(|e| e.to_string())
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+
+    let result = (|| -> Result<(), String> {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        store
+            .set_source_checked(&url, checked)
+            .map_err(|e| format!("保存优选源勾选状态失败：{e}"))
+    })();
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(()) => {
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Info, "sources", "source.checked")
+                    .trace(&trace)
+                    .duration(duration_ms)
+                    .params(serde_json::json!({ "url": url, "checked": checked })),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Info,
+                &trace,
+                &format!(
+                    "优选源已{}：{url}",
+                    if checked { "勾选" } else { "取消勾选" }
+                ),
+            );
+        }
+        Err(message) => {
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Error, "sources", "source.checked")
+                    .trace(&trace)
+                    .duration(duration_ms)
+                    .params(serde_json::json!({ "url": url, "checked": checked }))
+                    .error(message, None),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Error,
+                &trace,
+                &format!("保存优选源勾选状态失败：{message}"),
+            );
+        }
+    }
+    result
 }
 
 /// 导出结果：取消时 `cancelled` 为真，不写文件也不算失败。
@@ -2515,6 +2619,42 @@ fn spawn_daily_log_cleanup(app: tauri::AppHandle) {
     });
 }
 
+/// 数据目录名：Windows 上落在 `%APPDATA%\vpm-search`。
+const DATA_DIR_NAME: &str = "vpm-search";
+
+/// 解析数据目录：Windows 用 `%APPDATA%\vpm-search`（spec 要求，与 identifier 无关），
+/// 其他平台回落到 Tauri 的 `app_data_dir()`。
+fn data_dir_for(appdata: Option<&Path>, app_data_dir: Option<&Path>) -> PathBuf {
+    match appdata {
+        Some(base) => base.join(DATA_DIR_NAME),
+        None => app_data_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    }
+}
+
+/// 旧版数据库（`%APPDATA%\com.asonnychen.vpm-search\data.db`）只迁移一次。
+///
+/// 新库已存在时不动它；旧库不存在时什么也不做。复制而不是改名，
+/// 迁移失败或回滚旧版本时旧数据仍然可用。
+fn migrate_legacy_db(new_db: &Path, legacy_db: &Path) -> Result<bool, String> {
+    if new_db.exists() || !legacy_db.is_file() {
+        return Ok(false);
+    }
+    if let Some(parent) = new_db.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建数据目录 {} 失败：{e}", parent.display()))?;
+    }
+    std::fs::copy(legacy_db, new_db).map_err(|e| {
+        format!(
+            "迁移旧数据库 {} → {} 失败：{e}",
+            legacy_db.display(),
+            new_db.display()
+        )
+    })?;
+    Ok(true)
+}
+
 /// 单实例插件必须是第一个注册的插件，否则第二个实例可能先创建窗口。
 pub fn run() {
     tauri::Builder::default()
@@ -2528,17 +2668,41 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // Windows 上解析为 %APPDATA%\com.asonnychen.vpm-search。
-            let app_dir = app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| PathBuf::from("."));
+            // 旧路径（identifier 目录）只用于一次性迁移旧数据库。
+            let legacy_dir = app.path().app_data_dir().ok();
+            // Windows 上是 %APPDATA%\vpm-search，与 spec 的数据库路径一致。
+            let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+            let app_dir = data_dir_for(appdata.as_deref(), legacy_dir.as_deref());
             let log_dir = app_dir.join("logs");
             let db_path = app_dir.join("data.db");
 
             let log_writer = Arc::new(LogWriter::new(log_dir));
             let singbox = Arc::new(SingboxLog::spawn(log_writer.clone()));
             let temp_dir = app_dir.join("tmp");
+
+            // 旧数据库只在目标不存在时复制一次；失败只记日志，不阻塞启动。
+            if let Some(legacy_dir) = legacy_dir.as_deref() {
+                let legacy_db = legacy_dir.join("data.db");
+                match migrate_legacy_db(&db_path, &legacy_db) {
+                    Ok(true) => {
+                        let _ = log_writer.write_app(
+                            &AppLogRecord::new(LogLevel::Info, "app", "app.db.migrate")
+                                .result(serde_json::json!({
+                                    "from": legacy_db.display().to_string(),
+                                    "to": db_path.display().to_string(),
+                                })),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(message) => {
+                        let _ = log_writer.write_app(
+                            &AppLogRecord::new(LogLevel::Warn, "app", "app.db.migrate")
+                                .error(&message, None),
+                        );
+                        eprintln!("{message}");
+                    }
+                }
+            }
 
             let store = match Store::open(&db_path) {
                 Ok(store) => Some(store),
@@ -2655,6 +2819,49 @@ mod packaging_tests {
 
         let candidates = singbox_candidate_paths(Some(&dir), None);
         assert_eq!(probe::singbox::pick_existing(&candidates), Some(dev));
+        std::fs::remove_dir_all(&dir).expect("清临时目录");
+    }
+
+    #[test]
+    fn windows_数据目录落在_appdata_下的_vpm_search() {
+        let base = PathBuf::from(r"C:\Users\tester\AppData\Roaming");
+        assert_eq!(
+            data_dir_for(Some(&base), Some(Path::new(r"C:\ignored"))),
+            base.join("vpm-search")
+        );
+        // 没有 APPDATA 时回落到 Tauri 给的目录。
+        let fallback = PathBuf::from(r"C:\Users\tester\AppData\Roaming\com.asonnychen.vpm-search");
+        assert_eq!(
+            data_dir_for(None, Some(&fallback)),
+            fallback,
+            "非 Windows 或缺少 APPDATA 时保留 Tauri 默认目录"
+        );
+    }
+
+    #[test]
+    fn 旧数据库只迁移一次且不覆盖新库() {
+        let dir = 临时目录("db-migrate");
+        let legacy_dir = dir.join("legacy");
+        let new_dir = dir.join("vpm-search");
+        std::fs::create_dir_all(&legacy_dir).expect("建旧目录");
+        std::fs::create_dir_all(&new_dir).expect("建新目录");
+        let legacy_db = legacy_dir.join("data.db");
+        let new_db = new_dir.join("data.db");
+        std::fs::write(&legacy_db, b"old").expect("写旧库");
+
+        assert!(migrate_legacy_db(&new_db, &legacy_db).expect("首次迁移"));
+        assert_eq!(std::fs::read(&new_db).expect("读新库"), b"old");
+
+        // 新库已存在：不再复制，也不覆盖已有数据。
+        std::fs::write(&new_db, b"new").expect("写新库");
+        assert!(!migrate_legacy_db(&new_db, &legacy_db).expect("再次迁移"));
+        assert_eq!(std::fs::read(&new_db).expect("读新库"), b"new");
+
+        // 旧库不存在：什么也不做。
+        let missing = legacy_dir.join("missing.db");
+        let target = dir.join("other").join("data.db");
+        assert!(!migrate_legacy_db(&target, &missing).expect("无旧库"));
+        assert!(!target.exists());
         std::fs::remove_dir_all(&dir).expect("清临时目录");
     }
 }

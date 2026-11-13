@@ -19,7 +19,7 @@ use super::config::build_slot_config;
 use super::port::pick_free_port_avoiding;
 use super::singbox::{spawn_singbox, wait_until_ready, TempConfig, STARTUP_TIMEOUT};
 use super::speed::{self, SpeedOptions, SpeedProber};
-use super::{classify, Attempt, Endpoint, ProbeOptions, ProbeOutcome, PROBE_URL};
+use super::{classify, non_204_status, Attempt, Endpoint, ProbeOptions, ProbeOutcome, PROBE_URL};
 
 /// 一条地址在某个槽位进程里的入口。
 struct Lane {
@@ -177,9 +177,9 @@ impl SlotPool {
             Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => {
                 classify(Attempt::responded(elapsed_ms))
             }
-            Ok(response) => classify(Attempt::connect_failed(format!(
-                "204 端点返回 HTTP {}",
-                response.status().as_u16()
+            // 连接成功但响应不是 204：按契约归为「失败」，摘要写明实际状态码。
+            Ok(response) => classify(Attempt::connect_failed(non_204_status(
+                response.status().as_u16(),
             ))),
             Err(error) => {
                 // 槽位进程中途退出：立即失败并给出日志路径。

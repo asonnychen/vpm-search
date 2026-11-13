@@ -46,6 +46,12 @@ pwsh -File scripts/fetch-geoip.ps1 -Month 2026-10
 避免繁简混排。出口仍在 Cloudflare 网内（ASN 13335 或落在已知 CF 段）时只显示机房三字码，
 归属地两段显示 `Cloudflare`，不硬编城市名。
 
+## 数据位置
+
+数据库与日志都在 `%APPDATA%\vpm-search\`：`data.db` 与 `logs\` 同目录。
+首次启动时若发现旧路径 `%APPDATA%\com.asonnychen.vpm-search\data.db`，会复制一份到新路径并写一条应用日志；
+复制失败只记录日志，不阻塞启动。
+
 ## 开发与验证
 
 ```powershell
@@ -62,6 +68,13 @@ cargo check
 
 先确保 `src-tauri/binaries/sing-box-x86_64-pc-windows-msvc.exe` 与
 `src-tauri/resources/geoip/dbip-country-lite.mmdb` 都在位（见上文两个下载脚本），然后：
+
+```powershell
+pnpm build:release            # 一条命令产出 NSIS 安装包 + 免安装 zip
+```
+
+`pnpm build:release` 等价于先 `pnpm tauri build`，再执行
+`pwsh -NoProfile -File scripts/package-portable.ps1 -SkipBuild`。也可以分两步跑：
 
 ```powershell
 pnpm tauri build             # 生产构建 + 打包（NSIS 安装包）

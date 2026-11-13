@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { errorMessage, isRecord, isTauriRuntime } from "./utils";
 
 /** 表格列数，与 `ResultsTable` 的列一一对应，必须与 Rust 侧一致。 */
 export const COLUMN_COUNT = 14;
@@ -42,6 +43,17 @@ export type SpeedParams = {
   timeoutS: number;
 };
 
+/** 请求总超时固定 10 秒，只读展示，不写进设置。 */
+export const REQUEST_TIMEOUT_S = 10;
+/** 每条地址的延迟采样固定 3 次，只读展示，不写进设置。 */
+export const LATENCY_SAMPLES = 3;
+/** 测速固定 4 流 · 10MB · 15 秒，只读展示，不写进设置。 */
+export const SPEED_PARAMS: SpeedParams = {
+  streams: 4,
+  sizeMb: 10,
+  timeoutS: 15,
+};
+
 export type LogRetention = {
   operationDays: number;
   appDays: number;
@@ -62,10 +74,7 @@ export type Settings = {
   activeTemplateId: string;
   maxLatencyMs: number;
   connectTimeoutS: number;
-  requestTimeoutS: number;
   concurrency: number;
-  latencySamples: number;
-  speed: SpeedParams;
   columnWidths: number[];
   logRetention: LogRetention;
   ui: UiState;
@@ -98,18 +107,11 @@ export const DEFAULT_SETTINGS: Settings = {
   activeTemplateId: "default",
   maxLatencyMs: 200,
   connectTimeoutS: 5,
-  requestTimeoutS: 10,
   concurrency: 10,
-  latencySamples: 3,
-  speed: { streams: 4, sizeMb: 10, timeoutS: 15 },
   columnWidths: [...DEFAULT_COLUMN_WIDTHS],
   logRetention: { operationDays: 30, appDays: 30, singboxDays: 30 },
   ui: { logHeight: 214, logCollapsed: false, configOpen: true, poolOpen: false },
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /** 只接受区间内的有限数字，其余一律回落默认值，避免脏值进入界面。 */
 function numberIn(value: unknown, fallback: number, min: number, max: number): number {
@@ -171,9 +173,10 @@ function normalizeWidths(value: unknown): number[] {
 export function normalizeSettings(raw: unknown): Settings {
   const source = isRecord(raw) ? raw : {};
   const lastInput = isRecord(source.lastInput) ? source.lastInput : {};
-  const speed = isRecord(source.speed) ? source.speed : {};
   const retention = isRecord(source.logRetention) ? source.logRetention : {};
   const ui = isRecord(source.ui) ? source.ui : {};
+  // 请求总超时、延迟采样与测速参数是固定契约，界面上只读展示常量；
+  // 旧设置里即使存了别的值也直接忽略，避免出现与契约矛盾的显示值。
   const nodeTemplates = normalizeTemplates(
     source.nodeTemplates,
     DEFAULT_SETTINGS.nodeTemplates,
@@ -196,19 +199,7 @@ export function normalizeSettings(raw: unknown): Settings {
     activeTemplateId,
     maxLatencyMs: numberIn(source.maxLatencyMs, DEFAULT_SETTINGS.maxLatencyMs, 1, 10_000),
     connectTimeoutS: numberIn(source.connectTimeoutS, DEFAULT_SETTINGS.connectTimeoutS, 1, 10),
-    requestTimeoutS: numberIn(
-      source.requestTimeoutS,
-      DEFAULT_SETTINGS.requestTimeoutS,
-      1,
-      120,
-    ),
     concurrency: numberIn(source.concurrency, DEFAULT_SETTINGS.concurrency, 1, 32),
-    latencySamples: numberIn(source.latencySamples, DEFAULT_SETTINGS.latencySamples, 1, 10),
-    speed: {
-      streams: numberIn(speed.streams, DEFAULT_SETTINGS.speed.streams, 1, 32),
-      sizeMb: numberIn(speed.sizeMb, DEFAULT_SETTINGS.speed.sizeMb, 1, 1024),
-      timeoutS: numberIn(speed.timeoutS, DEFAULT_SETTINGS.speed.timeoutS, 1, 300),
-    },
     columnWidths: normalizeWidths(source.columnWidths),
     logRetention: {
       operationDays: numberIn(
@@ -242,10 +233,9 @@ export type SettingsPersistence = {
 
 export type SettingsPatch = Omit<
   Partial<Settings>,
-  "lastInput" | "speed" | "logRetention" | "ui"
+  "lastInput" | "logRetention" | "ui"
 > & {
   lastInput?: Partial<LastInput>;
-  speed?: Partial<SpeedParams>;
   logRetention?: Partial<LogRetention>;
   ui?: Partial<UiState>;
 };
@@ -259,10 +249,6 @@ export type SettingsStore = {
   setColumnWidth: (index: number, width: number) => void;
   flush: () => Promise<void>;
 };
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 export function createSettingsStore(
   persistence: SettingsPersistence,
@@ -311,7 +297,6 @@ export function createSettingsStore(
           ...current,
           ...patch,
           lastInput: { ...current.lastInput, ...patch.lastInput },
-          speed: { ...current.speed, ...patch.speed },
           logRetention: { ...current.logRetention, ...patch.logRetention },
           ui: { ...current.ui, ...patch.ui },
         };
@@ -339,10 +324,6 @@ export function createSettingsStore(
   });
 }
 
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
 /** 生产环境走 Tauri 命令；浏览器里跑原型时只保留默认值。 */
 export const tauriPersistence: SettingsPersistence = {
   load: () => (isTauriRuntime() ? invoke<unknown>("get_settings") : Promise.resolve(null)),
@@ -359,6 +340,5 @@ export const selectThresholdMs = (state: SettingsStore) => state.settings.maxLat
 export const selectColumnWidths = (state: SettingsStore) => state.settings.columnWidths;
 export const selectLastInput = (state: SettingsStore) => state.settings.lastInput;
 export const selectNodeTemplates = (state: SettingsStore) => state.settings.nodeTemplates;
-export const selectSpeedParams = (state: SettingsStore) => state.settings.speed;
 export const selectLogRetention = (state: SettingsStore) => state.settings.logRetention;
 export const selectUi = (state: SettingsStore) => state.settings.ui;

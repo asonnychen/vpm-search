@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:release": "tauri build",
+    "build:release": "tauri build && pwsh -NoProfile -File scripts/package-portable.ps1 -SkipBuild",
     "package:portable": "pwsh -NoProfile -File scripts/package-portable.ps1",
     "test": "vitest run && node --test tests/*.test.mjs"
   },

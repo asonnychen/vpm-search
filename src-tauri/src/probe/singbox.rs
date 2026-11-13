@@ -7,14 +7,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::geo::{self, ExitIp};
 use crate::logs::SingboxLog;
 use crate::template::NodeTemplate;
 
 use super::config::build_config;
 use super::port::pick_free_port;
 use super::speed::{self, SpeedOptions};
-use super::{classify, Attempt, Endpoint, ProbeOptions, ProbeOutcome, Prober, PROBE_URL};
+use super::{
+    classify, non_204_status, Attempt, Endpoint, ProbeOptions, ProbeOutcome, Prober, PROBE_URL,
+};
 
 /// 启动 sing-box 后等待本地入站就绪的上限。
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -150,10 +151,8 @@ impl SingBoxProber {
             Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => {
                 Attempt::responded(elapsed_ms)
             }
-            Ok(response) => Attempt::connect_failed(format!(
-                "204 端点返回 HTTP {}",
-                response.status().as_u16()
-            )),
+            // 连接成功但响应不是 204：按契约归为「失败」，摘要写明实际状态码。
+            Ok(response) => Attempt::connect_failed(non_204_status(response.status().as_u16())),
             Err(error) => {
                 // 进程中途崩溃时，先把日志路径告诉用户。
                 if let Ok(Some(status)) = session.child.try_wait() {
@@ -269,33 +268,6 @@ impl Prober for SingBoxProber {
         options: &ProbeOptions,
     ) -> ProbeOutcome {
         classify(self.attempt(endpoint, template, options))
-    }
-
-    /// 取出口 IP：为这条地址起临时链路，经本地入站请求两个端点并取多数。
-    fn exit_ip(
-        &self,
-        endpoint: &Endpoint,
-        template: &NodeTemplate,
-        options: &ProbeOptions,
-    ) -> Result<ExitIp, String> {
-        let (mut session, port) = self.start_session(endpoint, template)?;
-        let cancel = AtomicBool::new(false);
-        let result = geo::fetch_exit_ip(
-            Some(&format!("http://127.0.0.1:{port}")),
-            options.connect_timeout,
-            options.request_timeout,
-            &cancel,
-        );
-
-        if result.is_err() {
-            if let Ok(Some(status)) = session.child.try_wait() {
-                return Err(format!(
-                    "sing-box 中途退出（{status}），本轮已终止。{}",
-                    self.log_hint()
-                ));
-            }
-        }
-        result
     }
 
     /// 单地址测速：同一条代理链路上并发下载 4×2.5MB，上限 15 秒。

@@ -1,7 +1,8 @@
 //! 本地 SQLite 存储：建库、迁移、设置读写。
 //!
-//! 数据库位于 `app_data_dir()/data.db`（Windows 上是
-//! `%APPDATA%\com.asonnychen.vpm-search\data.db`）。
+//! 数据库位于 `%APPDATA%\vpm-search\data.db`（非 Windows 平台回落到
+//! `app_data_dir()/data.db`）。旧路径 `%APPDATA%\com.asonnychen.vpm-search\data.db`
+//! 在启动时由 `lib.rs` 一次性复制迁移。
 //! 测试全部使用临时文件数据库，不触碰真实 `%APPDATA%`。
 
 use rusqlite::{Connection, OptionalExtension};
@@ -375,35 +376,40 @@ impl Store {
                 .unwrap_or_default();
         }
 
-        Ok(Settings {
-            last_input: self
-                .read_json("last_input")?
-                .unwrap_or(defaults.last_input),
-            node_templates,
-            active_template_id,
-            max_latency_ms: self
-                .read_json("max_latency_ms")?
-                .unwrap_or(defaults.max_latency_ms),
-            connect_timeout_s: self
-                .read_json("connect_timeout_s")?
-                .unwrap_or(defaults.connect_timeout_s),
-            request_timeout_s: self
-                .read_json("request_timeout_s")?
-                .unwrap_or(defaults.request_timeout_s),
-            concurrency: self
-                .read_json("concurrency")?
-                .unwrap_or(defaults.concurrency),
-            latency_samples: self
-                .read_json("latency_samples")?
-                .unwrap_or(defaults.latency_samples),
-            speed: self.read_json("speed")?.unwrap_or(defaults.speed),
-            column_widths: self
-                .read_json("column_widths")?
-                .unwrap_or(defaults.column_widths),
-            log_retention: self
-                .read_json("log_retention")?
-                .unwrap_or(defaults.log_retention),
-            ui: self.read_json("ui")?.unwrap_or(defaults.ui),
+        Ok({
+            let mut settings = Settings {
+                last_input: self
+                    .read_json("last_input")?
+                    .unwrap_or(defaults.last_input),
+                node_templates,
+                active_template_id,
+                max_latency_ms: self
+                    .read_json("max_latency_ms")?
+                    .unwrap_or(defaults.max_latency_ms),
+                connect_timeout_s: self
+                    .read_json("connect_timeout_s")?
+                    .unwrap_or(defaults.connect_timeout_s),
+                request_timeout_s: self
+                    .read_json("request_timeout_s")?
+                    .unwrap_or(defaults.request_timeout_s),
+                concurrency: self
+                    .read_json("concurrency")?
+                    .unwrap_or(defaults.concurrency),
+                latency_samples: self
+                    .read_json("latency_samples")?
+                    .unwrap_or(defaults.latency_samples),
+                speed: self.read_json("speed")?.unwrap_or(defaults.speed),
+                column_widths: self
+                    .read_json("column_widths")?
+                    .unwrap_or(defaults.column_widths),
+                log_retention: self
+                    .read_json("log_retention")?
+                    .unwrap_or(defaults.log_retention),
+                ui: self.read_json("ui")?.unwrap_or(defaults.ui),
+            };
+            // 旧库里存过的只读参数在这里钳回契约值，界面与日志不会出现矛盾值。
+            settings.normalize_reserved();
+            settings
         })
     }
 
@@ -417,11 +423,14 @@ impl Store {
 
     /// 整份写入，单事务完成，避免只写了一半。
     pub fn save_settings(&self, settings: &Settings) -> Result<()> {
+        // 只读参数即使被旧客户端传进来，也只按契约值落库。
+        let mut settings = settings.clone();
+        settings.normalize_reserved();
         settings
             .validate()
             .map_err(|e| StoreError::InvalidSettings(e.to_string()))?;
 
-        let pairs = settings_to_pairs(settings)?;
+        let pairs = settings_to_pairs(&settings)?;
         let tx = self.conn.unchecked_transaction()?;
         for (key, value) in pairs {
             tx.execute(
@@ -1180,7 +1189,15 @@ mod tests {
         settings.log_retention.singbox_days = 60;
 
         store.save_settings(&settings).unwrap();
-        assert_eq!(store.load_settings().unwrap(), settings);
+        let loaded = store.load_settings().unwrap();
+        // 旧客户端传来的只读参数按契约值落库与读回。
+        assert_eq!(loaded.request_timeout_s, 10);
+        assert_eq!(loaded.latency_samples, 3);
+        assert_eq!(loaded.speed.streams, 4);
+        assert_eq!(loaded.speed.size_mb, 10);
+        assert_eq!(loaded.speed.timeout_s, 15);
+        settings.normalize_reserved();
+        assert_eq!(loaded, settings);
     }
 
     #[test]

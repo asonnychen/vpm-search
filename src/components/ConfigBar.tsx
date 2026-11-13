@@ -2,9 +2,11 @@ import { useState } from "react";
 import { Btn, Field, Num } from "./ui";
 import TemplatePanel, { type TemplatePanelMode } from "./TemplatePanel";
 import {
+  LATENCY_SAMPLES,
+  REQUEST_TIMEOUT_S,
+  SPEED_PARAMS,
   selectNodeTemplates,
   selectSettings,
-  selectSpeedParams,
   useSettingsStore,
 } from "../store/settings";
 import { activeTemplate, deleteTemplate } from "../store/template";
@@ -20,7 +22,6 @@ export default function ConfigBar({
 }) {
   const settings = useSettingsStore(selectSettings);
   const templates = useSettingsStore(selectNodeTemplates);
-  const speed = useSettingsStore(selectSpeedParams);
   const patch = useSettingsStore((state) => state.patch);
   const batch = useProbeStore(selectProbeBatch);
   const startBatch = useProbeStore((state) => state.startBatch);
@@ -72,7 +73,7 @@ export default function ConfigBar({
         <span className="text-[12px] text-dim num hidden sm:inline">
           {selected?.name ?? "未选择模板"} · 最大延时 {settings.maxLatencyMs}ms · 并发{" "}
           {settings.concurrency} · 超时 {settings.connectTimeoutS}s/
-          {settings.requestTimeoutS}s
+          {REQUEST_TIMEOUT_S}s
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Btn variant="secondary">抓取优选源</Btn>
@@ -226,14 +227,9 @@ export default function ConfigBar({
             />
           </Field>
           <Field label="请求总超时" width="92px">
-            <Num
-              value={settings.requestTimeoutS}
-              unit="s"
-              width="92px"
-              min={1}
-              max={120}
-              onChange={(requestTimeoutS) => patch({ requestTimeoutS })}
-            />
+            <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted">
+              <span className="num text-text">{REQUEST_TIMEOUT_S}</span> s（固定）
+            </div>
           </Field>
           <Field label="地址并发" width="86px">
             <Num
@@ -249,14 +245,14 @@ export default function ConfigBar({
 
           <Field label="延迟采样">
             <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted">
-              <span className="num text-text">{settings.latencySamples}</span> 次取最小
+              <span className="num text-text">{LATENCY_SAMPLES}</span> 次取最小
             </div>
           </Field>
           <Field label="测速">
             <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted">
-              <span className="num text-text">{speed.streams}</span> 流 ·
-              <span className="num text-text">{speed.sizeMb}</span> MB ·
-              <span className="num text-text">{speed.timeoutS}</span> s
+              <span className="num text-text">{SPEED_PARAMS.streams}</span> 流 ·
+              <span className="num text-text">{SPEED_PARAMS.sizeMb}</span> MB ·
+              <span className="num text-text">{SPEED_PARAMS.timeoutS}</span> s
             </div>
           </Field>
 

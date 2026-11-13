@@ -18,6 +18,20 @@ pub const DEFAULT_COLUMN_WIDTHS: [u32; COLUMN_COUNT] = [
 /// 三类日志的保留天数默认值。
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
 
+/// 请求总超时固定 10 秒，不随设置变化。
+pub const FIXED_REQUEST_TIMEOUT_S: u32 = 10;
+
+/// 每条地址的延迟采样固定 3 次，不随设置变化。
+pub const FIXED_LATENCY_SAMPLES: u32 = 3;
+
+fn default_request_timeout_s() -> u32 {
+    FIXED_REQUEST_TIMEOUT_S
+}
+
+fn default_latency_samples() -> u32 {
+    FIXED_LATENCY_SAMPLES
+}
+
 /// 设置里每个字段在 `settings` 表中的 key。
 pub const SETTING_KEYS: [&str; 12] = [
     "last_input",
@@ -122,9 +136,18 @@ pub struct Settings {
     /// 超阈值判定用的最大延时。
     pub max_latency_ms: u32,
     pub connect_timeout_s: u32,
+    /// 保留字段：请求总超时已固定为 [`FIXED_REQUEST_TIMEOUT_S`]（10 秒），
+    /// 后端不再读取该值；保留它只为兼容旧设置 JSON 与旧数据库行。
+    #[serde(default = "default_request_timeout_s")]
     pub request_timeout_s: u32,
     pub concurrency: u32,
+    /// 保留字段：延迟采样已固定为 [`FIXED_LATENCY_SAMPLES`]（3 次），
+    /// 后端不再读取该值；保留它只为兼容旧设置 JSON 与旧数据库行。
+    #[serde(default = "default_latency_samples")]
     pub latency_samples: u32,
+    /// 保留字段：测速固定为 4 流 · 10MB · 15 秒（[`SpeedParams::default`]），
+    /// 后端不再读取该值；保留它只为兼容旧设置 JSON 与旧数据库行。
+    #[serde(default)]
     pub speed: SpeedParams,
     pub column_widths: Vec<u32>,
     pub log_retention: LogRetention,
@@ -171,6 +194,13 @@ fn in_range(name: &str, value: u32, min: u32, max: u32) -> Result<(), Validation
 }
 
 impl Settings {
+    /// 把已固定的只读参数钳回契约值：旧设置里即使存了别的值也不生效。
+    pub fn normalize_reserved(&mut self) {
+        self.request_timeout_s = FIXED_REQUEST_TIMEOUT_S;
+        self.latency_samples = FIXED_LATENCY_SAMPLES;
+        self.speed = SpeedParams::default();
+    }
+
     /// 参数校验。命令层只做校验与转发，落库前必须通过这里。
     pub fn validate(&self) -> Result<(), ValidationError> {
         in_range("最大延时", self.max_latency_ms, 1, 10_000)?;
@@ -304,5 +334,43 @@ mod tests {
         let mut settings = Settings::default();
         settings.node_templates[0].name = "  ".to_string();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn 只读参数被钳回固定契约值() {
+        let mut settings = Settings {
+            request_timeout_s: 99,
+            latency_samples: 9,
+            speed: SpeedParams {
+                streams: 16,
+                size_mb: 512,
+                timeout_s: 300,
+            },
+            ..Settings::default()
+        };
+        settings.normalize_reserved();
+        assert_eq!(settings.request_timeout_s, FIXED_REQUEST_TIMEOUT_S);
+        assert_eq!(settings.latency_samples, FIXED_LATENCY_SAMPLES);
+        assert_eq!(settings.speed, SpeedParams::default());
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn 旧设置_json_缺少只读字段也能反序列化() {
+        let json = serde_json::json!({
+            "lastInput": { "sourceUrls": "", "manualAddresses": "" },
+            "nodeTemplates": [],
+            "activeTemplateId": "",
+            "maxLatencyMs": 200,
+            "connectTimeoutS": 5,
+            "concurrency": 10,
+            "columnWidths": DEFAULT_COLUMN_WIDTHS,
+            "logRetention": { "operationDays": 30, "appDays": 30, "singboxDays": 30 },
+            "ui": { "logHeight": 214, "logCollapsed": false, "configOpen": true, "poolOpen": false }
+        });
+        let settings: Settings = serde_json::from_value(json).expect("旧 JSON 应能解析");
+        assert_eq!(settings.request_timeout_s, FIXED_REQUEST_TIMEOUT_S);
+        assert_eq!(settings.latency_samples, FIXED_LATENCY_SAMPLES);
+        assert_eq!(settings.speed, SpeedParams::default());
     }
 }

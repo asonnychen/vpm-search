@@ -31,6 +31,14 @@ pub const REQUEST_TIMEOUT_S: u64 = 10;
 /// 探测用的 204 端点。
 pub const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
+/// 204 端点返回非 204 状态码时的失败摘要。
+///
+/// 连接已建立但响应不符合契约（不是 204）仍归为「失败」而非「超时」：
+/// 这不是等不到响应，而是对端明确给了别的状态码，摘要里必须写明实际状态码。
+pub fn non_204_status(status: u16) -> String {
+    format!("204 端点返回 HTTP {status}")
+}
+
 /// 一条待测优选地址。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -203,20 +211,6 @@ pub trait Prober: Send + Sync {
         options: &ProbeOptions,
     ) -> ProbeOutcome;
 
-    /// 取出口 IP：经当前代理链路请求两个端点，交叉校验后取多数。
-    ///
-    /// 与 `measure_latency` 共用一条链路，但结论不同：延迟看响应快慢，
-    /// 这里看对端观察到的来源 IP（见 ADR-0002）。
-    #[allow(dead_code)] // 批量走 GeoProber；单条入口留给界面与后续命令
-    fn exit_ip(
-        &self,
-        _endpoint: &Endpoint,
-        _template: &NodeTemplate,
-        _options: &ProbeOptions,
-    ) -> Result<crate::geo::ExitIp, String> {
-        Err("当前探测器不支持取出口 IP".to_string())
-    }
-
     /// 测速；阶段 8 实现。
     #[allow(dead_code)] // 阶段 8 接入
     fn measure_speed(
@@ -321,6 +315,14 @@ mod tests {
         assert_eq!(outcome.status, ProbeStatus::Timeout);
         assert_eq!(outcome.latency_ms, None);
         assert!(outcome.error.unwrap().contains("10s"));
+    }
+
+    #[test]
+    fn 连接成功但返回非_204_记为失败并写明状态码() {
+        let outcome = classify(Attempt::connect_failed(non_204_status(503)));
+        assert_eq!(outcome.status, ProbeStatus::Fail);
+        assert_eq!(outcome.latency_ms, None);
+        assert_eq!(outcome.error.as_deref(), Some("204 端点返回 HTTP 503"));
     }
 
     #[test]

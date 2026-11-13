@@ -1,13 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SETTINGS,
+  LATENCY_SAMPLES,
+  REQUEST_TIMEOUT_S,
+  SPEED_PARAMS,
   createSettingsStore,
   normalizeSettings,
   selectColumnWidths,
   selectLastInput,
   selectLogRetention,
   selectNodeTemplates,
-  selectSpeedParams,
   selectThresholdMs,
   type Settings,
   type SettingsPersistence,
@@ -52,6 +54,20 @@ describe("normalizeSettings", () => {
   it("完全无法识别的输入返回默认设置", () => {
     expect(normalizeSettings(null)).toEqual(DEFAULT_SETTINGS);
     expect(normalizeSettings("乱码")).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("旧的只读参数被忽略，显示值只能来自固定契约", () => {
+    const settings = normalizeSettings({
+      requestTimeoutS: 99,
+      latencySamples: 9,
+      speed: { streams: 16, sizeMb: 512, timeoutS: 300 },
+    });
+    expect(settings).not.toHaveProperty("requestTimeoutS");
+    expect(settings).not.toHaveProperty("latencySamples");
+    expect(settings).not.toHaveProperty("speed");
+    expect(REQUEST_TIMEOUT_S).toBe(10);
+    expect(LATENCY_SAMPLES).toBe(3);
+    expect(SPEED_PARAMS).toEqual({ streams: 4, sizeMb: 10, timeoutS: 15 });
   });
 });
 
@@ -137,7 +153,6 @@ describe("设置 store 的读写", () => {
     const store = createSettingsStore(
       fakePersistence({
         load: async () => ({
-          speed: { streams: 6, sizeMb: 20, timeoutS: 25 },
           logRetention: { operationDays: 7, appDays: 14, singboxDays: 60 },
           nodeTemplates: [{ id: "t1", name: "备用", kind: "trojan", transport: "ws", tls: true }],
         }),
@@ -146,7 +161,6 @@ describe("设置 store 的读写", () => {
     await store.getState().load();
 
     const state = store.getState();
-    expect(selectSpeedParams(state)).toEqual({ streams: 6, sizeMb: 20, timeoutS: 25 });
     expect(selectLogRetention(state)).toEqual({ operationDays: 7, appDays: 14, singboxDays: 60 });
     expect(selectNodeTemplates(state)).toHaveLength(1);
     expect(selectNodeTemplates(state)[0].name).toBe("备用");

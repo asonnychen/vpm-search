@@ -116,6 +116,12 @@ test("第三方许可声明随安装包分发", () => {
     "THIRD_PARTY_NOTICES.md 未作为 bundle resource 声明",
   );
 
+  // NSIS 安装界面直接读取 licenseFile，必须指向随包许可声明。
+  assert.equal(conf.bundle.licenseFile, "../THIRD_PARTY_NOTICES.md");
+  assert.ok(existsSync(path.join(root, "THIRD_PARTY_NOTICES.md")));
+  assert.match(conf.bundle.license, /GPL-3\.0/);
+  assert.match(conf.bundle.license, /CC BY 4\.0/);
+
   const notices = read("THIRD_PARTY_NOTICES.md");
   assert.match(notices, /sing-box\s+1\.14\.4/);
   assert.match(notices, /GPL-3\.0/);
@@ -132,6 +138,11 @@ test("免安装 zip 打包脚本与 README 命令就位", () => {
 
   const pkg = readJson("package.json");
   assert.ok(pkg.scripts["package:portable"], "缺少 package:portable 脚本");
+  assert.match(
+    pkg.scripts["build:release"],
+    /package-portable\.ps1/,
+    "build:release 必须同时产出免安装 zip",
+  );
 
   const readme = read("README.md");
   assert.match(readme, /pnpm tauri build/);

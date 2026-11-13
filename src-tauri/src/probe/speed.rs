@@ -116,6 +116,9 @@ pub fn download_streams(
         builder = builder.proxy(
             reqwest::Proxy::all(proxy).map_err(|e| format!("本地代理地址无效：{e}"))?,
         );
+    } else {
+        // 显式禁用系统代理：没有本地入站时也不读取系统代理（ADR-0004）。
+        builder = builder.no_proxy();
     }
     let client = builder
         .build()
