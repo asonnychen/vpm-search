@@ -1,17 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { rows, type Row } from "../mock";
+import { usePoolStore } from "../store/pool";
 import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
 import { cn } from "./ui";
 
-const filters = [
-  { id: "all", label: "全部", count: 128 },
-  { id: "ok", label: "成功", count: 8 },
-  { id: "timeout", label: "超时", count: 1 },
-  { id: "fail", label: "失败", count: 1 },
-  { id: "slow", label: "超阈值", count: 1 },
+type RowStatus = "untested" | "ok" | "timeout" | "fail";
+
+/** 表格行来自优选域名池；阶段 5 之前没有模板，类型/传输/TLS 一律留空。 */
+type Row = {
+  id: string;
+  host: string;
+  port: number;
+  alias: string;
+  source: string;
+  latency: number | null;
+  speed: number | null;
+  status: RowStatus;
+};
+
+const filterDefs = [
+  { id: "all", label: "全部" },
+  { id: "ok", label: "成功" },
+  { id: "timeout", label: "超时" },
+  { id: "fail", label: "失败" },
+  { id: "slow", label: "超阈值" },
 ] as const;
 
-type FilterId = (typeof filters)[number]["id"];
+type FilterId = (typeof filterDefs)[number]["id"];
 
 function latencyCell(row: Row, threshold: number) {
   if (row.status === "timeout") {
@@ -20,13 +34,16 @@ function latencyCell(row: Row, threshold: number) {
   if (row.status === "fail") {
     return <span className="text-danger text-[12px]">失败</span>;
   }
-  const over = row.latency! > threshold;
+  if (row.latency === null) {
+    return <span className="text-dim">—</span>;
+  }
+  const over = row.latency > threshold;
   return (
     <span className="inline-flex items-center justify-end gap-1.5">
       <span className="w-10 h-1 bg-panel-2 ring-1 ring-line rounded-full overflow-hidden">
         <span
           className={cn("block h-full rounded-full", over ? "bg-danger" : "bg-accent")}
-          style={{ width: `${Math.min(100, (row.latency! / threshold) * 100)}%` }}
+          style={{ width: `${Math.min(100, (row.latency / threshold) * 100)}%` }}
         />
       </span>
       <span className={cn("num", over ? "text-danger" : "text-text")}>
@@ -40,11 +57,38 @@ function latencyCell(row: Row, threshold: number) {
 export default function ResultsTable() {
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<string[]>(["1"]);
+  const [selected, setSelected] = useState<string[]>([]);
   const [sort, setSort] = useState<{ key: "latency" | "speed"; dir: "asc" | "desc" }>({
     key: "latency",
     dir: "asc",
   });
+
+  const poolEntries = usePoolStore((state) => state.entries);
+
+  const rows = useMemo<Row[]>(
+    () =>
+      poolEntries.map((entry) => ({
+        id: `${entry.host}:${entry.port}`,
+        host: entry.host,
+        port: entry.port,
+        alias: entry.alias,
+        source: entry.source,
+        latency: null,
+        speed: null,
+        status: "untested",
+      })),
+    [poolEntries],
+  );
+
+  const counts = useMemo(() => {
+    const base = { all: rows.length, ok: 0, timeout: 0, fail: 0, slow: 0 };
+    for (const row of rows) {
+      if (row.status === "ok") base.ok += 1;
+      if (row.status === "timeout") base.timeout += 1;
+      if (row.status === "fail") base.fail += 1;
+    }
+    return base;
+  }, [rows]);
 
   const toggleSort = (key: "latency" | "speed") =>
     setSort((s) =>
@@ -89,14 +133,13 @@ export default function ResultsTable() {
       if (filter === "ok" && r.status !== "ok") return false;
       if (filter === "timeout" && r.status !== "timeout") return false;
       if (filter === "fail" && r.status !== "fail") return false;
-      if (filter === "slow" && !(r.latency && r.latency > threshold)) return false;
+      if (filter === "slow" && !(r.latency !== null && r.latency > threshold)) return false;
       if (query) {
         const q = query.toLowerCase();
         return (
           r.host.toLowerCase().includes(q) ||
           r.alias.toLowerCase().includes(q) ||
-          r.geoZh.includes(q) ||
-          r.geoEn.toLowerCase().includes(q)
+          r.source.toLowerCase().includes(q)
         );
       }
       return true;
@@ -137,7 +180,7 @@ export default function ResultsTable() {
     <section className="flex-1 min-h-0 flex flex-col bg-panel">
       <div className="min-h-10 shrink-0 flex flex-wrap items-center gap-x-2 gap-y-1.5 px-4 py-1.5 border-b border-line bg-panel">
         <div className="flex items-center gap-0.5 border border-line rounded-[3px] p-0.5 bg-canvas/60">
-          {filters.map((f) => (
+          {filterDefs.map((f) => (
             <button
               key={f.id}
               type="button"
@@ -156,7 +199,7 @@ export default function ResultsTable() {
                   filter === f.id ? "text-accent/70" : "text-dim",
                 )}
               >
-                {f.count}
+                {counts[f.id]}
               </span>
             </button>
           ))}
@@ -185,13 +228,10 @@ export default function ResultsTable() {
 
         <div className="ml-auto flex items-center gap-3 text-[12px] text-dim num">
           <span>
-            最快 <span className="text-accent">38</span>ms
+            共 <span className="text-text">{rows.length}</span> 条
           </span>
           <span>
-            中位 <span className="text-text">88</span>ms
-          </span>
-          <span>
-            平均 <span className="text-text">6.9</span>MB/s
+            未测 <span className="text-text">{rows.length - counts.ok - counts.timeout - counts.fail}</span>
           </span>
           <span className="text-line-2">|</span>
           <span>
@@ -349,15 +389,13 @@ export default function ResultsTable() {
                     </button>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5">
-                    <span className="inline-flex h-5 items-center px-1.5 rounded-[2px] border border-line-2/70 text-[12px] num text-muted">
-                      {r.type}
-                    </span>
+                    <span className="text-dim">—</span>
                   </td>
                   <td
                     className="border-b border-line/60 px-2 py-1.5 max-w-[260px] truncate text-text/85"
                     title={r.alias}
                   >
-                    {r.alias}
+                    {r.alias || <span className="text-dim">—</span>}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-text">
                     {r.host}
@@ -366,33 +404,19 @@ export default function ResultsTable() {
                     {r.port}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-muted">
-                    {r.transport}
+                    <span className="text-dim">—</span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5">
-                    {r.geoZh ? (
-                      <span className="text-text/90">{r.geoZh}</span>
-                    ) : (
-                      <span className="text-dim">—</span>
-                    )}
+                    <span className="text-dim">—</span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-muted">
-                    {r.geoEn || <span className="text-dim">—</span>}
+                    <span className="text-dim">—</span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-right">
-                    {r.colo ? (
-                      <span className="text-[12px] px-1 py-0.5 border border-line-2/60 rounded-[2px] text-muted">
-                        {r.colo}
-                      </span>
-                    ) : (
-                      <span className="text-dim">—</span>
-                    )}
+                    <span className="text-dim">—</span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    {r.tls ? (
-                      <span className="text-accent/80 text-[12px]">开</span>
-                    ) : (
-                      <span className="text-dim text-[12px]">关</span>
-                    )}
+                    <span className="text-dim text-[12px]">—</span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-[12px] text-dim whitespace-nowrap">
                     {r.source}
@@ -444,8 +468,10 @@ export default function ResultsTable() {
       </div>
 
       <div className="h-6 shrink-0 flex items-center gap-3 px-4 border-t border-line text-[12px] text-dim num">
-        <span>共 128 条</span>
-        <span>成功 8 · 超时 1 · 失败 1</span>
+        <span>共 {rows.length} 条</span>
+        <span>
+          成功 {counts.ok} · 超时 {counts.timeout} · 失败 {counts.fail}
+        </span>
         <span className="text-line-2">|</span>
         <span>阈值 {threshold}ms</span>
         <span className="ml-auto">

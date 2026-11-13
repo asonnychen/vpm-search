@@ -10,9 +10,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::settings::{Settings, SETTING_KEYS};
+use crate::sources::parse::{CatalogSource, PoolCandidate};
 
 /// 当前 schema 版本，写进 SQLite 的 `user_version`。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 阶段 2 建好五张表；本期只有 `settings` 真正读写。
 const SCHEMA_V1: &str = r#"
@@ -72,6 +73,12 @@ CREATE TABLE IF NOT EXISTS test_result (
 );
 
 CREATE INDEX IF NOT EXISTS idx_test_result_run ON test_result(run_id);
+"#;
+
+/// 阶段 3：源记录失败原因，池条目保存来源标识（手动来源没有 source_id）。
+const SCHEMA_V2: &str = r#"
+ALTER TABLE pool_source ADD COLUMN last_error TEXT;
+ALTER TABLE pool_entry ADD COLUMN source_label TEXT NOT NULL DEFAULT '';
 "#;
 
 #[derive(Debug)]
@@ -161,6 +168,9 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         if version < 1 {
             tx.execute_batch(SCHEMA_V1)?;
+        }
+        if version < 2 {
+            tx.execute_batch(SCHEMA_V2)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -290,6 +300,163 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// 把页面上的源清单写进 `pool_source`。
+    ///
+    /// 新源按页面状态决定是否默认勾选；已有源只更新名称与异常标记，
+    /// 保留用户自己的勾选、条目数与最近抓取时间。
+    pub fn upsert_catalog(&self, sources: &[CatalogSource]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for source in sources {
+            tx.execute(
+                "INSERT INTO pool_source (url, name, broken, checked)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(url) DO UPDATE SET
+                     name = excluded.name,
+                     broken = excluded.broken",
+                rusqlite::params![
+                    source.url,
+                    source.name,
+                    i64::from(source.broken),
+                    i64::from(!source.broken),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_pool_sources(&self) -> Result<Vec<PoolSourceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT url, name, checked, broken, entry_count, fetched_at, last_error
+             FROM pool_source
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PoolSourceRow {
+                url: row.get(0)?,
+                name: row.get(1)?,
+                checked: row.get::<_, i64>(2)? != 0,
+                broken: row.get::<_, i64>(3)? != 0,
+                entry_count: row.get::<_, i64>(4)?.max(0) as u32,
+                fetched_at: row.get(5)?,
+                last_error: row.get(6)?,
+            })
+        })?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(row?);
+        }
+        Ok(sources)
+    }
+
+    /// 用户勾选状态落库。
+    pub fn set_source_checked(&self, url: &str, checked: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pool_source SET checked = ?2 WHERE url = ?1",
+            rusqlite::params![url, i64::from(checked)],
+        )?;
+        Ok(())
+    }
+
+    /// 用本次抓取的结果整体替换池内容。池是快照，不做增量合并。
+    pub fn replace_pool_entries(&self, candidates: &[PoolCandidate], added_at: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM pool_entry", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pool_entry (host, port, alias, source_id, source_label, created_at)
+                 VALUES (?1, ?2, ?3,
+                         (SELECT id FROM pool_source WHERE url = ?5),
+                         ?4, ?6)
+                 ON CONFLICT(host, port) DO UPDATE SET
+                     alias = excluded.alias,
+                     source_label = excluded.source_label",
+            )?;
+            for candidate in candidates {
+                stmt.execute(rusqlite::params![
+                    candidate.host,
+                    candidate.port,
+                    candidate.alias,
+                    candidate.source,
+                    candidate.source_url,
+                    added_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_pool_entries(&self) -> Result<Vec<PoolEntryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT host, port, alias, source_label, created_at
+             FROM pool_entry
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PoolEntryRow {
+                host: row.get(0)?,
+                port: row.get::<_, i64>(1)?.clamp(0, u16::MAX as i64) as u16,
+                alias: row.get(2)?,
+                source: row.get(3)?,
+                added_at: row.get(4)?,
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    /// 记录单个源本次抓取的结果：条目数、错误、时间。
+    pub fn record_source_fetch(
+        &self,
+        url: &str,
+        entry_count: u32,
+        error: Option<&str>,
+        fetched_at: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pool_source
+             SET entry_count = ?2, last_error = ?3, fetched_at = ?4
+             WHERE url = ?1",
+            rusqlite::params![url, i64::from(entry_count), error, fetched_at],
+        )?;
+        Ok(())
+    }
+
+    /// 池里最近一次成功抓取的时间；从未抓取过则为 `None`。
+    pub fn last_fetched_at(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(fetched_at) FROM pool_source", [], |row| {
+                row.get(0)
+            })?)
+    }
+}
+
+/// `pool_source` 的一行，直接给前端用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSourceRow {
+    pub url: String,
+    pub name: String,
+    pub checked: bool,
+    pub broken: bool,
+    pub entry_count: u32,
+    pub fetched_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// `pool_entry` 的一行，`source` 是来源标识。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolEntryRow {
+    pub host: String,
+    pub port: u16,
+    pub alias: String,
+    pub source: String,
+    pub added_at: String,
 }
 
 fn settings_to_pairs(settings: &Settings) -> Result<Vec<(&'static str, String)>> {
@@ -423,5 +590,145 @@ mod tests {
         let loaded = store.load_settings().unwrap();
         assert_eq!(loaded.max_latency_ms, Settings::default().max_latency_ms);
         assert_eq!(loaded.concurrency, Settings::default().concurrency);
+    }
+
+    #[test]
+    fn 从阶段二的旧库升级会补上新列且不丢数据() {
+        let (_dir, path) = temp_db();
+        {
+            // 模拟阶段 2 的库：只有 V1 的表结构。
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO pool_source (url, name) VALUES ('https://a/all.txt', '旧源')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let sources = store.list_pool_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "旧源");
+        assert_eq!(sources[0].last_error, None);
+        // 新列可写。
+        store
+            .record_source_fetch("https://a/all.txt", 2, Some("HTTP 404"), "2026-11-13T00:00:00.000Z")
+            .unwrap();
+    }
+
+    fn catalog() -> Vec<CatalogSource> {
+        vec![
+            CatalogSource {
+                url: "https://bestcf.pages.dev/domain/all.txt".to_string(),
+                name: "BestCF·domain/all.txt".to_string(),
+                broken: false,
+            },
+            CatalogSource {
+                url: "https://bestcf.pages.dev/luoli/all.txt".to_string(),
+                name: "BestCF·luoli/all.txt".to_string(),
+                broken: true,
+            },
+        ]
+    }
+
+    fn candidate(host: &str, port: u16, source_url: Option<&str>) -> PoolCandidate {
+        PoolCandidate {
+            host: host.to_string(),
+            port,
+            alias: format!("{host} 的备注 | 来源"),
+            source: "BestCF·domain/all.txt".to_string(),
+            source_url: source_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn 源清单入库时异常源默认不勾选() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_catalog(&catalog()).unwrap();
+
+        let sources = store.list_pool_sources().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources[0].checked);
+        assert!(!sources[1].checked);
+        assert!(sources[1].broken);
+
+        // 用户手动勾上异常源后，再刷新清单不应被覆盖。
+        store
+            .set_source_checked("https://bestcf.pages.dev/luoli/all.txt", true)
+            .unwrap();
+        store.upsert_catalog(&catalog()).unwrap();
+        let sources = store.list_pool_sources().unwrap();
+        assert!(sources[1].checked);
+    }
+
+    #[test]
+    fn 池条目按_host_port_唯一并带来源标识() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_catalog(&catalog()).unwrap();
+        let url = Some("https://bestcf.pages.dev/domain/all.txt");
+
+        store
+            .replace_pool_entries(
+                &[
+                    candidate("a.example.com", 443, url),
+                    candidate("a.example.com", 8443, url),
+                    candidate("a.example.com", 443, url),
+                ],
+                "2026-11-13T04:05:06.000Z",
+            )
+            .unwrap();
+
+        let entries = store.list_pool_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].port, 443);
+        assert_eq!(entries[1].port, 8443);
+        assert_eq!(entries[0].source, "BestCF·domain/all.txt");
+        assert_eq!(entries[0].alias, "a.example.com 的备注 | 来源");
+        assert_eq!(entries[0].added_at, "2026-11-13T04:05:06.000Z");
+    }
+
+    #[test]
+    fn 抓取时间与错误落库且重启后仍在() {
+        let (_dir, path) = temp_db();
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_catalog(&catalog()).unwrap();
+            store
+                .record_source_fetch(
+                    "https://bestcf.pages.dev/domain/all.txt",
+                    3,
+                    None,
+                    "2026-11-13T04:05:06.000Z",
+                )
+                .unwrap();
+            store
+                .record_source_fetch(
+                    "https://bestcf.pages.dev/luoli/all.txt",
+                    0,
+                    Some("请求超时（10s）"),
+                    "2026-11-13T04:05:07.000Z",
+                )
+                .unwrap();
+            store
+                .replace_pool_entries(
+                    &[candidate("a.example.com", 443, None)],
+                    "2026-11-13T04:05:06.000Z",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let sources = store.list_pool_sources().unwrap();
+        assert_eq!(sources[0].entry_count, 3);
+        assert_eq!(sources[0].fetched_at.as_deref(), Some("2026-11-13T04:05:06.000Z"));
+        assert_eq!(sources[1].last_error.as_deref(), Some("请求超时（10s）"));
+        assert_eq!(
+            store.last_fetched_at().unwrap().as_deref(),
+            Some("2026-11-13T04:05:07.000Z")
+        );
+        assert_eq!(store.list_pool_entries().unwrap().len(), 1);
     }
 }

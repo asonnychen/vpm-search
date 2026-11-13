@@ -6,6 +6,7 @@ import ResultsTable from "./components/ResultsTable";
 import TopBar from "./components/TopBar";
 import { Dot } from "./components/ui";
 import { selectSettings, selectUi, useSettingsStore } from "./store/settings";
+import { usePoolStore } from "./store/pool";
 
 export default function App() {
   const settings = useSettingsStore(selectSettings);
@@ -19,6 +20,16 @@ export default function App() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 读取上次的池；首次使用还没有源清单时自动抓一次 bestcf 页面。
+  useEffect(() => {
+    void (async () => {
+      await usePoolStore.getState().load();
+      if (usePoolStore.getState().sources.length === 0) {
+        await usePoolStore.getState().refreshCatalog();
+      }
+    })();
+  }, []);
 
   // 关窗/刷新前把待保存的修改立即落库，尽量不丢最后一次编辑。
   useEffect(() => {
