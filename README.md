@@ -49,21 +49,56 @@ pwsh -File scripts/fetch-geoip.ps1 -Month 2026-10
 ## 开发与验证
 
 ```powershell
-pnpm install
-pnpm exec tsc --noEmit
-pnpm test
+pnpm install                 # 首次安装依赖
+pnpm tauri dev               # 启动原生窗口（开发模式）
+pnpm exec tsc --noEmit       # 类型检查
+pnpm test                    # 前端单测 + 发布配置测试
 cd src-tauri
 cargo test
 cargo check
+```
+
+## 打包
+
+先确保 `src-tauri/binaries/sing-box-x86_64-pc-windows-msvc.exe` 与
+`src-tauri/resources/geoip/dbip-country-lite.mmdb` 都在位（见上文两个下载脚本），然后：
+
+```powershell
+pnpm tauri build             # 生产构建 + 打包（NSIS 安装包）
+pnpm package:portable        # 生成免安装 zip（需已构建主程序）
+```
+
+产物位置：
+
+| 产物 | 路径 |
+| --- | --- |
+| 主程序 | `src-tauri/target/release/vpm-search.exe` |
+| NSIS 安装包 | `src-tauri/target/release/bundle/nsis/vpm-search_0.1.0_x64-setup.exe` |
+| 免安装 zip | `src-tauri/target/release/bundle/portable/vpm-search-0.1.0-portable.zip` |
+
+免安装 zip 内是解压即用的目录：`vpm-search.exe`、内置的 `sing-box-x86_64-pc-windows-msvc.exe`、
+`geoip/dbip-country-lite.mmdb`、`THIRD_PARTY_NOTICES.md` 与 `README.md`。sing-box 与离线归属地库
+都随包分发，首次运行不需要联网下载。
+
+图标由 `src-tauri/icons/app-icon.png`（1024×1024）生成，重新生成：
+
+```powershell
+pnpm exec tauri icon src-tauri/icons/app-icon.png
 ```
 
 ## 目录
 
 - `src/`：React 界面与状态（zustand），`src/store/*.test.ts` 为前端单测。
 - `src-tauri/src/`：Rust 后端。`probe/` 负责单条真连接延迟与测速，`geo/` 负责出口 IP 与归属地，`logs/` 负责三类日志，`sources/` 负责优选源抓取，`store.rs` 负责 SQLite。
+- `scripts/`：`fetch-singbox.ps1`、`fetch-geoip.ps1` 准备打包资源，`package-portable.ps1` 生成免安装 zip。
+- `tests/`：发布配置与产物契约测试（版本号一致性、图标来源、随包许可声明）。
 - `docs/adr/`：架构决策记录；`GLOSSARY.md`：领域词汇。
 
 ## 许可
 
-应用代码为自用项目；随包分发的 sing-box 遵循 GPL-3.0，见其官方仓库。
-归属地离线库为 [DB-IP](https://db-ip.com) 的 Country Lite，遵循 CC BY 4.0，署名 DB-IP。
+应用代码为自用项目。随包分发的第三方组件及其许可全文见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)，
+该文件同时作为 bundle resource 打进安装包：
+
+- **sing-box 1.14.4**：GPL-3.0，作为 sidecar 以独立可执行文件分发，来源 <https://github.com/SagerNet/sing-box>。
+- **DB-IP Country Lite**：CC BY 4.0，署名 **IP Geolocation by DB-IP**（<https://db-ip.com>）。
+
