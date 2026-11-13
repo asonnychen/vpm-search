@@ -1,31 +1,72 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { MAX_LATENCY, rows, type Row } from "../mock";
+import { usePoolStore } from "../store/pool";
+import {
+  probeKey,
+  selectProbeError,
+  selectProbeGeos,
+  selectProbeResults,
+  selectProbeSpeeds,
+  selectProbeTesting,
+  useProbeStore,
+  type GeoResult,
+} from "../store/probe";
+import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
+import { activeTemplate, templateColumns } from "../store/template";
+import { useSelectionStore } from "../store/selection";
+import { sortRows, type SortDir, type SortKey } from "../store/tableSort";
+import { countMissingGeo, pickExportRange, type ExportRow } from "../store/exportRows";
+import { exportTxt } from "../store/exportFile";
 import { cn } from "./ui";
 
-const filters = [
-  { id: "all", label: "全部", count: 128 },
-  { id: "ok", label: "成功", count: 8 },
-  { id: "timeout", label: "超时", count: 1 },
-  { id: "fail", label: "失败", count: 1 },
-  { id: "slow", label: "超阈值", count: 1 },
+type RowStatus = "untested" | "ok" | "timeout" | "fail";
+
+/** 表格行来自优选域名池；类型/传输/TLS 三列来自当前节点模板。 */
+type Row = {
+  id: string;
+  host: string;
+  port: number;
+  alias: string;
+  source: string;
+  latency: number | null;
+  speed: number | null;
+  /** 测速状态，与延迟状态分开，失败时速度列显示「失败」。 */
+  speedStatus: "ok" | "fail" | "untested";
+  status: RowStatus;
+  /** 失败或超时的原因，悬浮时显示。 */
+  error: string | null;
+  /** 测速失败原因。 */
+  speedError: string | null;
+  /** 出口 IP 的归属地；未查询或查询失败时为 null。 */
+  geo: GeoResult | null;
+};
+
+const filterDefs = [
+  { id: "all", label: "全部" },
+  { id: "ok", label: "成功" },
+  { id: "timeout", label: "超时" },
+  { id: "fail", label: "失败" },
+  { id: "slow", label: "超阈值" },
 ] as const;
 
-type FilterId = (typeof filters)[number]["id"];
+type FilterId = (typeof filterDefs)[number]["id"];
 
-function latencyCell(row: Row) {
+function latencyCell(row: Row, threshold: number) {
   if (row.status === "timeout") {
     return <span className="text-warn text-[12px]">超时</span>;
   }
   if (row.status === "fail") {
     return <span className="text-danger text-[12px]">失败</span>;
   }
-  const over = row.latency! > MAX_LATENCY;
+  if (row.latency === null) {
+    return <span className="text-dim">—</span>;
+  }
+  const over = row.latency > threshold;
   return (
     <span className="inline-flex items-center justify-end gap-1.5">
       <span className="w-10 h-1 bg-panel-2 ring-1 ring-line rounded-full overflow-hidden">
         <span
           className={cn("block h-full rounded-full", over ? "bg-danger" : "bg-accent")}
-          style={{ width: `${Math.min(100, (row.latency! / MAX_LATENCY) * 100)}%` }}
+          style={{ width: `${Math.min(100, (row.latency / threshold) * 100)}%` }}
         />
       </span>
       <span className={cn("num", over ? "text-danger" : "text-text")}>
@@ -36,31 +77,97 @@ function latencyCell(row: Row) {
   );
 }
 
+function geoTitle(geo: GeoResult | null): string | undefined {
+  if (!geo) return undefined;
+  const parts = [
+    geo.exitIp ? `出口 ${geo.exitIp}` : "",
+    geo.country ? `国家码 ${geo.country}` : "",
+    geo.source ? `来源 ${geo.source}` : "",
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
 export default function ResultsTable() {
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<string[]>(["1"]);
-  const [sort, setSort] = useState<{ key: "latency" | "speed"; dir: "asc" | "desc" }>({
+  const selected = useSelectionStore((state) => state.ids);
+  const setIds = useSelectionStore((state) => state.setIds);
+  const setSelected = (updater: string[] | ((prev: string[]) => string[])) =>
+    setIds(typeof updater === "function" ? updater(selected) : updater);
+  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({
     key: "latency",
     dir: "asc",
   });
+  const [exporting, setExporting] = useState(false);
+  const [exportNotice, setExportNotice] = useState<{
+    tone: "ok" | "warn" | "err";
+    text: string;
+  } | null>(null);
 
-  const toggleSort = (key: "latency" | "speed") =>
+  const poolEntries = usePoolStore((state) => state.entries);
+  const templates = useSettingsStore((state) => state.settings.nodeTemplates);
+  const activeId = useSettingsStore((state) => state.settings.activeTemplateId);
+  // 切换模板后这三列立刻跟着变；行数据仍来自池。
+  const columns = templateColumns(activeTemplate(templates, activeId));
+
+  // 单条真连接延迟的结果按 `host:port` 覆盖到对应行，未测的行保持 null。
+  const probeResults = useProbeStore(selectProbeResults);
+  const probeSpeeds = useProbeStore(selectProbeSpeeds);
+  const probeGeos = useProbeStore(selectProbeGeos);
+  const probeTesting = useProbeStore(selectProbeTesting);
+  const probeError = useProbeStore(selectProbeError);
+  const testOne = useProbeStore((state) => state.testOne);
+
+  const rows = useMemo<Row[]>(
+    () =>
+      poolEntries.map((entry) => {
+        const key = probeKey(entry.host, entry.port);
+        const result = probeResults[key];
+        const speed = probeSpeeds[key];
+        return {
+          id: key,
+          host: entry.host,
+          port: entry.port,
+          alias: entry.alias,
+          source: entry.source,
+          latency: result?.latencyMs ?? null,
+          speed: speed?.mbps ?? null,
+          speedStatus: speed?.status ?? "untested",
+          status: result?.status ?? "untested",
+          error: result?.error ?? null,
+          speedError: speed?.error ?? null,
+          geo: probeGeos[key] ?? null,
+        };
+      }),
+    [poolEntries, probeResults, probeSpeeds, probeGeos],
+  );
+
+  const counts = useMemo(() => {
+    const base = { all: rows.length, ok: 0, timeout: 0, fail: 0, slow: 0 };
+    for (const row of rows) {
+      if (row.status === "ok") base.ok += 1;
+      if (row.status === "timeout") base.timeout += 1;
+      if (row.status === "fail") base.fail += 1;
+    }
+    return base;
+  }, [rows]);
+
+  const toggleSort = (key: SortKey) =>
     setSort((s) =>
       s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
     );
 
-  // 列宽：拖拽表头右缘调整，索引与列一一对应
-  const COL_WIDTHS = [64, 60, 172, 140, 58, 54, 84, 96, 54, 46, 156, 112, 88, 84];
-  const [widths, setWidths] = useState<number[]>(COL_WIDTHS);
+  // 列宽来自设置 store：拖拽后防抖落库，重启还原。
+  const widths = useSettingsStore(selectColumnWidths);
+  const setColumnWidth = useSettingsStore((state) => state.setColumnWidth);
+  const threshold = useSettingsStore(selectThresholdMs);
   const resizeRef = useRef<{ i: number; x: number; w: number } | null>(null);
 
   useEffect(() => {
     const move = (e: MouseEvent) => {
       const r = resizeRef.current;
       if (!r) return;
-      const next = Math.max(48, r.w + (e.clientX - r.x));
-      setWidths((ws) => ws.map((w, i) => (i === r.i ? next : w)));
+      setColumnWidth(r.i, Math.max(48, r.w + (e.clientX - r.x)));
     };
     const up = () => {
       resizeRef.current = null;
@@ -73,7 +180,7 @@ export default function ResultsTable() {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
     };
-  }, []);
+  }, [setColumnWidth]);
 
   const startResize = (i: number) => (e: React.MouseEvent) => {
     e.preventDefault();
@@ -83,39 +190,91 @@ export default function ResultsTable() {
     document.body.style.userSelect = "none";
   };
 
+  // 排序作用于全表，再按筛选出可见行；导出顺序也跟这份排序一致。
+  // 空值（超时 / 失败 / 未测）始终排在末尾，不参与升降序翻转。
+  const sortedRows = useMemo(
+    () => sortRows(rows, sort.key, sort.dir),
+    [rows, sort],
+  );
+
   const shown = useMemo(() => {
-    const list = rows.filter((r) => {
+    return sortedRows.filter((r) => {
       if (filter === "ok" && r.status !== "ok") return false;
       if (filter === "timeout" && r.status !== "timeout") return false;
       if (filter === "fail" && r.status !== "fail") return false;
-      if (filter === "slow" && !(r.latency && r.latency > MAX_LATENCY)) return false;
+      if (filter === "slow" && !(r.latency !== null && r.latency > threshold)) return false;
       if (query) {
         const q = query.toLowerCase();
         return (
           r.host.toLowerCase().includes(q) ||
           r.alias.toLowerCase().includes(q) ||
-          r.geoZh.includes(q) ||
-          r.geoEn.toLowerCase().includes(q)
+          r.source.toLowerCase().includes(q) ||
+          (r.geo?.zh.toLowerCase().includes(q) ?? false) ||
+          (r.geo?.en.toLowerCase().includes(q) ?? false) ||
+          (r.geo?.colo?.toLowerCase().includes(q) ?? false)
         );
       }
       return true;
     });
-
-    // 空值（超时 / 失败）始终排在末尾，不参与升降序翻转
-    return list.sort((a, b) => {
-      const av = a[sort.key];
-      const bv = b[sort.key];
-      if (av === null && bv === null) return 0;
-      if (av === null) return 1;
-      if (bv === null) return -1;
-      return sort.dir === "asc" ? av - bv : bv - av;
-    });
-  }, [filter, query, sort]);
+  }, [filter, query, threshold, sortedRows]);
 
   const toggle = (id: string) =>
     setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
 
   const shownIds = shown.map((r) => r.id);
+
+  // 导出用全表快照，顺序即当前排序；勾选非空时范围就是勾选行。
+  const exportRows = useMemo<ExportRow[]>(
+    () =>
+      sortedRows.map((r) => ({
+        id: r.id,
+        host: r.host,
+        port: r.port,
+        alias: r.alias,
+        source: r.source,
+        geo: r.geo,
+      })),
+    [sortedRows],
+  );
+  const exportRange = useMemo(
+    () => pickExportRange(exportRows, selected, shownIds),
+    [exportRows, selected, shownIds],
+  );
+  const exportMissing = useMemo(
+    () => countMissingGeo(exportRange),
+    [exportRange],
+  );
+
+  const handleExport = async () => {
+    if (exportRange.length === 0) {
+      setExportNotice({ tone: "warn", text: "没有可导出的地址" });
+      return;
+    }
+    setExporting(true);
+    setExportNotice(null);
+    try {
+      const summary = await exportTxt(exportRows, selected, shownIds);
+      // 取消不提示，避免误以为出了错。
+      if (!summary.cancelled) {
+        setExportNotice({
+          tone: summary.missingGeo > 0 ? "warn" : "ok",
+          text: `已导出 ${summary.rows} 条到 ${summary.path ?? ""}${
+            summary.missingGeo > 0
+              ? `，其中 ${summary.missingGeo} 条缺少归属地`
+              : ""
+          }`,
+        });
+      }
+    } catch (error) {
+      setExportNotice({
+        tone: "err",
+        text: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const allShown = shownIds.length > 0 && shownIds.every((id) => selected.includes(id));
   const someShown = shownIds.some((id) => selected.includes(id));
 
@@ -136,7 +295,7 @@ export default function ResultsTable() {
     <section className="flex-1 min-h-0 flex flex-col bg-panel">
       <div className="min-h-10 shrink-0 flex flex-wrap items-center gap-x-2 gap-y-1.5 px-4 py-1.5 border-b border-line bg-panel">
         <div className="flex items-center gap-0.5 border border-line rounded-[3px] p-0.5 bg-canvas/60">
-          {filters.map((f) => (
+          {filterDefs.map((f) => (
             <button
               key={f.id}
               type="button"
@@ -155,7 +314,7 @@ export default function ResultsTable() {
                   filter === f.id ? "text-accent/70" : "text-dim",
                 )}
               >
-                {f.count}
+                {counts[f.id]}
               </span>
             </button>
           ))}
@@ -183,14 +342,30 @@ export default function ResultsTable() {
         </div>
 
         <div className="ml-auto flex items-center gap-3 text-[12px] text-dim num">
+          {exportMissing > 0 ? (
+            <span className="text-warn">
+              {exportMissing} 条缺少归属地，导出时该段留空
+            </span>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => void handleExport()}
+            disabled={exporting || rows.length === 0}
+            title={selected.length > 0 ? "导出勾选行" : "导出当前筛选后的可见行"}
+            className={cn(
+              "h-7 px-2.5 border rounded-[3px] text-[12px] whitespace-nowrap",
+              exporting || rows.length === 0
+                ? "border-line text-dim cursor-not-allowed"
+                : "border-accent bg-accent text-white hover:bg-accent-strong",
+            )}
+          >
+            {exporting ? "导出中…" : "导出 txt"}
+          </button>
           <span>
-            最快 <span className="text-accent">38</span>ms
+            共 <span className="text-text">{rows.length}</span> 条
           </span>
           <span>
-            中位 <span className="text-text">88</span>ms
-          </span>
-          <span>
-            平均 <span className="text-text">6.9</span>MB/s
+            未测 <span className="text-text">{rows.length - counts.ok - counts.timeout - counts.fail}</span>
           </span>
           <span className="text-line-2">|</span>
           <span>
@@ -198,6 +373,29 @@ export default function ResultsTable() {
           </span>
         </div>
       </div>
+
+      {probeError ? (
+        <div className="shrink-0 flex items-start gap-2 px-4 py-1.5 border-b border-line bg-danger/[0.06] text-[12px] text-danger">
+          <span className="font-medium">测试失败</span>
+          <span className="num break-all opacity-90">{probeError}</span>
+        </div>
+      ) : null}
+
+      {exportNotice ? (
+        <div
+          className={cn(
+            "shrink-0 flex items-start gap-2 px-4 py-1.5 border-b border-line text-[12px]",
+            exportNotice.tone === "err"
+              ? "bg-danger/[0.06] text-danger"
+              : exportNotice.tone === "warn"
+                ? "bg-warn/[0.06] text-warn"
+                : "bg-accent-soft text-accent",
+          )}
+        >
+          <span className="font-medium">导出</span>
+          <span className="break-all opacity-90">{exportNotice.text}</span>
+        </div>
+      ) : null}
 
       <div className="flex-1 min-h-0 overflow-auto border border-line rounded-[3px] bg-panel">
         <table className="w-full min-w-[1180px] table-fixed border-separate border-spacing-0 text-[12px] [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th:last-child]:border-r-0 [&_td:last-child]:border-r-0">
@@ -315,7 +513,8 @@ export default function ResultsTable() {
           <tbody>
             {shown.map((r) => {
               const isSel = selected.includes(r.id);
-              const slow = r.latency !== null && r.latency > MAX_LATENCY;
+              const slow = r.latency !== null && r.latency > threshold;
+              const busy = Boolean(probeTesting[r.id]);
               return (
                 <tr
                   key={r.id}
@@ -348,15 +547,13 @@ export default function ResultsTable() {
                     </button>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5">
-                    <span className="inline-flex h-5 items-center px-1.5 rounded-[2px] border border-line-2/70 text-[12px] num text-muted">
-                      {r.type}
-                    </span>
+                    <span className="text-muted">{columns.kind}</span>
                   </td>
                   <td
                     className="border-b border-line/60 px-2 py-1.5 max-w-[260px] truncate text-text/85"
                     title={r.alias}
                   >
-                    {r.alias}
+                    {r.alias || <span className="text-dim">—</span>}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-text">
                     {r.host}
@@ -365,57 +562,82 @@ export default function ResultsTable() {
                     {r.port}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-muted">
-                    {r.transport}
+                    {columns.transport}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5">
-                    {r.geoZh ? (
-                      <span className="text-text/90">{r.geoZh}</span>
+                  <td className="border-b border-line/60 px-2 py-1.5" title={geoTitle(r.geo)}>
+                    {r.geo?.zh ? (
+                      <span className="text-text/90">{r.geo.zh}</span>
                     ) : (
                       <span className="text-dim">—</span>
                     )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-muted">
-                    {r.geoEn || <span className="text-dim">—</span>}
+                  <td className="border-b border-line/60 px-2 py-1.5" title={geoTitle(r.geo)}>
+                    {r.geo?.en ? (
+                      <span className="text-muted">{r.geo.en}</span>
+                    ) : (
+                      <span className="text-dim">—</span>
+                    )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 num text-right">
-                    {r.colo ? (
-                      <span className="text-[12px] px-1 py-0.5 border border-line-2/60 rounded-[2px] text-muted">
-                        {r.colo}
-                      </span>
+                  <td className="border-b border-line/60 px-2 py-1.5 num text-right" title={geoTitle(r.geo)}>
+                    {r.geo?.colo ? (
+                      <span className="text-text/90">{r.geo.colo}</span>
                     ) : (
                       <span className="text-dim">—</span>
                     )}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    {r.tls ? (
-                      <span className="text-accent/80 text-[12px]">开</span>
-                    ) : (
-                      <span className="text-dim text-[12px]">关</span>
-                    )}
+                    <span
+                      className={cn(
+                        "text-[12px]",
+                        columns.tls === "无" ? "text-dim" : "text-muted",
+                      )}
+                    >
+                      {columns.tls}
+                    </span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-[12px] text-dim whitespace-nowrap">
                     {r.source}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    {latencyCell(r)}
-                  </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    {r.speed === null ? (
-                      <span className="text-dim">—</span>
+                  <td
+                    className="border-b border-line/60 px-2 py-1.5 text-right"
+                    title={r.error ?? undefined}
+                  >
+                    {busy ? (
+                      <span className="text-accent text-[12px]">测试中…</span>
                     ) : (
+                      latencyCell(r, threshold)
+                    )}
+                  </td>
+                  <td
+                    className="border-b border-line/60 px-2 py-1.5 text-right"
+                    title={r.speedError ?? undefined}
+                  >
+                    {r.speedStatus === "fail" ? (
+                      <span className="text-danger text-[12px]">失败</span>
+                    ) : r.speed !== null ? (
                       <span className="num text-text/90">
                         {r.speed.toFixed(1)}
                         <span className="text-dim text-[12px] ml-0.5">MB/s</span>
                       </span>
+                    ) : (
+                      <span className="text-dim">—</span>
                     )}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
                     <div className="flex items-center justify-end gap-1 opacity-80 group-hover:opacity-100">
                       <button
                         type="button"
-                        className="h-5 px-1.5 border border-line rounded-[2px] text-[12px] text-muted hover:text-accent hover:border-accent-dim whitespace-nowrap"
+                        onClick={() => void testOne(r.host, r.port, r.alias)}
+                        disabled={busy}
+                        title={r.error ?? "重测这一条"}
+                        className={cn(
+                          "h-5 px-1.5 border border-line rounded-[2px] text-[12px] whitespace-nowrap",
+                          busy
+                            ? "text-dim cursor-wait"
+                            : "text-muted hover:text-accent hover:border-accent-dim",
+                        )}
                       >
-                        重测
+                        {busy ? "测试中" : "重测"}
                       </button>
                       <button
                         type="button"
@@ -443,10 +665,12 @@ export default function ResultsTable() {
       </div>
 
       <div className="h-6 shrink-0 flex items-center gap-3 px-4 border-t border-line text-[12px] text-dim num">
-        <span>共 128 条</span>
-        <span>成功 8 · 超时 1 · 失败 1</span>
+        <span>共 {rows.length} 条</span>
+        <span>
+          成功 {counts.ok} · 超时 {counts.timeout} · 失败 {counts.fail}
+        </span>
         <span className="text-line-2">|</span>
-        <span>阈值 {MAX_LATENCY}ms</span>
+        <span>阈值 {threshold}ms</span>
         <span className="ml-auto">
           排序：{sort.key === "latency" ? "延迟" : "速度"}
           {sort.dir === "asc" ? " ↑" : " ↓"}

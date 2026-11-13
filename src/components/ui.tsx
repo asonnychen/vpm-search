@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 export function cn(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -10,12 +10,14 @@ export function Btn({
   onClick,
   className,
   title,
+  disabled = false,
 }: {
   children: ReactNode;
   variant?: "primary" | "accent" | "secondary" | "ghost" | "danger";
   onClick?: () => void;
   className?: string;
   title?: string;
+  disabled?: boolean;
 }) {
   const styles = {
     primary:
@@ -34,9 +36,11 @@ export function Btn({
       type="button"
       title={title}
       onClick={onClick}
+      disabled={disabled}
       className={cn(
         "h-8 px-3 rounded-[3px] text-[12px] tracking-wide transition-colors whitespace-nowrap",
         styles,
+        disabled ? "opacity-45 cursor-not-allowed hover:bg-inherit" : "",
         className,
       )}
     >
@@ -74,19 +78,45 @@ export function Num({
   unit,
   suffix,
   width = "86px",
+  onChange,
+  min,
+  max,
 }: {
   value: string | number;
   unit?: string;
   suffix?: string;
   width?: string;
+  /** 只在输入是合法数字时回调，非法中间态留在输入框里。 */
+  onChange?: (value: number) => void;
+  min?: number;
+  max?: number;
 }) {
+  const [draft, setDraft] = useState(String(value));
+
+  // 设置从磁盘回填后同步到输入框。
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = (next: string) => {
+    setDraft(next);
+    if (next.trim() === "") return;
+    const parsed = Number(next);
+    if (!Number.isFinite(parsed)) return;
+    if (min !== undefined && parsed < min) return;
+    if (max !== undefined && parsed > max) return;
+    onChange?.(parsed);
+  };
+
   return (
     <div
       className="h-8 flex items-center justify-between gap-1 border border-line bg-panel px-2 rounded-[3px] focus-within:border-accent-dim"
       style={{ width }}
     >
       <input
-        defaultValue={value}
+        value={draft}
+        inputMode="numeric"
+        onChange={(e) => commit(e.target.value)}
         className="num w-full bg-transparent text-[12px] outline-none text-text"
       />
       {unit ? (

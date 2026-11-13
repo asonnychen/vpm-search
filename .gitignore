@@ -3,7 +3,11 @@ dist/
 target/
 src-tauri/target/
 src-tauri/gen/
+*.tsbuildinfo
 .playwright-mcp/
 .design-studio/
 .tickets/
 *.log
+
+# 随包内置的 sing-box 由 scripts/fetch-singbox.ps1 下载，不进版本库
+src-tauri/binaries/
