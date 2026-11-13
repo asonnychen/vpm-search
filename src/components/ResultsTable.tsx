@@ -14,6 +14,8 @@ import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../stor
 import { activeTemplate, templateColumns } from "../store/template";
 import { useSelectionStore } from "../store/selection";
 import { sortRows, type SortDir, type SortKey } from "../store/tableSort";
+import { countMissingGeo, pickExportRange, type ExportRow } from "../store/exportRows";
+import { exportTxt } from "../store/exportFile";
 import { cn } from "./ui";
 
 type RowStatus = "untested" | "ok" | "timeout" | "fail";
@@ -96,6 +98,11 @@ export default function ResultsTable() {
     key: "latency",
     dir: "asc",
   });
+  const [exporting, setExporting] = useState(false);
+  const [exportNotice, setExportNotice] = useState<{
+    tone: "ok" | "warn" | "err";
+    text: string;
+  } | null>(null);
 
   const poolEntries = usePoolStore((state) => state.entries);
   const templates = useSettingsStore((state) => state.settings.nodeTemplates);
@@ -183,8 +190,15 @@ export default function ResultsTable() {
     document.body.style.userSelect = "none";
   };
 
+  // 排序作用于全表，再按筛选出可见行；导出顺序也跟这份排序一致。
+  // 空值（超时 / 失败 / 未测）始终排在末尾，不参与升降序翻转。
+  const sortedRows = useMemo(
+    () => sortRows(rows, sort.key, sort.dir),
+    [rows, sort],
+  );
+
   const shown = useMemo(() => {
-    const list = rows.filter((r) => {
+    return sortedRows.filter((r) => {
       if (filter === "ok" && r.status !== "ok") return false;
       if (filter === "timeout" && r.status !== "timeout") return false;
       if (filter === "fail" && r.status !== "fail") return false;
@@ -202,15 +216,65 @@ export default function ResultsTable() {
       }
       return true;
     });
-
-    // 空值（超时 / 失败 / 未测）始终排在末尾，不参与升降序翻转。
-    return sortRows(list, sort.key, sort.dir);
-  }, [filter, query, sort, threshold, rows]);
+  }, [filter, query, threshold, sortedRows]);
 
   const toggle = (id: string) =>
     setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
 
   const shownIds = shown.map((r) => r.id);
+
+  // 导出用全表快照，顺序即当前排序；勾选非空时范围就是勾选行。
+  const exportRows = useMemo<ExportRow[]>(
+    () =>
+      sortedRows.map((r) => ({
+        id: r.id,
+        host: r.host,
+        port: r.port,
+        alias: r.alias,
+        source: r.source,
+        geo: r.geo,
+      })),
+    [sortedRows],
+  );
+  const exportRange = useMemo(
+    () => pickExportRange(exportRows, selected, shownIds),
+    [exportRows, selected, shownIds],
+  );
+  const exportMissing = useMemo(
+    () => countMissingGeo(exportRange),
+    [exportRange],
+  );
+
+  const handleExport = async () => {
+    if (exportRange.length === 0) {
+      setExportNotice({ tone: "warn", text: "没有可导出的地址" });
+      return;
+    }
+    setExporting(true);
+    setExportNotice(null);
+    try {
+      const summary = await exportTxt(exportRows, selected, shownIds);
+      // 取消不提示，避免误以为出了错。
+      if (!summary.cancelled) {
+        setExportNotice({
+          tone: summary.missingGeo > 0 ? "warn" : "ok",
+          text: `已导出 ${summary.rows} 条到 ${summary.path ?? ""}${
+            summary.missingGeo > 0
+              ? `，其中 ${summary.missingGeo} 条缺少归属地`
+              : ""
+          }`,
+        });
+      }
+    } catch (error) {
+      setExportNotice({
+        tone: "err",
+        text: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const allShown = shownIds.length > 0 && shownIds.every((id) => selected.includes(id));
   const someShown = shownIds.some((id) => selected.includes(id));
 
@@ -278,6 +342,25 @@ export default function ResultsTable() {
         </div>
 
         <div className="ml-auto flex items-center gap-3 text-[12px] text-dim num">
+          {exportMissing > 0 ? (
+            <span className="text-warn">
+              {exportMissing} 条缺少归属地，导出时该段留空
+            </span>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => void handleExport()}
+            disabled={exporting || rows.length === 0}
+            title={selected.length > 0 ? "导出勾选行" : "导出当前筛选后的可见行"}
+            className={cn(
+              "h-7 px-2.5 border rounded-[3px] text-[12px] whitespace-nowrap",
+              exporting || rows.length === 0
+                ? "border-line text-dim cursor-not-allowed"
+                : "border-accent bg-accent text-white hover:bg-accent-strong",
+            )}
+          >
+            {exporting ? "导出中…" : "导出 txt"}
+          </button>
           <span>
             共 <span className="text-text">{rows.length}</span> 条
           </span>
@@ -295,6 +378,22 @@ export default function ResultsTable() {
         <div className="shrink-0 flex items-start gap-2 px-4 py-1.5 border-b border-line bg-danger/[0.06] text-[12px] text-danger">
           <span className="font-medium">测试失败</span>
           <span className="num break-all opacity-90">{probeError}</span>
+        </div>
+      ) : null}
+
+      {exportNotice ? (
+        <div
+          className={cn(
+            "shrink-0 flex items-start gap-2 px-4 py-1.5 border-b border-line text-[12px]",
+            exportNotice.tone === "err"
+              ? "bg-danger/[0.06] text-danger"
+              : exportNotice.tone === "warn"
+                ? "bg-warn/[0.06] text-warn"
+                : "bg-accent-soft text-accent",
+          )}
+        >
+          <span className="font-medium">导出</span>
+          <span className="break-all opacity-90">{exportNotice.text}</span>
         </div>
       ) : null}
 

@@ -1,3 +1,4 @@
+mod export;
 mod geo;
 mod logs;
 mod probe;
@@ -17,6 +18,7 @@ use sources::fetch::{self, CATALOG_URL};
 use sources::parse::{parse_catalog, source_label, CatalogSource};
 use store::{PoolEntryRow, PoolSourceRow, Store};
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 
 use logs::{AppLogRecord, LogEntry, LogKind, LogLevel, LogWriter, LogsSnapshot, SingboxLog};
 use probe::Prober;
@@ -1901,6 +1903,173 @@ fn set_source_checked(
         .map_err(|e| e.to_string())
 }
 
+/// 导出结果：取消时 `cancelled` 为真，不写文件也不算失败。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportSummary {
+    cancelled: bool,
+    path: Option<String>,
+    rows: usize,
+    missing_geo: usize,
+}
+
+/// 把当前范围导出成客户端可直接使用的 txt。
+///
+/// 范围由前端给：有勾选行时传勾选行，否则传当前筛选后的可见行；
+/// 行顺序就是表格当前排序。文件通过系统保存对话框选位置，
+/// UTF-8 无 BOM、LF 换行，导出动作写操作日志与应用日志。
+#[tauri::command]
+async fn export_txt(
+    app: tauri::AppHandle,
+    rows: Vec<export::ExportRow>,
+    selected_ids: Vec<String>,
+    visible_ids: Vec<String>,
+) -> Result<ExportSummary, String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    let scope = if selected_ids.is_empty() {
+        "visible"
+    } else {
+        "selected"
+    };
+
+    let chosen = export::select_rows(&rows, &selected_ids, &visible_ids);
+    if chosen.is_empty() {
+        let message = "没有可导出的地址".to_string();
+        log_operation(
+            app.state::<AppState>().inner(),
+            &app,
+            LogLevel::Warn,
+            &trace,
+            &message,
+        );
+        log_app(
+            app.state::<AppState>().inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Warn, "export", "export.write")
+                .trace(&trace)
+                .params(serde_json::json!({
+                    "scope": scope,
+                    "rows": 0,
+                    "selected": selected_ids.len(),
+                    "visible": visible_ids.len(),
+                }))
+                .error(&message, None),
+        );
+        return Err(message);
+    }
+
+    let content = export::render(&chosen);
+    let missing_geo = export::missing_geo(&chosen);
+    let default_name = export::file_name(chrono::Local::now());
+
+    // 保存对话框要阻塞等待用户选择，必须离开主线程，否则事件循环被卡住。
+    let dialog_app = app.clone();
+    let dialog_name = default_name.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .file()
+            .set_file_name(&dialog_name)
+            .add_filter("文本文件", &["txt"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| format!("打开保存对话框失败：{e}"))?;
+
+    let Some(file_path) = picked else {
+        // 用户取消：不写文件，也不记成失败。
+        log_app(
+            app.state::<AppState>().inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Info, "export", "export.write")
+                .trace(&trace)
+                .duration(started.elapsed().as_millis() as u64)
+                .params(serde_json::json!({
+                    "scope": scope,
+                    "rows": chosen.len(),
+                    "defaultName": default_name,
+                }))
+                .result(serde_json::json!({ "cancelled": true })),
+        );
+        return Ok(ExportSummary {
+            cancelled: true,
+            path: None,
+            rows: 0,
+            missing_geo: 0,
+        });
+    };
+
+    let path = file_path
+        .into_path()
+        .map_err(|e| format!("无法解析保存路径：{e}"))?;
+    if let Err(error) = export::write_file(&path, &content) {
+        let message = format!("写入 {} 失败：{error}", path.display());
+        log_app(
+            app.state::<AppState>().inner(),
+            &app,
+            AppLogRecord::new(LogLevel::Error, "export", "export.write")
+                .trace(&trace)
+                .duration(started.elapsed().as_millis() as u64)
+                .params(serde_json::json!({
+                    "scope": scope,
+                    "rows": chosen.len(),
+                    "file": path.display().to_string(),
+                }))
+                .error(&message, None),
+        );
+        log_operation(
+            app.state::<AppState>().inner(),
+            &app,
+            LogLevel::Error,
+            &trace,
+            &message,
+        );
+        return Err(message);
+    }
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let path_text = path.display().to_string();
+    log_app(
+        app.state::<AppState>().inner(),
+        &app,
+        AppLogRecord::new(LogLevel::Info, "export", "export.write")
+            .trace(&trace)
+            .span(&logs::new_span_id())
+            .duration(duration_ms)
+            .params(serde_json::json!({
+                "scope": scope,
+                "rows": chosen.len(),
+                "missingGeo": missing_geo,
+                "file": path_text,
+            }))
+            .result(serde_json::json!({
+                "bytes": content.len(),
+                "cancelled": false,
+            })),
+    );
+    log_operation(
+        app.state::<AppState>().inner(),
+        &app,
+        LogLevel::Ok,
+        &trace,
+        &format!(
+            "已导出 {} 条到 {}（缺少归属地 {} 条，{}ms）",
+            chosen.len(),
+            path_text,
+            missing_geo,
+            duration_ms
+        ),
+    );
+
+    Ok(ExportSummary {
+        cancelled: false,
+        path: Some(path_text),
+        rows: chosen.len(),
+        missing_geo,
+    })
+}
+
 /// 启动时读回三类日志各最近若干行。
 #[tauri::command]
 fn get_logs(state: tauri::State<'_, AppState>, limit: Option<usize>) -> LogsSnapshot {
@@ -1955,6 +2124,7 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Windows 上解析为 %APPDATA%\com.asonnychen.vpm-search。
             let app_dir = app
@@ -2025,7 +2195,8 @@ pub fn run() {
             probe_batch,
             probe_speed_batch,
             probe_geo_batch,
-            probe_cancel
+            probe_cancel,
+            export_txt
         ])
         .on_window_event(|window, event| {
             // 关闭窗口即结束进程，避免残留后台进程；先收掉日志写入线程。
