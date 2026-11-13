@@ -1,3 +1,4 @@
+mod geo;
 mod logs;
 mod probe;
 mod settings;
@@ -35,6 +36,8 @@ pub struct AppState {
     singbox: Arc<SingboxLog>,
     /// 临时配置目录，测完即删。
     temp_dir: PathBuf,
+    /// 归属地查询器：离线库优先、在线兜底、按出口 IP 缓存。
+    geo: Arc<geo::GeoResolver>,
     /// 正在跑的一轮批量测试；停止按钮通过它发信号。
     batch: Mutex<Option<Arc<BatchControl>>>,
 }
@@ -325,8 +328,40 @@ fn singbox_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     candidates
 }
 
-fn resolve_singbox(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    probe::singbox::pick_existing(&singbox_candidates(app)).ok_or_else(|| {
+/// 内置离线归属地库的候选路径：打包后与主程序同目录 → 资源目录 → 开发期 resources。
+///
+/// 文件缺失时归属地查询自动回落在线的 `ipwho.is`，应用不会因此启动失败。
+fn geo_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let file = geo::offline::GEOIP_FILE;
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(geo::offline::GEOIP_DIR).join(file));
+            candidates.push(
+                dir.join("resources")
+                    .join(geo::offline::GEOIP_DIR)
+                    .join(file),
+            );
+        }
+    }
+    if let Ok(dir) = app.path().resource_dir() {
+        candidates.push(dir.join(geo::offline::GEOIP_DIR).join(file));
+        candidates.push(
+            dir.join("resources")
+                .join(geo::offline::GEOIP_DIR)
+                .join(file),
+        );
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(geo::offline::GEOIP_DIR)
+            .join(file),
+    );
+    candidates
+}
+
+fn resolve_singbox(app: &tauri::AppHandle) -> Result<PathBuf, String> {    probe::singbox::pick_existing(&singbox_candidates(app)).ok_or_else(|| {
         format!(
             "未找到 sing-box（{SINGBOX_BINARY}），请先运行 scripts/fetch-singbox.ps1"
         )
@@ -1086,6 +1121,362 @@ async fn probe_speed_batch(
     })
 }
 
+/// 一条归属地结果的对外形状。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoRowDto {
+    host: String,
+    port: u16,
+    alias: String,
+    /// `ok` / `fail` / `untested`，与延迟状态互不影响。
+    status: &'static str,
+    exit_ip: Option<String>,
+    country: Option<String>,
+    zh: Option<String>,
+    en: Option<String>,
+    colo: Option<String>,
+    asn: Option<u32>,
+    error: Option<String>,
+}
+
+/// 一轮归属地查询的完整结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoReportDto {
+    run_id: String,
+    total: usize,
+    completed: usize,
+    stopped: bool,
+    counts: geo::GeoCounts,
+    rows: Vec<GeoRowDto>,
+}
+
+/// 一键查归属地：整池或选中行，经各自代理链路取出口 IP 后查归属地。
+///
+/// 结果写进最近一轮 `test_result` 的出口 IP 与归属地列，延迟、速度不受影响；
+/// 查询失败的行只留空归属地，不清空已有结论。
+#[tauri::command]
+async fn probe_geo_batch(
+    app: tauri::AppHandle,
+    targets: Option<Vec<SpeedTarget>>,
+) -> Result<GeoReportDto, String> {
+    let state = app.state::<AppState>();
+
+    // 读设置与池：只短暂加锁，查询期间不占着数据库。
+    let (template, options, concurrency, entries) = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        let settings = store.load_settings().map_err(|e| e.to_string())?;
+        let template = settings
+            .node_templates
+            .iter()
+            .find(|template| template.id == settings.active_template_id)
+            .or_else(|| settings.node_templates.first())
+            .cloned()
+            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
+        (
+            template,
+            probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
+            settings.concurrency as usize,
+            store.list_pool_entries().map_err(|e| e.to_string())?,
+        )
+    };
+
+    let wanted: Option<std::collections::HashSet<(String, u16)>> = targets.as_ref().map(|list| {
+        list.iter()
+            .map(|target| (target.host.trim().to_string(), target.port))
+            .collect()
+    });
+
+    let items: Vec<probe::batch::BatchItem> = entries
+        .into_iter()
+        .filter(|entry| {
+            wanted
+                .as_ref()
+                .map(|set| set.contains(&(entry.host.clone(), entry.port)))
+                .unwrap_or(true)
+        })
+        .map(|entry| {
+            probe::batch::BatchItem::new(
+                probe::Endpoint::new(entry.host, entry.port),
+                entry.alias,
+            )
+        })
+        .collect();
+
+    if items.is_empty() {
+        return Err("没有可查归属地的地址，请先抓取优选源或选中行".to_string());
+    }
+
+    let binary = resolve_singbox(&app)?;
+
+    // 与延迟、测速共用同一个「正在跑」槽位：同一时间只允许一轮。
+    let control = Arc::new(BatchControl {
+        cancel: AtomicBool::new(false),
+    });
+    {
+        let mut guard = state
+            .batch
+            .lock()
+            .map_err(|_| "测试状态锁已损坏".to_string())?;
+        if guard.is_some() {
+            return Err("测试正在进行，请先停止或等待结束".to_string());
+        }
+        *guard = Some(control.clone());
+    }
+
+    let started_at = logs::now_iso8601();
+    let started = Instant::now();
+    let params = serde_json::json!({
+        "mode": "geo",
+        "kind": template.kind,
+        "transport": template.transport,
+        "tls": template.tls,
+        "concurrency": concurrency,
+        "total": items.len(),
+    });
+
+    // 挂到最近一轮结果上；没有历史轮次时才新建。
+    let run_id = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        match store.latest_test_run_id().map_err(|e| e.to_string())? {
+            Some(id) => id,
+            None => {
+                let id = format!("run-{}", logs::new_span_id());
+                store
+                    .insert_test_run(&store::TestRunRecord {
+                        id: &id,
+                        started_at: &started_at,
+                        finished_at: &started_at,
+                        params_json: &params.to_string(),
+                        total: items.len() as u32,
+                        ok_count: 0,
+                        timeout_count: 0,
+                        fail_count: 0,
+                    })
+                    .map_err(|e| e.to_string())?;
+                id
+            }
+        }
+    };
+
+    // 落库的缓存先灌进内存，同一出口 IP 不重复查询。
+    let cached = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        match guard.as_ref() {
+            Some(store) => store
+                .list_geo_cache()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|row| (row.ip, row.record))
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        }
+    };
+    state.geo.preload(cached);
+
+    let offline_ready = geo_candidates(&app).iter().any(|path| path.is_file());
+    log_operation(
+        state.inner(),
+        &app,
+        LogLevel::Info,
+        &run_id,
+        &format!(
+            "开始查询归属地：{} 条，并发 {}，离线库{}",
+            items.len(),
+            concurrency,
+            if offline_ready {
+                "已就绪"
+            } else {
+                "不可用（改用在线源）"
+            }
+        ),
+    );
+
+    let app_for_progress = app.clone();
+    let run_for_progress = run_id.clone();
+    let on_progress = move |progress: probe::batch::BatchProgress| {
+        let _ = app_for_progress.emit(
+            "probe:progress",
+            serde_json::json!({
+                "runId": run_for_progress,
+                "mode": "geo",
+                "completed": progress.completed,
+                "total": progress.total,
+            }),
+        );
+    };
+
+    let cancel = control.clone();
+    let singbox = state.singbox.clone();
+    let log_path = state.logs.today_path(LogKind::Singbox);
+    let temp_dir = state.temp_dir.clone();
+    let blocking_items = items.clone();
+    let blocking_template = template.clone();
+    let resolver = state.geo.clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let pool = probe::slot::SlotPool::start(
+            binary,
+            singbox,
+            log_path,
+            temp_dir,
+            &blocking_items,
+            &blocking_template,
+            concurrency,
+        )?;
+        let report = geo::run_geo_batch(
+            &pool,
+            &resolver,
+            &blocking_items,
+            &options,
+            concurrency,
+            &cancel.cancel,
+            &on_progress,
+        );
+        drop(pool);
+        Ok::<_, String>(report)
+    })
+    .await;
+
+    // 无论成功、失败、停止还是任务异常，都要把这一轮从「正在跑」里摘掉。
+    if let Ok(mut guard) = state.batch.lock() {
+        *guard = None;
+    }
+
+    let report = joined.map_err(|e| format!("归属地查询任务异常结束：{e}"))??;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        geo::persist_geo(store, &run_id, &report.rows)?;
+    }
+
+    for row in &report.rows {
+        let mut record = AppLogRecord::new(
+            if row.info.is_some() {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
+            "geo",
+            "geo.lookup",
+        )
+        .trace(&run_id)
+        .span(&logs::new_span_id())
+        .params(serde_json::json!({
+            "host": row.endpoint.host,
+            "port": row.endpoint.port,
+            "alias": row.alias,
+        }));
+        match &row.info {
+            Some(info) => {
+                record = record.result(serde_json::json!({
+                    "exitIp": info.exit_ip,
+                    "country": info.country,
+                    "zh": info.zh,
+                    "en": info.en,
+                    "colo": info.colo,
+                    "asn": info.asn,
+                    "source": info.source,
+                }));
+            }
+            None => {
+                record = record.error(
+                    row.error.as_deref().unwrap_or("归属地查询没有结论"),
+                    None,
+                );
+            }
+        }
+        log_app(state.inner(), &app, record);
+    }
+
+    let counts = report.counts();
+    log_app(
+        state.inner(),
+        &app,
+        AppLogRecord::new(LogLevel::Info, "geo", "geo.batch")
+            .trace(&run_id)
+            .duration(duration_ms)
+            .params(params.clone())
+            .result(serde_json::json!({
+                "ok": counts.ok,
+                "fail": counts.fail,
+                "untested": counts.untested,
+                "stopped": report.stopped,
+            })),
+    );
+    log_operation(
+        state.inner(),
+        &app,
+        if counts.fail > 0 {
+            LogLevel::Warn
+        } else {
+            LogLevel::Ok
+        },
+        &run_id,
+        &format!(
+            "归属地查询结束：成功 {} · 失败 {} · 未测 {}（{}ms）",
+            counts.ok, counts.fail, counts.untested, duration_ms
+        ),
+    );
+
+    Ok(GeoReportDto {
+        run_id,
+        total: report.total,
+        completed: report.completed,
+        stopped: report.stopped,
+        counts,
+        rows: report
+            .rows
+            .into_iter()
+            .map(|row| {
+                let status = if row.info.is_some() {
+                    "ok"
+                } else if row.error.is_some() {
+                    "fail"
+                } else {
+                    "untested"
+                };
+                let info = row.info;
+                GeoRowDto {
+                    host: row.endpoint.host,
+                    port: row.endpoint.port,
+                    alias: row.alias,
+                    status,
+                    exit_ip: info.as_ref().map(|info| info.exit_ip.clone()),
+                    country: info.as_ref().map(|info| info.country.clone()),
+                    zh: info.as_ref().map(|info| info.zh.clone()),
+                    en: info.as_ref().map(|info| info.en.clone()),
+                    colo: info.as_ref().and_then(|info| info.colo.clone()),
+                    asn: info.as_ref().and_then(|info| info.asn),
+                    error: row.error,
+                }
+            })
+            .collect(),
+    })
+}
+
 /// 请求停止当前批量测试；没有在跑时返回 `false`。
 #[tauri::command]
 fn probe_cancel(state: tauri::State<'_, AppState>) -> Result<bool, String> {    let guard = state
@@ -1613,6 +2004,7 @@ pub fn run() {
                 logs: log_writer,
                 singbox,
                 temp_dir,
+                geo: Arc::new(geo::GeoResolver::new(geo_candidates(app.handle()))),
                 batch: Mutex::new(None),
             });
 
@@ -1632,6 +2024,7 @@ pub fn run() {
             probe_single,
             probe_batch,
             probe_speed_batch,
+            probe_geo_batch,
             probe_cancel
         ])
         .on_window_event(|window, event| {

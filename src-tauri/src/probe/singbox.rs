@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::geo::{self, ExitIp};
 use crate::logs::SingboxLog;
 use crate::template::NodeTemplate;
 
@@ -270,9 +271,35 @@ impl Prober for SingBoxProber {
         classify(self.attempt(endpoint, template, options))
     }
 
-    /// 单地址测速：同一条代理链路上并发下载 4×2.5MB，上限 15 秒。
-    fn measure_speed(
+    /// 取出口 IP：为这条地址起临时链路，经本地入站请求两个端点并取多数。
+    fn exit_ip(
         &self,
+        endpoint: &Endpoint,
+        template: &NodeTemplate,
+        options: &ProbeOptions,
+    ) -> Result<ExitIp, String> {
+        let (mut session, port) = self.start_session(endpoint, template)?;
+        let cancel = AtomicBool::new(false);
+        let result = geo::fetch_exit_ip(
+            Some(&format!("http://127.0.0.1:{port}")),
+            options.connect_timeout,
+            options.request_timeout,
+            &cancel,
+        );
+
+        if result.is_err() {
+            if let Ok(Some(status)) = session.child.try_wait() {
+                return Err(format!(
+                    "sing-box 中途退出（{status}），本轮已终止。{}",
+                    self.log_hint()
+                ));
+            }
+        }
+        result
+    }
+
+    /// 单地址测速：同一条代理链路上并发下载 4×2.5MB，上限 15 秒。
+    fn measure_speed(        &self,
         endpoint: &Endpoint,
         template: &NodeTemplate,
         options: &ProbeOptions,

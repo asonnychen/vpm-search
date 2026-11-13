@@ -203,15 +203,18 @@ pub trait Prober: Send + Sync {
         options: &ProbeOptions,
     ) -> ProbeOutcome;
 
-    /// 取出口 IP；阶段 9 实现。
-    #[allow(dead_code)] // 阶段 9 接入
+    /// 取出口 IP：经当前代理链路请求两个端点，交叉校验后取多数。
+    ///
+    /// 与 `measure_latency` 共用一条链路，但结论不同：延迟看响应快慢，
+    /// 这里看对端观察到的来源 IP（见 ADR-0002）。
+    #[allow(dead_code)] // 批量走 GeoProber；单条入口留给界面与后续命令
     fn exit_ip(
         &self,
         _endpoint: &Endpoint,
         _template: &NodeTemplate,
         _options: &ProbeOptions,
-    ) -> Result<String, String> {
-        Err("出口 IP 查询将在阶段 9 实现".to_string())
+    ) -> Result<crate::geo::ExitIp, String> {
+        Err("当前探测器不支持取出口 IP".to_string())
     }
 
     /// 测速；阶段 8 实现。

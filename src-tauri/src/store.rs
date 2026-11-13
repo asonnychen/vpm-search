@@ -13,7 +13,7 @@ use crate::settings::{Settings, SETTING_KEYS};
 use crate::sources::parse::{CatalogSource, PoolCandidate};
 
 /// 当前 schema 版本，写进 SQLite 的 `user_version`。
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// 阶段 2 建好五张表；本期只有 `settings` 真正读写。
 const SCHEMA_V1: &str = r#"
@@ -90,6 +90,22 @@ ALTER TABLE test_result ADD COLUMN samples_json TEXT NOT NULL DEFAULT '[]';
 const SCHEMA_V5: &str = r#"
 ALTER TABLE test_result ADD COLUMN speed_status TEXT NOT NULL DEFAULT 'untested';
 ALTER TABLE test_result ADD COLUMN speed_error TEXT;
+"#;
+
+/// 阶段 9：归属地补上国家码，并新增按出口 IP 的查询缓存。
+///
+/// `test_result` 的 `exit_ip` / `geo_zh` / `geo_en` / `colo` 在阶段 2 就留好了，
+/// 这里只补国家码；缓存表让同一出口 IP 只查一次。
+const SCHEMA_V6: &str = r#"
+ALTER TABLE test_result ADD COLUMN geo_country TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS geo_cache (
+    ip         TEXT PRIMARY KEY,
+    country    TEXT NOT NULL DEFAULT '',
+    zh         TEXT NOT NULL DEFAULT '',
+    en         TEXT NOT NULL DEFAULT '',
+    asn        INTEGER,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 "#;
 
 /// 阶段 5：节点模板补上凭据与传输细节，并记录当前选中的模板。
@@ -266,6 +282,9 @@ impl Store {
         }
         if version < 5 {
             tx.execute_batch(SCHEMA_V5)?;
+        }
+        if version < 6 {
+            tx.execute_batch(SCHEMA_V6)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -672,6 +691,105 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM test_run", [], |row| row.get(0))?)
     }
 
+    /// 把归属地写进该轮已有的结果行；没有行时才新建（状态记未测）。
+    ///
+    /// 只更新 `exit_ip` / `geo_*` / `colo` 五列，绝不触碰延迟、速度与采样，
+    /// 因此归属地查询失败或重查都不会覆盖已有测试结论。
+    pub fn upsert_test_result_geo(
+        &self,
+        run_id: &str,
+        endpoint: &crate::probe::Endpoint,
+        alias: &str,
+        info: &crate::geo::GeoInfo,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE test_result
+             SET exit_ip = ?4, geo_country = ?5, geo_zh = ?6, geo_en = ?7, colo = ?8
+             WHERE run_id = ?1 AND host = ?2 AND port = ?3",
+            rusqlite::params![
+                run_id,
+                endpoint.host,
+                i64::from(endpoint.port),
+                info.exit_ip,
+                info.country,
+                info.zh,
+                info.en,
+                info.colo,
+            ],
+        )?;
+        if changed > 0 {
+            return Ok(());
+        }
+
+        self.conn.execute(
+            "INSERT INTO test_result
+                 (run_id, host, port, alias, status, latency_ms,
+                  exit_ip, geo_country, geo_zh, geo_en, colo)
+             VALUES (?1, ?2, ?3, ?4, 'untested', NULL, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                run_id,
+                endpoint.host,
+                i64::from(endpoint.port),
+                alias,
+                info.exit_ip,
+                info.country,
+                info.zh,
+                info.en,
+                info.colo,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 写一条出口 IP 的归属地缓存；同一 IP 覆盖为最新结论。
+    pub fn upsert_geo_cache(&self, ip: &str, record: &crate::geo::GeoRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO geo_cache (ip, country, zh, en, asn, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(ip) DO UPDATE SET
+                 country = excluded.country,
+                 zh = excluded.zh,
+                 en = excluded.en,
+                 asn = excluded.asn,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![
+                ip,
+                record.country,
+                record.zh,
+                record.en,
+                record.asn.map(i64::from),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 读全部归属地缓存，用于启动一轮查询前预灌内存缓存。
+    pub fn list_geo_cache(&self) -> Result<Vec<GeoCacheRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ip, country, zh, en, asn
+             FROM geo_cache
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GeoCacheRow {
+                ip: row.get(0)?,
+                record: crate::geo::GeoRecord {
+                    country: row.get(1)?,
+                    zh: row.get(2)?,
+                    en: row.get(3)?,
+                    asn: row
+                        .get::<_, Option<i64>>(4)?
+                        .map(|asn| asn.clamp(0, u32::MAX as i64) as u32),
+                },
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn count_test_results(&self) -> Result<i64> {
         Ok(self
@@ -684,7 +802,8 @@ impl Store {
     pub fn list_test_results(&self, run_id: &str) -> Result<Vec<TestResultRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT run_id, host, port, alias, status, latency_ms, error, samples_json,
-                    speed_mbps, speed_status, speed_error
+                    speed_mbps, speed_status, speed_error,
+                    exit_ip, geo_country, geo_zh, geo_en, colo
              FROM test_result
              WHERE run_id = ?1
              ORDER BY id",
@@ -703,6 +822,11 @@ impl Store {
                 speed_mbps: row.get(8)?,
                 speed_status: row.get(9)?,
                 speed_error: row.get(10)?,
+                exit_ip: row.get(11)?,
+                geo_country: row.get(12)?,
+                geo_zh: row.get(13)?,
+                geo_en: row.get(14)?,
+                colo: row.get(15)?,
             })
         })?;
         let mut results = Vec::new();
@@ -770,6 +894,23 @@ pub struct TestResultRow {
     pub speed_status: String,
     /// 测速失败原因，成功时为 `None`。
     pub speed_error: Option<String>,
+    /// 经代理观测到的出口 IP；未查询时为 `None`。
+    pub exit_ip: Option<String>,
+    /// 出口 IP 的 ISO 国家码；Cloudflare 落地为空。
+    pub geo_country: Option<String>,
+    /// 归属地中文名。
+    pub geo_zh: Option<String>,
+    /// 归属地英文名。
+    pub geo_en: Option<String>,
+    /// Cloudflare 机房三字码；非 CF 落地为空。
+    pub colo: Option<String>,
+}
+
+/// `geo_cache` 的一行：出口 IP 到归属地的缓存。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoCacheRow {
+    pub ip: String,
+    pub record: crate::geo::GeoRecord,
 }
 
 /// `test_run` 的一行。
@@ -871,6 +1012,7 @@ mod tests {
         assert_eq!(
             tables,
             vec![
+                "geo_cache".to_string(),
                 "pool_entry".to_string(),
                 "pool_source".to_string(),
                 "settings".to_string(),
@@ -1164,5 +1306,68 @@ mod tests {
             Some("2026-11-13T04:05:07.000Z")
         );
         assert_eq!(store.list_pool_entries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 从阶段八的旧库升级补上国家码与缓存表() {
+        let (_dir, path) = temp_db();
+        {
+            // 模拟阶段 8 的库：schema 到 V5，结果行已有延迟但没有国家码。
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(SCHEMA_V5).unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+            conn.execute(
+                "INSERT INTO test_run (id, started_at, total) VALUES ('run-old', '2026-11-13T00:00:00.000Z', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO test_result (run_id, host, port, status, latency_ms)
+                 VALUES ('run-old', '104.16.1.1', 8443, 'ok', 88)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows = store.list_test_results("run-old").unwrap();
+        assert_eq!(rows[0].latency_ms, Some(88));
+        assert_eq!(rows[0].geo_country.as_deref(), Some(""));
+        assert_eq!(rows[0].geo_zh, None);
+        // 新表可写。
+        store
+            .upsert_geo_cache(
+                "203.0.113.9",
+                &crate::geo::GeoRecord::from_country("CA", Some(15169)),
+            )
+            .unwrap();
+        assert_eq!(store.list_geo_cache().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 出口_ip_缓存同一_ip_覆盖不重复() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_geo_cache(
+                "203.0.113.9",
+                &crate::geo::GeoRecord::from_country("CA", Some(15169)),
+            )
+            .unwrap();
+        store
+            .upsert_geo_cache(
+                "203.0.113.9",
+                &crate::geo::GeoRecord::from_country("JP", Some(2497)),
+            )
+            .unwrap();
+
+        let cache = store.list_geo_cache().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].ip, "203.0.113.9");
+        assert_eq!(cache[0].record.zh, "日本");
+        assert_eq!(cache[0].record.asn, Some(2497));
     }
 }

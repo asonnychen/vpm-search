@@ -3,10 +3,12 @@ import { usePoolStore } from "../store/pool";
 import {
   probeKey,
   selectProbeError,
+  selectProbeGeos,
   selectProbeResults,
   selectProbeSpeeds,
   selectProbeTesting,
   useProbeStore,
+  type GeoResult,
 } from "../store/probe";
 import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
 import { activeTemplate, templateColumns } from "../store/template";
@@ -32,6 +34,8 @@ type Row = {
   error: string | null;
   /** 测速失败原因。 */
   speedError: string | null;
+  /** 出口 IP 的归属地；未查询或查询失败时为 null。 */
+  geo: GeoResult | null;
 };
 
 const filterDefs = [
@@ -71,6 +75,16 @@ function latencyCell(row: Row, threshold: number) {
   );
 }
 
+function geoTitle(geo: GeoResult | null): string | undefined {
+  if (!geo) return undefined;
+  const parts = [
+    geo.exitIp ? `出口 ${geo.exitIp}` : "",
+    geo.country ? `国家码 ${geo.country}` : "",
+    geo.source ? `来源 ${geo.source}` : "",
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
 export default function ResultsTable() {
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
@@ -92,6 +106,7 @@ export default function ResultsTable() {
   // 单条真连接延迟的结果按 `host:port` 覆盖到对应行，未测的行保持 null。
   const probeResults = useProbeStore(selectProbeResults);
   const probeSpeeds = useProbeStore(selectProbeSpeeds);
+  const probeGeos = useProbeStore(selectProbeGeos);
   const probeTesting = useProbeStore(selectProbeTesting);
   const probeError = useProbeStore(selectProbeError);
   const testOne = useProbeStore((state) => state.testOne);
@@ -114,9 +129,10 @@ export default function ResultsTable() {
           status: result?.status ?? "untested",
           error: result?.error ?? null,
           speedError: speed?.error ?? null,
+          geo: probeGeos[key] ?? null,
         };
       }),
-    [poolEntries, probeResults, probeSpeeds],
+    [poolEntries, probeResults, probeSpeeds, probeGeos],
   );
 
   const counts = useMemo(() => {
@@ -178,7 +194,10 @@ export default function ResultsTable() {
         return (
           r.host.toLowerCase().includes(q) ||
           r.alias.toLowerCase().includes(q) ||
-          r.source.toLowerCase().includes(q)
+          r.source.toLowerCase().includes(q) ||
+          (r.geo?.zh.toLowerCase().includes(q) ?? false) ||
+          (r.geo?.en.toLowerCase().includes(q) ?? false) ||
+          (r.geo?.colo?.toLowerCase().includes(q) ?? false)
         );
       }
       return true;
@@ -446,14 +465,26 @@ export default function ResultsTable() {
                   <td className="border-b border-line/60 px-2 py-1.5 num text-muted">
                     {columns.transport}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5">
-                    <span className="text-dim">—</span>
+                  <td className="border-b border-line/60 px-2 py-1.5" title={geoTitle(r.geo)}>
+                    {r.geo?.zh ? (
+                      <span className="text-text/90">{r.geo.zh}</span>
+                    ) : (
+                      <span className="text-dim">—</span>
+                    )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-muted">
-                    <span className="text-dim">—</span>
+                  <td className="border-b border-line/60 px-2 py-1.5" title={geoTitle(r.geo)}>
+                    {r.geo?.en ? (
+                      <span className="text-muted">{r.geo.en}</span>
+                    ) : (
+                      <span className="text-dim">—</span>
+                    )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 num text-right">
-                    <span className="text-dim">—</span>
+                  <td className="border-b border-line/60 px-2 py-1.5 num text-right" title={geoTitle(r.geo)}>
+                    {r.geo?.colo ? (
+                      <span className="text-text/90">{r.geo.colo}</span>
+                    ) : (
+                      <span className="text-dim">—</span>
+                    )}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 text-right">
                     <span

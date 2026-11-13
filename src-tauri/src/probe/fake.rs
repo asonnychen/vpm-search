@@ -20,8 +20,11 @@ pub struct FakeProber {
     scripted: Mutex<HashMap<(String, u16), Vec<Attempt>>>,
     /// 按地址预设的测速结果。
     speeds: Mutex<HashMap<(String, u16), Result<f64, String>>>,
+    /// 按地址预设的出口 IP。
+    exits: Mutex<HashMap<(String, u16), Result<crate::geo::ExitIp, String>>>,
     calls: Mutex<Vec<(String, u16)>>,
     speed_calls: Mutex<Vec<(String, u16)>>,
+    geo_calls: Mutex<Vec<(String, u16)>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // 只在测试里构造
@@ -31,8 +34,10 @@ impl FakeProber {
             attempts: Mutex::new(attempts),
             scripted: Mutex::new(HashMap::new()),
             speeds: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
             speed_calls: Mutex::new(Vec::new()),
+            geo_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -51,8 +56,10 @@ impl FakeProber {
             attempts: Mutex::new(Vec::new()),
             scripted: Mutex::new(scripted),
             speeds: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
             speed_calls: Mutex::new(Vec::new()),
+            geo_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -71,6 +78,26 @@ impl FakeProber {
 
     pub fn calls(&self) -> Vec<(String, u16)> {
         self.calls.lock().map(|calls| calls.clone()).unwrap_or_default()
+    }
+
+    /// 预设每条地址的出口 IP；没预设的地址返回失败。
+    pub fn with_exits(
+        self,
+        entries: Vec<((&str, u16), Result<crate::geo::ExitIp, String>)>,
+    ) -> Self {
+        if let Ok(mut exits) = self.exits.lock() {
+            for ((host, port), result) in entries {
+                exits.insert((host.to_string(), port), result);
+            }
+        }
+        self
+    }
+
+    pub fn geo_calls(&self) -> Vec<(String, u16)> {
+        self.geo_calls
+            .lock()
+            .map(|calls| calls.clone())
+            .unwrap_or_default()
     }
 
     pub fn speed_calls(&self) -> Vec<(String, u16)> {
@@ -133,6 +160,24 @@ impl BatchProber for FakeProber {
         options: &ProbeOptions,
     ) -> ProbeOutcome {
         self.measure_latency(endpoint, template, options)
+    }
+}
+
+impl crate::geo::GeoProber for FakeProber {
+    fn exit_ip_sample(
+        &self,
+        endpoint: &Endpoint,
+        _options: &ProbeOptions,
+        _cancel: &AtomicBool,
+    ) -> Result<crate::geo::ExitIp, String> {
+        if let Ok(mut calls) = self.geo_calls.lock() {
+            calls.push((endpoint.host.clone(), endpoint.port));
+        }
+        self.exits
+            .lock()
+            .ok()
+            .and_then(|exits| exits.get(&(endpoint.host.clone(), endpoint.port)).cloned())
+            .unwrap_or_else(|| Err("假探测器没有预设出口 IP".to_string()))
     }
 }
 

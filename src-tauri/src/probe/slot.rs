@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::geo::{self, ExitIp, GeoProber};
 use crate::logs::SingboxLog;
 use crate::template::NodeTemplate;
 
@@ -250,10 +251,43 @@ impl SpeedProber for SlotPool {
     }
 }
 
+impl GeoProber for SlotPool {
+    /// 经该地址所属槽位的本地入站取出口 IP，两个端点交叉校验。
+    fn exit_ip_sample(
+        &self,
+        endpoint: &Endpoint,
+        options: &ProbeOptions,
+        cancel: &AtomicBool,
+    ) -> Result<ExitIp, String> {
+        let Some(lane) = self.lanes.get(&(endpoint.host.clone(), endpoint.port)) else {
+            return Err("槽位池里没有这条地址".to_string());
+        };
+
+        let result = geo::fetch_exit_ip(
+            Some(&format!("http://127.0.0.1:{}", lane.port)),
+            options.connect_timeout,
+            options.request_timeout,
+            cancel,
+        );
+
+        // 槽位进程中途退出时，把日志路径带进失败原因。
+        if result.is_err() {
+            if let Ok(mut child) = self.slots[lane.slot].child.lock() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(format!(
+                        "sing-box 槽位中途退出（{status}），本轮已终止。sing-box 日志：{}",
+                        self.log_path.display()
+                    ));
+                }
+            }
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn 空地址池不要求_binary_也不启动进程() {
         let dir = tempfile::tempdir().unwrap();

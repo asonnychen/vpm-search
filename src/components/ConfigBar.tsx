@@ -25,11 +25,13 @@ export default function ConfigBar({
   const batch = useProbeStore(selectProbeBatch);
   const startBatch = useProbeStore((state) => state.startBatch);
   const startSpeedBatch = useProbeStore((state) => state.startSpeedBatch);
+  const startGeoBatch = useProbeStore((state) => state.startGeoBatch);
   const cancelBatch = useProbeStore((state) => state.cancelBatch);
   const selectedIds = useSelectionStore((state) => state.ids);
   const [panel, setPanel] = useState<TemplatePanelMode | null>(null);
 
   const runningSpeed = batch.running && batch.mode === "speed";
+  const runningGeo = batch.running && batch.mode === "geo";
   const speedScope = selectedIds.length > 0 ? `选中 ${selectedIds.length} 行` : "整池";
 
   const percent =
@@ -99,6 +101,22 @@ export default function ConfigBar({
             {runningSpeed ? "测速中…" : "一键多线程测速"}
           </Btn>
           <Btn
+            variant="secondary"
+            disabled={batch.running}
+            title={
+              batch.running
+                ? "测试进行中，结束后才能再发起一轮"
+                : `经代理取${speedScope}的出口 IP 并查归属地，不影响已有延迟与速度`
+            }
+            onClick={() =>
+              void startGeoBatch(
+                selectedIds.length > 0 ? speedTargetsFromIds(selectedIds) : undefined,
+              )
+            }
+          >
+            {runningGeo ? "查询中…" : "查询归属地"}
+          </Btn>
+          <Btn
             variant="danger"
             disabled={!batch.running || batch.stopping}
             title={batch.running ? "停止后已完成的保留，未开始的标记为未测" : "当前没有正在跑的测试"}
@@ -117,7 +135,9 @@ export default function ConfigBar({
               ? "正在停止，已开始的会跑完"
               : batch.mode === "speed"
                 ? "批量测速进行中"
-                : "批量测试进行中"}
+                : batch.mode === "geo"
+                  ? "归属地查询进行中"
+                  : "批量测试进行中"}
           </span>
           <span
             className="h-1.5 flex-1 max-w-md bg-canvas ring-1 ring-line rounded-full overflow-hidden"

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createProbeStore,
   normalizeBatchReport,
+  normalizeGeoReport,
   normalizeProbeResult,
   normalizeSpeedReport,
   probeKey,
@@ -40,6 +41,43 @@ function fakePersistence(
       ],
     })),
     cancelBatch: vi.fn(async () => true),
+    geoBatch: vi.fn(async () => ({
+      runId: "run-1",
+      total: 2,
+      completed: 2,
+      stopped: false,
+      counts: { ok: 2, fail: 0, untested: 0 },
+      rows: [
+        {
+          host: "104.16.1.1",
+          port: 8443,
+          alias: "",
+          status: "ok",
+          exitIp: "104.16.1.1",
+          country: "",
+          zh: "Cloudflare",
+          en: "Cloudflare",
+          colo: "LAX",
+          asn: 13335,
+          error: null,
+          source: "offline",
+        },
+        {
+          host: "104.16.2.2",
+          port: 8443,
+          alias: "",
+          status: "ok",
+          exitIp: "203.0.113.9",
+          country: "CA",
+          zh: "加拿大",
+          en: "Canada",
+          colo: null,
+          asn: 15169,
+          error: null,
+          source: "online",
+        },
+      ],
+    })),
     ...overrides,
   };
 }
@@ -343,6 +381,104 @@ describe("测速", () => {
       mode: "speed",
       completed: 2,
       total: 5,
+    });
+  });
+});
+
+describe("归属地", () => {
+  it("三段写进归属地表且不清空延迟与速度", async () => {
+    const persistence = fakePersistence();
+    const store = createProbeStore(persistence);
+
+    await store.getState().testOne("104.16.1.1", 8443);
+    await store.getState().startSpeedBatch([{ host: "104.16.1.1", port: 8443 }]);
+    await store.getState().startGeoBatch([{ host: "104.16.1.1", port: 8443 }]);
+
+    expect(persistence.geoBatch).toHaveBeenCalledWith([
+      { host: "104.16.1.1", port: 8443 },
+    ]);
+    // 延迟与速度都不受归属地影响。
+    expect(store.getState().results["104.16.1.1:8443"].latencyMs).toBe(120);
+    expect(store.getState().speeds["104.16.1.1:8443"].mbps).toBe(12.3);
+
+    // Cloudflare 落地：机房有值。
+    expect(store.getState().geos["104.16.1.1:8443"]).toMatchObject({
+      zh: "Cloudflare",
+      en: "Cloudflare",
+      colo: "LAX",
+      asn: 13335,
+    });
+    // 非 CF 落地：机房为空。
+    expect(store.getState().geos["104.16.2.2:8443"]).toMatchObject({
+      zh: "加拿大",
+      en: "Canada",
+      colo: null,
+    });
+  });
+
+  it("成功却没有地名时按失败处理，不写空字符串", () => {
+    const report = normalizeGeoReport({
+      runId: "run-1",
+      rows: [
+        { host: "104.16.1.1", port: 8443, status: "ok", zh: "", en: "" },
+        { host: "104.16.1.2", port: 8443, status: "fail", error: "归属地查询失败" },
+      ],
+    });
+
+    expect(report.rows[0]).toMatchObject({ status: "fail", zh: "" });
+    expect(report.rows[1]).toMatchObject({
+      status: "fail",
+      error: "归属地查询失败",
+    });
+  });
+
+  it("查询失败或未测的行不覆盖已有归属地", async () => {
+    const first = fakePersistence();
+    const store = createProbeStore(first);
+    await store.getState().startGeoBatch();
+
+    const second = fakePersistence({
+      geoBatch: vi.fn(async () => ({
+        runId: "run-2",
+        total: 1,
+        completed: 0,
+        stopped: true,
+        counts: { ok: 0, fail: 1, untested: 0 },
+        rows: [
+          {
+            host: "104.16.1.1",
+            port: 8443,
+            alias: "",
+            status: "fail",
+            exitIp: null,
+            country: null,
+            zh: "",
+            en: "",
+            colo: null,
+            asn: null,
+            error: "取出口 IP 失败",
+            source: "",
+          },
+        ],
+      })),
+    });
+    const restarted = createProbeStore(second);
+    restarted.setState({ geos: store.getState().geos });
+    await restarted.getState().startGeoBatch();
+
+    expect(restarted.getState().geos["104.16.1.1:8443"].zh).toBe("Cloudflare");
+    expect(restarted.getState().geos["104.16.1.1:8443"].colo).toBe("LAX");
+  });
+
+  it("归属地查询中标记为 geo 模式并记录进度", () => {
+    const store = createProbeStore(fakePersistence());
+    store.getState().applyProgress({ runId: "run-1", mode: "geo", completed: 1, total: 4 });
+
+    expect(store.getState().batch).toMatchObject({
+      running: true,
+      mode: "geo",
+      completed: 1,
+      total: 4,
     });
   });
 });

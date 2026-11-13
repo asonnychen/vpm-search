@@ -78,8 +78,8 @@ export type BatchReport = {
 /** 后端通过事件推送的进度。 */
 export type BatchProgress = {
   runId: string;
-  /** 这一轮是延迟测试还是测速。 */
-  mode?: "latency" | "speed";
+  /** 这一轮是延迟测试、测速还是归属地查询。 */
+  mode?: "latency" | "speed" | "geo";
   completed: number;
   total: number;
 };
@@ -90,7 +90,7 @@ export type BatchState = {
   /** 已经点过停止，等待在跑的采样收尾。 */
   stopping: boolean;
   /** 这一轮的类型，决定按钮文案与进度说明。 */
-  mode: "latency" | "speed";
+  mode: "latency" | "speed" | "geo";
   runId: string | null;
   completed: number;
   total: number;
@@ -135,8 +135,59 @@ export type SpeedReport = {
   rows: SpeedRow[];
 };
 
-export const EMPTY_BATCH_REPORT: BatchReport = {
+/** 一条地址的归属地结果，与延迟、测速分开保存。 */
+export type GeoResult = {
+  /** 经代理观测到的出口 IP，不是优选地址本身。 */
+  exitIp: string | null;
+  /** ISO 国家码；Cloudflare 落地为空。 */
+  country: string | null;
+  /** 归属地中文名。 */
+  zh: string;
+  /** 归属地英文名。 */
+  en: string;
+  /** Cloudflare 机房三字码；非 CF 落地或没有 colo 时为 null。 */
+  colo: string | null;
+  asn: number | null;
+  /** 数据来源：offline / online / cache / trace。 */
+  source: string;
+};
+
+/** 归属地查询里一条地址的结果。 */
+export type GeoRow = GeoResult & {
+  host: string;
+  port: number;
+  alias: string;
+  status: "ok" | "fail" | "untested";
+  error: string | null;
+};
+
+/** 一轮归属地查询的统计。 */
+export type GeoCounts = {
+  ok: number;
+  fail: number;
+  untested: number;
+};
+
+/** 一轮归属地查询的完整结果。 */
+export type GeoReport = {
+  runId: string;
+  total: number;
+  completed: number;
+  stopped: boolean;
+  counts: GeoCounts;
+  rows: GeoRow[];
+};
+
+export const EMPTY_GEO_REPORT: GeoReport = {
   runId: "",
+  total: 0,
+  completed: 0,
+  stopped: false,
+  counts: { ok: 0, fail: 0, untested: 0 },
+  rows: [],
+};
+
+export const EMPTY_BATCH_REPORT: BatchReport = {  runId: "",
   total: 0,
   completed: 0,
   stopped: false,
@@ -266,6 +317,66 @@ export function normalizeSpeedReport(raw: unknown): SpeedReport {
   };
 }
 
+/** 把后端返回的任意 JSON 归一成一轮归属地结果；坏字段只丢自己。 */
+export function normalizeGeoReport(raw: unknown): GeoReport {
+  if (!isRecord(raw)) return EMPTY_GEO_REPORT;
+
+  const rows: GeoRow[] = Array.isArray(raw.rows)
+    ? raw.rows.filter(isRecord).map((item) => {
+        const host = str(item.host);
+        const port = Math.round(num(item.port));
+        const alias = str(item.alias);
+        const error =
+          typeof item.error === "string" && item.error !== "" ? item.error : null;
+        const zh = str(item.zh);
+        const en = str(item.en);
+
+        // 状态与归属地以「有没有中英文名」为准：后端说成功但没名字是坏数据。
+        if (item.status === "untested") {
+          return { host, port, alias, status: "untested" as const, error: null,
+            exitIp: null, country: null, zh: "", en: "", colo: null, asn: null, source: "" };
+        }
+        if (item.status !== "ok" || (zh === "" && en === "")) {
+          return { host, port, alias, status: "fail" as const,
+            error: error ?? "归属地查询失败",
+            exitIp: null, country: null, zh: "", en: "", colo: null, asn: null, source: "" };
+        }
+
+        const asn = num(item.asn, 0);
+        const colo = str(item.colo).trim();
+        return {
+          host,
+          port,
+          alias,
+          status: "ok" as const,
+          error: null,
+          exitIp: str(item.exitIp) || null,
+          country: str(item.country) || null,
+          zh,
+          en,
+          // 无机房信息时第三段留空，不写占位符。
+          colo: colo === "" ? null : colo,
+          asn: asn > 0 ? Math.round(asn) : null,
+          source: str(item.source),
+        };
+      })
+    : [];
+
+  const counts = isRecord(raw.counts) ? raw.counts : {};
+  return {
+    runId: str(raw.runId),
+    total: count(raw.total),
+    completed: count(raw.completed),
+    stopped: bool(raw.stopped, false),
+    counts: {
+      ok: count(counts.ok),
+      fail: count(counts.fail),
+      untested: count(counts.untested),
+    },
+    rows: rows.filter((row) => row.host !== "" && row.port > 0),
+  };
+}
+
 /** 把 `host:port` 形式的选中行拆成测速目标。 */
 export function speedTargetsFromIds(ids: string[]): SpeedTarget[] {
   return ids.flatMap((id) => {
@@ -282,6 +393,7 @@ export type ProbePersistence = {
   probe: (host: string, port: number, alias: string) => Promise<unknown>;
   startBatch: () => Promise<unknown>;
   speedBatch: (targets?: SpeedTarget[]) => Promise<unknown>;
+  geoBatch: (targets?: SpeedTarget[]) => Promise<unknown>;
   cancelBatch: () => Promise<unknown>;
 };
 
@@ -290,6 +402,8 @@ export type ProbeStore = {
   results: Record<string, ProbeResult>;
   /** 按 `host:port` 索引的测速结果，与延迟分开保存。 */
   speeds: Record<string, SpeedResult>;
+  /** 按 `host:port` 索引的归属地结果，与延迟、测速互不影响。 */
+  geos: Record<string, GeoResult>;
   /** 正在测试的行。 */
   testing: Record<string, boolean>;
   /** 批量测试的进度与状态。 */
@@ -299,6 +413,7 @@ export type ProbeStore = {
   testOne: (host: string, port: number, alias?: string) => Promise<ProbeResult>;
   startBatch: () => Promise<void>;
   startSpeedBatch: (targets?: SpeedTarget[]) => Promise<void>;
+  startGeoBatch: (targets?: SpeedTarget[]) => Promise<void>;
   cancelBatch: () => Promise<void>;
   applyProgress: (progress: BatchProgress) => void;
 };
@@ -311,6 +426,7 @@ export function createProbeStore(persistence: ProbePersistence) {
   return create<ProbeStore>()((set, get) => ({
     results: {},
     speeds: {},
+    geos: {},
     testing: {},
     batch: { ...EMPTY_BATCH_STATE },
     error: null,
@@ -432,6 +548,56 @@ export function createProbeStore(persistence: ProbePersistence) {
       });
     },
 
+    startGeoBatch: async (targets) => {
+      // 与延迟、测速共用同一轮槽位，测试进行中禁止重复触发。
+      if (get().batch.running) return;
+
+      set({
+        batch: { ...EMPTY_BATCH_STATE, running: true, mode: "geo" },
+        error: null,
+      });
+
+      let report: GeoReport;
+      try {
+        report = normalizeGeoReport(await persistence.geoBatch(targets));
+      } catch (error) {
+        set({
+          batch: { ...EMPTY_BATCH_STATE },
+          error: errorMessage(error),
+        });
+        return;
+      }
+
+      // 只覆盖真正查到结论的行；失败或未测的行保留上一次的归属地。
+      const geos = { ...get().geos };
+      for (const row of report.rows) {
+        if (row.status !== "ok") continue;
+        geos[probeKey(row.host, row.port)] = {
+          exitIp: row.exitIp,
+          country: row.country,
+          zh: row.zh,
+          en: row.en,
+          colo: row.colo,
+          asn: row.asn,
+          source: row.source,
+        };
+      }
+
+      set({
+        geos,
+        batch: {
+          running: false,
+          stopping: false,
+          mode: "geo",
+          runId: report.runId,
+          completed: report.completed,
+          total: report.total,
+          stopped: report.stopped,
+        },
+        error: null,
+      });
+    },
+
     cancelBatch: async () => {
       if (get().batch.running) {
         set({ batch: { ...get().batch, stopping: true } });
@@ -480,6 +646,10 @@ export const tauriProbePersistence: ProbePersistence = {
     isTauriRuntime()
       ? invoke<unknown>("probe_speed_batch", { targets: targets ?? null })
       : Promise.reject(new Error("当前不在 Tauri 窗口内，无法启动 sing-box")),
+  geoBatch: (targets) =>
+    isTauriRuntime()
+      ? invoke<unknown>("probe_geo_batch", { targets: targets ?? null })
+      : Promise.reject(new Error("当前不在 Tauri 窗口内，无法查询归属地")),
   cancelBatch: () =>
     isTauriRuntime() ? invoke<unknown>("probe_cancel") : Promise.resolve(false),
 };
@@ -496,7 +666,12 @@ export async function subscribeProbeProgress(
     if (!isRecord(payload)) return;
     handler({
       runId: str(payload.runId),
-      mode: payload.mode === "speed" ? "speed" : "latency",
+      mode:
+        payload.mode === "speed"
+          ? "speed"
+          : payload.mode === "geo"
+            ? "geo"
+            : "latency",
       completed: count(payload.completed),
       total: count(payload.total),
     });
@@ -505,6 +680,7 @@ export async function subscribeProbeProgress(
 
 export const selectProbeResults = (state: ProbeStore) => state.results;
 export const selectProbeSpeeds = (state: ProbeStore) => state.speeds;
+export const selectProbeGeos = (state: ProbeStore) => state.geos;
 export const selectProbeTesting = (state: ProbeStore) => state.testing;
 export const selectProbeError = (state: ProbeStore) => state.error;
 export const selectProbeBatch = (state: ProbeStore) => state.batch;
