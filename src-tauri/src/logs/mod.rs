@@ -1,6 +1,7 @@
 //! 三类日志：操作日志、应用日志、sing-box 日志。
 //!
-//! 落盘位置为 `<app_data_dir>/logs/`，每类日志按天一个文件：
+//! 落盘位置为 `%APPDATA%\vpm-search\logs\`（与数据库同目录；非 Windows 平台
+//! 回落到 `app_data_dir()/logs/`），每类日志按天一个文件：
 //! `operation-YYYY-MM-DD.log`、`app-YYYY-MM-DD.log`、`singbox-YYYY-MM-DD.log`。
 //!
 //! - 操作日志：人读的中文单行，`<ts> <LEVEL> <traceId> <文本>`；
@@ -36,52 +37,82 @@ pub enum LogKind {
     Singbox,
 }
 
+/// 一类日志的元数据：前缀、中文名、保留天数字段都集中在这张表里。
+struct LogKindMeta {
+    kind: LogKind,
+    prefix: &'static str,
+    label: &'static str,
+    retention_days: fn(&LogRetention) -> u32,
+}
+
+fn operation_days(retention: &LogRetention) -> u32 {
+    retention.operation_days
+}
+
+fn app_days(retention: &LogRetention) -> u32 {
+    retention.app_days
+}
+
+fn singbox_days(retention: &LogRetention) -> u32 {
+    retention.singbox_days
+}
+
+const LOG_KIND_META: [LogKindMeta; 3] = [
+    LogKindMeta {
+        kind: LogKind::Operation,
+        prefix: "operation",
+        label: "操作日志",
+        retention_days: operation_days,
+    },
+    LogKindMeta {
+        kind: LogKind::App,
+        prefix: "app",
+        label: "应用日志",
+        retention_days: app_days,
+    },
+    LogKindMeta {
+        kind: LogKind::Singbox,
+        prefix: "singbox",
+        label: "sing-box 日志",
+        retention_days: singbox_days,
+    },
+];
+
 impl LogKind {
     pub const ALL: [LogKind; 3] = [LogKind::Operation, LogKind::App, LogKind::Singbox];
 
+    fn meta(self) -> &'static LogKindMeta {
+        LOG_KIND_META
+            .iter()
+            .find(|meta| meta.kind == self)
+            .expect("每种日志都有元数据")
+    }
+
     /// 文件名前缀。
     pub fn prefix(self) -> &'static str {
-        match self {
-            LogKind::Operation => "operation",
-            LogKind::App => "app",
-            LogKind::Singbox => "singbox",
-        }
+        self.meta().prefix
     }
 
     /// 界面上的中文名。
     pub fn label(self) -> &'static str {
-        match self {
-            LogKind::Operation => "操作日志",
-            LogKind::App => "应用日志",
-            LogKind::Singbox => "sing-box 日志",
-        }
+        self.meta().label
     }
 
     /// 前端传来的类型标识。
     pub fn as_str(self) -> &'static str {
-        match self {
-            LogKind::Operation => "operation",
-            LogKind::App => "app",
-            LogKind::Singbox => "singbox",
-        }
+        self.prefix()
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "operation" => Some(LogKind::Operation),
-            "app" => Some(LogKind::App),
-            "singbox" => Some(LogKind::Singbox),
-            _ => None,
-        }
+        LOG_KIND_META
+            .iter()
+            .find(|meta| meta.prefix == value)
+            .map(|meta| meta.kind)
     }
 
     /// 该类日志的保留天数。
     pub fn retention_days(self, retention: &LogRetention) -> u32 {
-        match self {
-            LogKind::Operation => retention.operation_days,
-            LogKind::App => retention.app_days,
-            LogKind::Singbox => retention.singbox_days,
-        }
+        (self.meta().retention_days)(retention)
     }
 }
 

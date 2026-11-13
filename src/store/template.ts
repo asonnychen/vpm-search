@@ -89,7 +89,6 @@ export function deleteTemplate(
 /** 新增模板并立即切换过去。 */
 export function addTemplate(
   templates: NodeTemplate[],
-  _activeTemplateId: string,
   template: NodeTemplate,
 ): TemplateSelection {
   return {

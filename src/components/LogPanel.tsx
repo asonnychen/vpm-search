@@ -26,6 +26,14 @@ const levelStyle: Record<LogLevel, string> = {
   ERROR: "text-danger",
 };
 
+/** 级别列按 sentence case 展示，不用全大写与宽字距。 */
+const levelLabel: Record<LogLevel, string> = {
+  INFO: "Info",
+  OK: "Ok",
+  WARN: "Warn",
+  ERROR: "Error",
+};
+
 const LEVEL_OPTIONS: LevelFilter[] = ["ALL", "INFO", "OK", "WARN", "ERROR"];
 
 /** 三类日志各自的保留天数字段。 */
@@ -174,8 +182,8 @@ export default function LogPanel({
                 className="grid grid-cols-[92px_64px_1fr] gap-3 hover:bg-panel-2/60 -mx-1 px-1"
               >
                 <span className="text-dim">{formatLogClock(line.ts)}</span>
-                <span className={cn("text-[12px] tracking-wider", levelStyle[line.level])}>
-                  {line.level}
+                <span className={cn("text-[12px]", levelStyle[line.level])}>
+                  {levelLabel[line.level]}
                 </span>
                 <span
                   className={cn(

@@ -115,7 +115,7 @@ describe("模板列表的增删改", () => {
 
   it("新增模板后自动选中新模板", () => {
     const created = template({ id: "t9", name: "新模板" });
-    const result = addTemplate([template()], "t1", created);
+    const result = addTemplate([template()], created);
     expect(result.templates.map((item) => item.id)).toEqual(["t1", "t9"]);
     expect(result.activeTemplateId).toBe("t9");
   });

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { errorMessage, isRecord, isTauriRuntime } from "./utils";
 
 /** 一条优选源。 */
 export type PoolSource = {
@@ -39,10 +40,6 @@ export const EMPTY_SNAPSHOT: PoolSnapshot = {
   fetchedAt: null,
   duplicates: 0,
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function str(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
@@ -133,10 +130,6 @@ export type PoolStore = PoolSnapshot & {
   toggleSource: (url: string, checked: boolean) => Promise<void>;
 };
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export function createPoolStore(persistence: PoolPersistence) {
   return create<PoolStore>()((set, get) => {
     const apply = (snapshot: PoolSnapshot) => {
@@ -219,10 +212,6 @@ export function createPoolStore(persistence: PoolPersistence) {
       },
     };
   });
-}
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 /** 生产环境走 Tauri 命令；浏览器里跑原型时返回空池。 */

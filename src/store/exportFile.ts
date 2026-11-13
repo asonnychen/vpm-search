@@ -1,6 +1,7 @@
 /** 导出命令的调用口：生产环境走 Tauri，浏览器原型里直接给可读失败。 */
 import { invoke } from "@tauri-apps/api/core";
 import type { ExportRow } from "./exportRows";
+import { isTauriRuntime } from "./utils";
 
 export type ExportSummary = {
   /** 用户在保存对话框里点了取消。 */
@@ -10,10 +11,6 @@ export type ExportSummary = {
   /** 本次导出里缺少归属地的条数。 */
   missingGeo: number;
 };
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
 
 /**
  * 打开系统保存对话框并写出 txt。

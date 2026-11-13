@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { errorMessage, isRecord, isTauriRuntime } from "./utils";
 
 /** 三类日志：操作日志、应用日志、sing-box 日志。 */
 export type LogKind = "operation" | "app" | "singbox";
@@ -29,10 +30,6 @@ export const MAX_LOG_LINES = 2000;
 export const LOG_KINDS: LogKind[] = ["operation", "app", "singbox"];
 
 const LEVELS: LogLevel[] = ["INFO", "OK", "WARN", "ERROR"];
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function str(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : null;
@@ -144,10 +141,6 @@ const DEFAULT_LEVELS: Record<LogKind, LevelFilter> = {
   singbox: "ALL",
 };
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function normalizeReport(raw: unknown): ClearReport {
   if (!isRecord(raw)) return { entries: 0, files: 0 };
   const number = (value: unknown) =>
@@ -206,10 +199,6 @@ export function createLogsStore(persistence: LogsPersistence) {
         get().append(entry);
       }),
   }));
-}
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 /** 生产环境走 Tauri；浏览器里跑原型时保持空表。 */

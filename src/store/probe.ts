@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { errorMessage, isRecord, isTauriRuntime } from "./utils";
 
 /** 单条测试的结论，与后端 `ProbeStatus` 一致。 */
 export type ProbeStatus = "ok" | "timeout" | "fail" | "untested";
@@ -17,10 +18,6 @@ export type ProbeResult = {
 /** 表格行的键，与 `ResultsTable` 一致。 */
 export function probeKey(host: string, port: number): string {
   return `${host}:${port}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** 把后端返回的任意 JSON 归一成结果；坏数据一律当失败。 */
@@ -418,10 +415,6 @@ export type ProbeStore = {
   applyProgress: (progress: BatchProgress) => void;
 };
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export function createProbeStore(persistence: ProbePersistence) {
   return create<ProbeStore>()((set, get) => ({
     results: {},
@@ -622,10 +615,6 @@ export function createProbeStore(persistence: ProbePersistence) {
       });
     },
   }));
-}
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 /** 生产环境走 Tauri 命令；浏览器里跑原型时直接给一条可读失败。 */

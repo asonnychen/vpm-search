@@ -5,13 +5,10 @@ import {
   type ProbeStatus,
   type SpeedStatus,
 } from "./probe";
+import { errorMessage, isRecord, isTauriRuntime } from "./utils";
 
 /** 数据库体积提示阈值：超过 50MB 就建议按轮次清理。 */
 export const HISTORY_DB_LIMIT_BYTES = 50 * 1024 * 1024;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function str(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
@@ -295,10 +292,6 @@ export type HistoryStore = {
   clearAddress: () => void;
 };
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export function createHistoryStore(persistence: HistoryPersistence) {
   return create<HistoryStore>()((set, get) => ({
     open: false,
@@ -390,10 +383,6 @@ export function createHistoryStore(persistence: HistoryPersistence) {
 
     clearAddress: () => set({ address: null }),
   }));
-}
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 /** 生产环境走 Tauri 命令；浏览器原型里返回空数据。 */

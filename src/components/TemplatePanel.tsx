@@ -9,12 +9,9 @@ import {
   renameTemplate,
   templateSummary,
 } from "../store/template";
+import { isTauriRuntime } from "../store/utils";
 
 export type TemplatePanelMode = "list" | "new" | "rename";
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
 
 function newId(): string {
   return `tpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
