@@ -24,8 +24,8 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::probe::batch::{BatchItem, BatchProgress};
-use crate::probe::{Endpoint, ProbeOptions};
+use crate::probe::batch::{BatchEvent, BatchItem, BatchProgress};
+use crate::probe::{Endpoint, ProbeOptions, ProbeStatus};
 use crate::store::Store;
 
 /// Cloudflare 的 ASN，用于判定「出口仍在 CF 网内」。
@@ -452,6 +452,9 @@ impl GeoReport {
 ///
 /// 分两段：先并发取每条的出口 IP，再对**去重后的出口 IP**并发查归属地。
 /// 同一 IP 只查一次，既省在线额度，也避免并发重复计费。
+///
+/// 第一段每完成一条推一次计数进度；归属地要等第二段查完才有结论，
+/// 所以逐行事件在结果成型后按行顺序推。
 pub fn run_geo_batch(
     prober: &dyn GeoProber,
     resolver: &GeoResolver,
@@ -459,7 +462,7 @@ pub fn run_geo_batch(
     options: &ProbeOptions,
     concurrency: usize,
     cancel: &AtomicBool,
-    on_progress: &(dyn Fn(BatchProgress) + Sync),
+    on_event: &(dyn Fn(BatchEvent) + Sync),
 ) -> GeoReport {
     let total = items.len();
     let concurrency = concurrency.clamp(1, 32);
@@ -487,10 +490,10 @@ pub fn run_geo_batch(
                 }
 
                 let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                on_progress(BatchProgress {
+                on_event(BatchEvent::Progress(BatchProgress {
                     completed: done,
                     total,
-                });
+                }));
             });
         }
     });
@@ -546,32 +549,47 @@ pub fn run_geo_batch(
             .and_then(|index| lookups[index].clone())
     };
 
-    let rows = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let mut row = GeoRow {
-                endpoint: item.endpoint.clone(),
-                alias: item.alias.clone(),
-                exit_ip: None,
-                info: None,
-                error: None,
-            };
-            match exits.get(index).cloned().flatten() {
-                Some(Ok(exit)) => {
-                    row.exit_ip = Some(exit.ip.clone());
-                    match lookup_of(exit.ip.trim()) {
-                        Some(Ok(info)) => row.info = Some(info),
-                        Some(Err(error)) => row.error = Some(error),
-                        None => row.error = Some("归属地查询没有结论".to_string()),
-                    }
+    let mut rows = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let mut row = GeoRow {
+            endpoint: item.endpoint.clone(),
+            alias: item.alias.clone(),
+            exit_ip: None,
+            info: None,
+            error: None,
+        };
+        match exits.get(index).cloned().flatten() {
+            Some(Ok(exit)) => {
+                row.exit_ip = Some(exit.ip.clone());
+                match lookup_of(exit.ip.trim()) {
+                    Some(Ok(info)) => row.info = Some(info),
+                    Some(Err(error)) => row.error = Some(error),
+                    None => row.error = Some("归属地查询没有结论".to_string()),
                 }
-                Some(Err(error)) => row.error = Some(error),
-                None => {}
             }
-            row
-        })
-        .collect();
+            Some(Err(error)) => row.error = Some(error),
+            None => {}
+        }
+
+        // 一行结论成型就推一次；失败行只带错误，不清空界面已有的归属地。
+        let status = if row.info.is_some() {
+            ProbeStatus::Ok
+        } else if row.error.is_some() {
+            ProbeStatus::Fail
+        } else {
+            ProbeStatus::Untested
+        };
+        let mut event = crate::probe::RowEvent::new(&item.endpoint, status);
+        event.error = row.error.clone();
+        if let Some(info) = &row.info {
+            event.country_zh = Some(info.zh.clone());
+            event.country_en = Some(info.en.clone());
+            event.colo = info.colo.clone();
+        }
+        on_event(BatchEvent::Row(event));
+
+        rows.push(row);
+    }
 
     GeoReport {
         rows,

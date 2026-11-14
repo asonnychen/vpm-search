@@ -36,7 +36,37 @@ pub const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// 连接已建立但响应不符合契约（不是 204）仍归为「失败」而非「超时」：
 /// 这不是等不到响应，而是对端明确给了别的状态码，摘要里必须写明实际状态码。
 pub fn non_204_status(status: u16) -> String {
+    if status == 403 {
+        return WORKER_403_HINT.to_string();
+    }
     format!("204 端点返回 HTTP {status}")
+}
+
+/// 403 的可操作摘要：worker 拒绝了这次隧道，通常是模板与 worker 对不上。
+pub const WORKER_403_HINT: &str =
+    "worker 拒绝（403）：检查模板的 path / Host / UUID 是否与 worker 一致";
+
+/// 一条错误摘要是否属于 worker 的 403 拒绝。
+///
+/// sing-box 的 ws 传输在升级阶段拿到 403 时会输出
+/// `unexpected HTTP response status: 403`，reqwest 侧把它包装成连接失败，
+/// 原文对用户毫无意义，统一换成语义化的提示。
+fn is_worker_403(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("unexpected http response status: 403")
+        || lower.contains("unexpected http response status 403")
+        || lower.contains("http 403")
+        || lower.contains("status 403")
+        || lower.contains("status code: 403")
+}
+
+/// 把底层错误摘要翻译成可操作的文案；其它错误原样返回（去掉首尾空白）。
+pub fn describe_error(error: &str) -> String {
+    if is_worker_403(error) {
+        WORKER_403_HINT.to_string()
+    } else {
+        error.trim().to_string()
+    }
 }
 
 /// 一条待测优选地址。
@@ -168,13 +198,56 @@ pub fn classify(attempt: Attempt) -> ProbeOutcome {
     if let Some(latency_ms) = attempt.responded_ms {
         return ProbeOutcome::ok(latency_ms);
     }
-    let message = attempt
-        .error
-        .unwrap_or_else(|| "未知错误".to_string());
+    let message = describe_error(&attempt.error.unwrap_or_else(|| "未知错误".to_string()));
     if attempt.connected {
         ProbeOutcome::timeout(message)
     } else {
         ProbeOutcome::fail(message)
+    }
+}
+
+/// 逐行实时事件（`probe:row`）的数据部分。
+///
+/// `runId` 与 `kind`（`delay` / `speed` / `geo`）由命令层补齐，这里只管一行地址的结论。
+/// 事件里绝不出现凭据：只有地址、状态与测量值。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowEvent {
+    pub host: String,
+    pub port: u16,
+    /// `ok` / `timeout` / `fail` / `untested`。
+    pub status: ProbeStatus,
+    pub latency_ms: Option<u64>,
+    pub speed_mbps: Option<f64>,
+    pub country_zh: Option<String>,
+    pub country_en: Option<String>,
+    pub colo: Option<String>,
+    pub error: Option<String>,
+}
+
+impl RowEvent {
+    /// 只有地址与状态的事件；延迟、速度、归属地各自补自己的字段。
+    pub fn new(endpoint: &Endpoint, status: ProbeStatus) -> Self {
+        Self {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            status,
+            latency_ms: None,
+            speed_mbps: None,
+            country_zh: None,
+            country_en: None,
+            colo: None,
+            error: None,
+        }
+    }
+
+    /// 延迟测试的一行：只有延迟与错误。
+    pub fn latency(endpoint: &Endpoint, outcome: &ProbeOutcome) -> Self {
+        Self {
+            latency_ms: outcome.latency_ms,
+            error: outcome.error.clone(),
+            ..Self::new(endpoint, outcome.status)
+        }
     }
 }
 
@@ -323,6 +396,23 @@ mod tests {
         assert_eq!(outcome.status, ProbeStatus::Fail);
         assert_eq!(outcome.latency_ms, None);
         assert_eq!(outcome.error.as_deref(), Some("204 端点返回 HTTP 503"));
+    }
+
+    #[test]
+    fn worker_返回_403_时换成可操作摘要且仍记失败() {
+        let outcome = classify(Attempt::connect_failed(
+            "连接阶段失败：error sending request for url: unexpected HTTP response status: 403",
+        ));
+
+        assert_eq!(outcome.status, ProbeStatus::Fail);
+        assert_eq!(outcome.latency_ms, None);
+        assert_eq!(outcome.error.as_deref(), Some(WORKER_403_HINT));
+
+        // 204 端点直接给出 403 也是同一种语义。
+        assert_eq!(non_204_status(403), WORKER_403_HINT);
+        assert_eq!(non_204_status(502), "204 端点返回 HTTP 502");
+        // 其它错误原样保留，只去掉首尾空白。
+        assert_eq!(describe_error("  连接被拒绝  "), "连接被拒绝");
     }
 
     #[test]

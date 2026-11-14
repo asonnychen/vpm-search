@@ -87,6 +87,31 @@ fn log_app(state: &AppState, app: &tauri::AppHandle, record: AppLogRecord) {
     }
 }
 
+/// 逐行实时事件 `probe:row` 的完整负载。
+///
+/// `runId` 与 `kind`（`delay` / `speed` / `geo`）在这里补齐，行的字段来自探测器；
+/// 事件里绝不带凭据。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RowEventDto<'a> {
+    run_id: &'a str,
+    kind: &'a str,
+    #[serde(flatten)]
+    row: &'a probe::RowEvent,
+}
+
+/// 推一条逐行实时事件。
+fn emit_row(app: &tauri::AppHandle, run_id: &str, kind: &str, row: &probe::RowEvent) {
+    let _ = app.emit(
+        "probe:row",
+        RowEventDto {
+            run_id,
+            kind,
+            row,
+        },
+    );
+}
+
 /// 读取整份设置。失败时返回错误字符串，前端保留默认值。
 #[tauri::command]
 fn get_settings(
@@ -391,11 +416,13 @@ fn probe_blocking(
     app: &tauri::AppHandle,
     endpoint: &probe::Endpoint,
     alias: &str,
+    trace: &str,
+    run_id: &str,
 ) -> Result<probe::ProbeOutcome, String> {
     let state = app.state::<AppState>();
 
     // 只短暂加锁读模板与超时，测试期间不占着数据库。
-    let (template, connect_timeout_s) = {
+    let (mut template, connect_timeout_s) = {
         let guard = state
             .store
             .lock()
@@ -414,6 +441,9 @@ fn probe_blocking(
         (template, settings.connect_timeout_s)
     };
 
+    // 模板缺凭据时不启动 sing-box：直接给可读原因。
+    prepare_template(state.inner(), app, trace, &mut template)?;
+
     let binary = resolve_singbox(app)?;
     let options = probe::ProbeOptions::from_connect_timeout_s(connect_timeout_s);
     let prober = probe::SingBoxProber::new(
@@ -427,7 +457,6 @@ fn probe_blocking(
     let outcome = prober.measure_latency(endpoint, &template, &options);
 
     // 结果落库：一条轮次 + 一条结果。写库失败不影响已经测出的结论。
-    let run_id = format!("run-{}", logs::new_span_id());
     {
         let guard = state
             .store
@@ -436,7 +465,7 @@ fn probe_blocking(
         if let Some(store) = guard.as_ref() {
             probe::persist_single(
                 store,
-                &run_id,
+                run_id,
                 &started_at,
                 &probe::SingleProbe {
                     endpoint,
@@ -452,6 +481,35 @@ fn probe_blocking(
     Ok(outcome)
 }
 
+/// 测试前置校验：模板缺凭据时写应用日志与操作日志，并返回可读错误。
+fn prepare_template(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    trace: &str,
+    template: &mut template::NodeTemplate,
+) -> Result<(), String> {
+    match template.prepare_for_probe() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            log_app(
+                state,
+                app,
+                AppLogRecord::new(LogLevel::Error, "probe", "probe.precheck")
+                    .trace(trace)
+                    .params(serde_json::json!({
+                        "template": template.name,
+                        "kind": template.kind,
+                        "transport": template.transport,
+                    }))
+                    .error(&message, None),
+            );
+            log_operation(state, app, LogLevel::Error, trace, &message);
+            Err(message)
+        }
+    }
+}
+
 /// 单条真连接延迟：为一个优选地址生成临时 sing-box 配置并测一次。
 #[tauri::command]
 async fn probe_single(
@@ -465,12 +523,16 @@ async fn probe_single(
     let started = Instant::now();
     let endpoint = probe::Endpoint::new(host.trim().to_string(), port);
     let alias = alias.unwrap_or_default();
+    // 单条重测也是一轮，逐行事件用同一个 runId。
+    let run_id = format!("run-{}", logs::new_span_id());
 
     let result = tauri::async_runtime::spawn_blocking({
         let app = app.clone();
         let endpoint = endpoint.clone();
         let alias = alias.clone();
-        move || probe_blocking(&app, &endpoint, &alias)
+        let trace = trace.clone();
+        let run_id = run_id.clone();
+        move || probe_blocking(&app, &endpoint, &alias, &trace, &run_id)
     })
     .await
     .map_err(|e| format!("测试任务异常结束：{e}"))?;
@@ -481,6 +543,14 @@ async fn probe_single(
 
     match &result {
         Ok(outcome) => {
+            // 单条重测也推一条逐行事件，界面不用等整轮结束。
+            emit_row(
+                &app,
+                &run_id,
+                "delay",
+                &probe::RowEvent::latency(&endpoint, outcome),
+            );
+
             let mut record = logs::AppLogRecord::new(LogLevel::Info, "probe", "probe.latency")
                 .trace(&trace)
                 .span(&span)
@@ -585,7 +655,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
     let state = app.state::<AppState>();
 
     // 读设置与池：只短暂加锁，测试期间不占着数据库。
-    let (template, options, batch, entries) = {
+    let (mut template, options, batch, entries) = {
         let guard = state
             .store
             .lock()
@@ -615,6 +685,9 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
     if entries.is_empty() {
         return Err("池里还没有地址，请先抓取优选源".to_string());
     }
+
+    // 模板缺凭据时直接返回可读错误，不启动 sing-box。
+    prepare_template(state.inner(), &app, &run_id, &mut template)?;
 
     let binary = resolve_singbox(&app)?;
     let items: Vec<probe::batch::BatchItem> = entries
@@ -669,18 +742,23 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
     );
 
     // 槽位池与调度都在阻塞线程里跑，进度通过事件推给界面。
-    let app_for_progress = app.clone();
-    let run_for_progress = run_id.clone();
-    let on_progress = move |progress: probe::batch::BatchProgress| {
-        let _ = app_for_progress.emit(
-            "probe:progress",
-            serde_json::json!({
-                "runId": run_for_progress,
-                "mode": "latency",
-                "completed": progress.completed,
-                "total": progress.total,
-            }),
-        );
+    let app_for_events = app.clone();
+    let run_for_events = run_id.clone();
+    let on_event = move |event: probe::batch::BatchEvent| match event {
+        probe::batch::BatchEvent::Progress(progress) => {
+            let _ = app_for_events.emit(
+                "probe:progress",
+                serde_json::json!({
+                    "runId": run_for_events,
+                    "mode": "latency",
+                    "completed": progress.completed,
+                    "total": progress.total,
+                }),
+            );
+        }
+        probe::batch::BatchEvent::Row(row) => {
+            emit_row(&app_for_events, &run_for_events, "delay", &row);
+        }
     };
     let cancel = control.clone();
     let singbox = state.singbox.clone();
@@ -706,7 +784,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
             &options,
             batch,
             &cancel.cancel,
-            &on_progress,
+            &on_event,
         )?;
         // 整轮结束（含停止）后立刻回收全部槽位进程与临时配置。
         drop(pool);
@@ -869,7 +947,7 @@ async fn probe_speed_batch(
     let state = app.state::<AppState>();
 
     // 读设置与池：只短暂加锁，测速期间不占着数据库。
-    let (template, options, concurrency, entries) = {
+    let (mut template, options, concurrency, entries) = {
         let guard = state
             .store
             .lock()
@@ -918,6 +996,10 @@ async fn probe_speed_batch(
     if items.is_empty() {
         return Err("没有可测速的地址，请先抓取优选源或选中行".to_string());
     }
+
+    // 模板缺凭据时直接返回可读错误，不启动 sing-box。
+    let precheck_trace = logs::new_trace_id();
+    prepare_template(state.inner(), &app, &precheck_trace, &mut template)?;
 
     let binary = resolve_singbox(&app)?;
     let speed = probe::speed::SpeedOptions::default();
@@ -996,18 +1078,23 @@ async fn probe_speed_batch(
         ),
     );
 
-    let app_for_progress = app.clone();
-    let run_for_progress = run_id.clone();
-    let on_progress = move |progress: probe::batch::BatchProgress| {
-        let _ = app_for_progress.emit(
-            "probe:progress",
-            serde_json::json!({
-                "runId": run_for_progress,
-                "mode": "speed",
-                "completed": progress.completed,
-                "total": progress.total,
-            }),
-        );
+    let app_for_events = app.clone();
+    let run_for_events = run_id.clone();
+    let on_event = move |event: probe::batch::BatchEvent| match event {
+        probe::batch::BatchEvent::Progress(progress) => {
+            let _ = app_for_events.emit(
+                "probe:progress",
+                serde_json::json!({
+                    "runId": run_for_events,
+                    "mode": "speed",
+                    "completed": progress.completed,
+                    "total": progress.total,
+                }),
+            );
+        }
+        probe::batch::BatchEvent::Row(row) => {
+            emit_row(&app_for_events, &run_for_events, "speed", &row);
+        }
     };
 
     let cancel = control.clone();
@@ -1034,7 +1121,7 @@ async fn probe_speed_batch(
             &speed,
             concurrency,
             &cancel.cancel,
-            &on_progress,
+            &on_event,
         )?;
         drop(pool);
         Ok::<_, String>(report)
@@ -1181,7 +1268,7 @@ async fn probe_geo_batch(
     let state = app.state::<AppState>();
 
     // 读设置与池：只短暂加锁，查询期间不占着数据库。
-    let (template, options, concurrency, entries) = {
+    let (mut template, options, concurrency, entries) = {
         let guard = state
             .store
             .lock()
@@ -1230,6 +1317,10 @@ async fn probe_geo_batch(
     if items.is_empty() {
         return Err("没有可查归属地的地址，请先抓取优选源或选中行".to_string());
     }
+
+    // 模板缺凭据时直接返回可读错误，不启动 sing-box。
+    let precheck_trace = logs::new_trace_id();
+    prepare_template(state.inner(), &app, &precheck_trace, &mut template)?;
 
     let binary = resolve_singbox(&app)?;
 
@@ -1325,18 +1416,23 @@ async fn probe_geo_batch(
         ),
     );
 
-    let app_for_progress = app.clone();
-    let run_for_progress = run_id.clone();
-    let on_progress = move |progress: probe::batch::BatchProgress| {
-        let _ = app_for_progress.emit(
-            "probe:progress",
-            serde_json::json!({
-                "runId": run_for_progress,
-                "mode": "geo",
-                "completed": progress.completed,
-                "total": progress.total,
-            }),
-        );
+    let app_for_events = app.clone();
+    let run_for_events = run_id.clone();
+    let on_event = move |event: probe::batch::BatchEvent| match event {
+        probe::batch::BatchEvent::Progress(progress) => {
+            let _ = app_for_events.emit(
+                "probe:progress",
+                serde_json::json!({
+                    "runId": run_for_events,
+                    "mode": "geo",
+                    "completed": progress.completed,
+                    "total": progress.total,
+                }),
+            );
+        }
+        probe::batch::BatchEvent::Row(row) => {
+            emit_row(&app_for_events, &run_for_events, "geo", &row);
+        }
     };
 
     let cancel = control.clone();
@@ -1364,7 +1460,7 @@ async fn probe_geo_batch(
             &options,
             concurrency,
             &cancel.cancel,
-            &on_progress,
+            &on_event,
         );
         drop(pool);
         Ok::<_, String>(report)
@@ -2820,6 +2916,61 @@ mod packaging_tests {
         let candidates = singbox_candidate_paths(Some(&dir), None);
         assert_eq!(probe::singbox::pick_existing(&candidates), Some(dev));
         std::fs::remove_dir_all(&dir).expect("清临时目录");
+    }
+
+    #[test]
+    fn 逐行事件负载字段齐全且不带凭据() {
+        let row = probe::RowEvent {
+            host: "104.16.1.1".to_string(),
+            port: 8443,
+            status: probe::ProbeStatus::Ok,
+            latency_ms: Some(88),
+            speed_mbps: Some(12.3),
+            country_zh: Some("加拿大".to_string()),
+            country_en: Some("Canada".to_string()),
+            colo: Some("LAX".to_string()),
+            error: None,
+        };
+
+        let value = serde_json::to_value(RowEventDto {
+            run_id: "run-1",
+            kind: "delay",
+            row: &row,
+        })
+        .unwrap();
+
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "colo",
+                "countryEn",
+                "countryZh",
+                "error",
+                "host",
+                "kind",
+                "latencyMs",
+                "port",
+                "runId",
+                "speedMbps",
+                "status",
+            ]
+        );
+        assert_eq!(value["runId"], "run-1");
+        assert_eq!(value["kind"], "delay");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["latencyMs"], 88);
+        assert!(value["error"].is_null());
+        // 事件里只有地址与测量值，没有任何凭据字段。
+        let text = value.to_string();
+        assert!(!text.contains("uuid"));
+        assert!(!text.contains("password"));
     }
 
     #[test]

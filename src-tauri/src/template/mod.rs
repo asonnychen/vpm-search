@@ -82,6 +82,34 @@ impl Default for NodeTemplate {
 }
 
 impl NodeTemplate {
+    /// 测试前置校验：补齐可回退字段，并检查测试必需的凭据。
+    ///
+    /// - `ws` 传输的 `path` 为空时回退成 `/`（worker 只认根路径，空值会被直接拒绝）；
+    /// - vless / vmess 必须有 `uuid`，trojan / ss 必须有 `password`；
+    /// - 不通过时返回可直接展示的中文原因，调用方据此不启动 sing-box。
+    pub fn prepare_for_probe(&mut self) -> Result<(), TemplateError> {
+        if self.transport.trim().eq_ignore_ascii_case("ws") && self.path.trim().is_empty() {
+            self.path = "/".to_string();
+        }
+
+        let kind = self.kind.trim();
+        let missing = if kind.eq_ignore_ascii_case("vless") || kind.eq_ignore_ascii_case("vmess") {
+            self.uuid.trim().is_empty().then_some("UUID")
+        } else if kind.eq_ignore_ascii_case("trojan") || kind.eq_ignore_ascii_case("ss") {
+            self.password.trim().is_empty().then_some("密码")
+        } else {
+            None
+        };
+
+        match missing {
+            Some(field) => Err(TemplateError(format!(
+                "当前节点模板「{}」缺少 {field}，请先粘贴节点链接或补全字段",
+                self.name
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// 用于界面列表与日志的副本：凭据替换成 `****`，其余字段原样。
     pub fn redacted(&self) -> Self {
         let mut copy = self.clone();
@@ -186,5 +214,56 @@ mod tests {
         assert!(!summary.contains("550e8400"));
         assert!(!summary.contains("hunter2"));
         assert!(summary.contains(MASK));
+    }
+
+    #[test]
+    fn vless_缺_uuid_时校验不通过并给出模板名() {
+        let mut value = template();
+        value.uuid.clear();
+
+        let error = value.prepare_for_probe().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "当前节点模板「测试节点」缺少 UUID，请先粘贴节点链接或补全字段"
+        );
+    }
+
+    #[test]
+    fn vmess_必须有_uuid_而_trojan_与_ss_必须有密码() {
+        let mut vmess = template();
+        vmess.kind = "vmess".to_string();
+        vmess.uuid.clear();
+        assert!(vmess.prepare_for_probe().is_err());
+
+        let mut trojan = template();
+        trojan.kind = "trojan".to_string();
+        trojan.password.clear();
+        let error = trojan.prepare_for_probe().unwrap_err();
+        assert!(error.to_string().contains("缺少 密码"), "{error}");
+
+        let mut ss = template();
+        ss.kind = "ss".to_string();
+        ss.password = "  ".to_string();
+        assert!(ss.prepare_for_probe().is_err());
+
+        // 凭据齐全时通过。
+        assert!(template().prepare_for_probe().is_ok());
+    }
+
+    #[test]
+    fn ws_的空_path_回退成根路径() {
+        let mut value = template();
+        value.path = "   ".to_string();
+
+        value.prepare_for_probe().unwrap();
+
+        assert_eq!(value.path, "/");
+        // 非 ws 传输不强制 path。
+        let mut grpc = template();
+        grpc.transport = "grpc".to_string();
+        grpc.path.clear();
+        grpc.prepare_for_probe().unwrap();
+        assert_eq!(grpc.path, "");
     }
 }

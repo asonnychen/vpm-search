@@ -112,6 +112,13 @@ pub struct BatchProgress {
     pub total: usize,
 }
 
+/// 批量测试推给界面的事件：计数进度 + 每完成一条的逐行结论。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchEvent {
+    Progress(BatchProgress),
+    Row(crate::probe::RowEvent),
+}
+
 /// 一轮的统计计数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +198,9 @@ fn error_summary(samples: &[ProbeOutcome], fallback: &str) -> String {
 }
 
 /// 跑一轮批量测试。停止后已开始的地址保留结论，未开始的记为未测。
+///
+/// 每完成一条就推一次 [`BatchEvent::Row`]，再推一次计数进度；
+/// 停止时没轮到的地址不推逐行事件，由界面按整轮结果补齐。
 pub fn run_batch(
     prober: &dyn BatchProber,
     items: &[BatchItem],
@@ -198,7 +208,7 @@ pub fn run_batch(
     options: &ProbeOptions,
     batch: BatchOptions,
     cancel: &AtomicBool,
-    on_progress: &(dyn Fn(BatchProgress) + Sync),
+    on_event: &(dyn Fn(BatchEvent) + Sync),
 ) -> Result<BatchReport, String> {
     let total = items.len();
     prober.prepare(items, template, batch.concurrency)?;
@@ -232,15 +242,19 @@ pub fn run_batch(
                         endpoint: item.endpoint.clone(),
                         alias: item.alias.clone(),
                         samples,
-                        outcome,
+                        outcome: outcome.clone(),
                     });
                 }
 
+                on_event(BatchEvent::Row(crate::probe::RowEvent::latency(
+                    &item.endpoint,
+                    &outcome,
+                )));
                 let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                on_progress(BatchProgress {
+                on_event(BatchEvent::Progress(BatchProgress {
                     completed: done,
                     total,
-                });
+                }));
             });
         }
     });
@@ -522,7 +536,7 @@ mod tests {
             item("104.16.2.2", 8443),
             item("104.16.2.3", 8443),
         ];
-        let progress = Mutex::new(Vec::new());
+        let events = Mutex::new(Vec::new());
         let report = run_batch(
             &prober,
             &items,
@@ -530,17 +544,43 @@ mod tests {
             &ProbeOptions::default(),
             BatchOptions::new(3, 2),
             &AtomicBool::new(false),
-            &|p| progress.lock().unwrap().push(p),
+            &|event| events.lock().unwrap().push(event),
         )
         .unwrap();
 
         let counts = report.counts();
         assert_eq!((counts.ok, counts.timeout, counts.fail), (1, 1, 1));
         assert_eq!(report.completed, 3);
-        let progress = progress.lock().unwrap();
+
+        let events = events.lock().unwrap();
+        let progress: Vec<BatchProgress> = events
+            .iter()
+            .filter_map(|event| match event {
+                BatchEvent::Progress(progress) => Some(*progress),
+                BatchEvent::Row(_) => None,
+            })
+            .collect();
         assert_eq!(progress.len(), 3);
         assert_eq!(progress.last().unwrap().completed, 3);
         assert_eq!(progress.last().unwrap().total, 3);
+
+        // 每完成一条推一次逐行事件，状态与聚合结论一致。
+        let rows: Vec<crate::probe::RowEvent> = events
+            .iter()
+            .filter_map(|event| match event {
+                BatchEvent::Row(row) => Some(row.clone()),
+                BatchEvent::Progress(_) => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.host == "104.16.2.1"
+            && row.status == ProbeStatus::Ok
+            && row.latency_ms == Some(90)));
+        assert!(rows.iter().any(|row| row.host == "104.16.2.2"
+            && row.status == ProbeStatus::Timeout));
+        assert!(rows.iter().any(|row| row.host == "104.16.2.3"
+            && row.status == ProbeStatus::Fail
+            && row.error.as_deref() == Some("拒绝")));
     }
 
     /// 按地址预设每次采样的原始观测，采样用尽后重复最后一次。

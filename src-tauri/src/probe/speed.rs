@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
 
-use super::batch::{BatchItem, BatchProgress};
+use super::batch::{BatchEvent, BatchItem, BatchProgress};
 use super::{Endpoint, ProbeOptions, ProbeStatus};
 
 /// 测速端点；`bytes` 查询参数决定每条流下载多少字节。
@@ -285,6 +285,8 @@ pub trait SpeedProber: Send + Sync {
 }
 
 /// 跑一轮测速。停止后已开始的地址保留结论，未开始的记为未测。
+///
+/// 每完成一条推一次逐行事件（`speedMbps` 有值、`latencyMs` 为空），再推计数进度。
 pub fn run_speed_batch(
     prober: &dyn SpeedProber,
     items: &[BatchItem],
@@ -292,7 +294,7 @@ pub fn run_speed_batch(
     speed: &SpeedOptions,
     concurrency: usize,
     cancel: &AtomicBool,
-    on_progress: &(dyn Fn(BatchProgress) + Sync),
+    on_event: &(dyn Fn(BatchEvent) + Sync),
 ) -> Result<SpeedReport, String> {
     let total = items.len();
     let concurrency = concurrency.clamp(1, 32);
@@ -321,15 +323,20 @@ pub fn run_speed_batch(
                     *slot = Some(SpeedRow {
                         endpoint: item.endpoint.clone(),
                         alias: item.alias.clone(),
-                        outcome,
+                        outcome: outcome.clone(),
                     });
                 }
 
+                on_event(BatchEvent::Row(crate::probe::RowEvent {
+                    speed_mbps: outcome.mbps,
+                    error: outcome.error.clone(),
+                    ..crate::probe::RowEvent::new(&item.endpoint, outcome.status)
+                }));
                 let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                on_progress(BatchProgress {
+                on_event(BatchEvent::Progress(BatchProgress {
                     completed: done,
                     total,
-                });
+                }));
             });
         }
     });
