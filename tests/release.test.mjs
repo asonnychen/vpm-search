@@ -119,12 +119,11 @@ test("第三方许可声明随安装包分发", () => {
   // NSIS 安装界面直接读取 licenseFile，必须指向随包许可声明。
   assert.equal(conf.bundle.licenseFile, "../THIRD_PARTY_NOTICES.md");
   assert.ok(existsSync(path.join(root, "THIRD_PARTY_NOTICES.md")));
-  assert.match(conf.bundle.license, /GPL-3\.0/);
   assert.match(conf.bundle.license, /CC BY 4\.0/);
 
   const notices = read("THIRD_PARTY_NOTICES.md");
-  assert.match(notices, /sing-box\s+1\.14\.4/);
-  assert.match(notices, /GPL-3\.0/);
+  // 不再内置任何代理内核，声明里也不该再出现 sing-box。
+  assert.doesNotMatch(notices, /sing-box/i);
   assert.match(notices, /DB-IP Country Lite/);
   assert.match(notices, /CC BY 4\.0/);
   assert.match(notices, /IP Geolocation by DB-IP/);
@@ -133,8 +132,9 @@ test("第三方许可声明随安装包分发", () => {
 test("免安装 zip 打包脚本与 README 命令就位", () => {
   assert.ok(existsSync(path.join(root, "scripts/package-portable.ps1")));
   const script = read("scripts/package-portable.ps1");
-  assert.match(script, /sing-box-x86_64-pc-windows-msvc\.exe/);
   assert.match(script, /geoip/);
+  // 免安装包只带主程序与离线库，不再复制代理内核。
+  assert.doesNotMatch(script, /sing-box/i);
 
   const pkg = readJson("package.json");
   assert.ok(pkg.scripts["package:portable"], "缺少 package:portable 脚本");

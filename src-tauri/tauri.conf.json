@@ -30,9 +30,8 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "app"],
-    "license": "GPL-3.0 (sing-box) / CC BY 4.0 (DB-IP Country Lite)",
+    "license": "CC BY 4.0 (DB-IP Country Lite)",
     "licenseFile": "../THIRD_PARTY_NOTICES.md",
-    "externalBin": ["binaries/sing-box"],
     "resources": {
       "resources/geoip/dbip-country-lite.mmdb": "geoip/dbip-country-lite.mmdb",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
