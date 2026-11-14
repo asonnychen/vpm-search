@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { usePoolStore } from "../store/pool";
 import {
   probeKey,
@@ -48,6 +49,11 @@ const filterDefs = [
 ] as const;
 
 type FilterId = (typeof filterDefs)[number]["id"];
+
+/** 行高固定 32px：虚拟滚动按这个值算位置，表格行必须严格一致。 */
+const ROW_HEIGHT = 32;
+/** 视口外多渲染几行，滚动时不出现空白。 */
+const OVERSCAN = 12;
 
 function latencyCell(row: Row, threshold: number) {
   if (row.status === "timeout") {
@@ -214,7 +220,9 @@ export default function ResultsTable() {
   const toggle = (id: string) =>
     setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
 
-  const shownIds = shown.map((r) => r.id);
+  const shownIds = useMemo(() => shown.map((r) => r.id), [shown]);
+  // 勾选集合查表用 Set，避免每行都对数组做一次 includes。
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
 
   // 导出用全表快照，顺序即当前排序；勾选非空时范围就是勾选行。
   const exportRows = useMemo<ExportRow[]>(
@@ -268,8 +276,14 @@ export default function ResultsTable() {
     }
   };
 
-  const allShown = shownIds.length > 0 && shownIds.every((id) => selected.includes(id));
-  const someShown = shownIds.some((id) => selected.includes(id));
+  const allShown = useMemo(
+    () => shownIds.length > 0 && shownIds.every((id) => selectedSet.has(id)),
+    [shownIds, selectedSet],
+  );
+  const someShown = useMemo(
+    () => shownIds.some((id) => selectedSet.has(id)),
+    [shownIds, selectedSet],
+  );
 
   const toggleAll = () =>
     setSelected((s) =>
@@ -283,6 +297,31 @@ export default function ResultsTable() {
       ...s.filter((id) => !shownIds.includes(id)),
       ...shownIds.filter((id) => !s.includes(id)),
     ]);
+
+  // 池子可能上千行，只渲染视口内的行：行高固定 32px，位置由虚拟滚动算。
+  // 表头 sticky、横向滚动、列宽拖拽都不受影响；全选/反选仍按 shownIds（筛选后的全部行）。
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: shown.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: OVERSCAN,
+    getItemKey: (index) => shown[index]?.id ?? index,
+  });
+  const virtualRows = virtualizer.getVirtualItems();
+  const padTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const padBottom =
+    virtualRows.length > 0
+      ? Math.max(
+          0,
+          virtualizer.getTotalSize() - virtualRows[virtualRows.length - 1].end,
+        )
+      : 0;
+
+  // 换了筛选条件就回到顶部，避免停在已经不存在的行号上。
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [filter, query]);
 
   return (
     <section className="flex-1 min-h-0 flex flex-col overflow-hidden bg-panel">
@@ -390,7 +429,10 @@ export default function ResultsTable() {
         </div>
       ) : null}
 
-      <div className="flex-1 min-h-0 overflow-auto border border-line rounded-[3px] bg-panel">
+      <div
+        ref={scrollRef}
+        className="flex-1 min-h-0 overflow-auto border border-line rounded-[3px] bg-panel"
+      >
         <table className="w-full min-w-[1180px] table-fixed border-separate border-spacing-0 text-[12px] [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th:last-child]:border-r-0 [&_td:last-child]:border-r-0">
           <colgroup>
             {widths.map((w, i) => (
@@ -500,19 +542,27 @@ export default function ResultsTable() {
             </tr>
           </thead>
           <tbody>
-            {shown.map((r) => {
-              const isSel = selected.includes(r.id);
+            {padTop > 0 ? (
+              <tr aria-hidden style={{ height: padTop }}>
+                <td colSpan={widths.length} style={{ padding: 0, border: 0 }} />
+              </tr>
+            ) : null}
+            {virtualRows.map((virtualRow) => {
+              const r = shown[virtualRow.index];
+              if (!r) return null;
+              const isSel = selectedSet.has(r.id);
               const slow = r.latency !== null && r.latency > threshold;
               const busy = Boolean(probeTesting[r.id]);
               return (
                 <tr
                   key={r.id}
+                  style={{ height: ROW_HEIGHT }}
                   className={cn(
                     "group transition-colors",
                     isSel ? "bg-accent/[0.07]" : "hover:bg-panel-2/70",
                   )}
                 >
-                  <td className="border-b border-line/60 px-2 py-1.5 w-8">
+                  <td className="border-b border-line/60 px-2 h-8 w-8">
                     <button
                       type="button"
                       onClick={() => toggle(r.id)}
@@ -536,36 +586,36 @@ export default function ResultsTable() {
                     </button>
                   </td>
                   <td
-                    className="border-b border-line/60 px-2 py-1.5 max-w-[260px] truncate text-text/85"
+                    className="border-b border-line/60 px-2 h-8 max-w-[260px] truncate text-text/85"
                     title={r.alias}
                   >
                     {r.alias || <span className="text-dim">—</span>}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 num text-text">
+                  <td className="border-b border-line/60 px-2 h-8 num text-text">
                     {r.host}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 num text-right text-muted">
+                  <td className="border-b border-line/60 px-2 h-8 num text-right text-muted">
                     {r.port}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5" title={geoTitle(r.geo)}>
+                  <td className="border-b border-line/60 px-2 h-8" title={geoTitle(r.geo)}>
                     {r.geo?.zh ? (
                       <span className="text-text/90">{r.geo.zh}</span>
                     ) : (
                       <span className="text-dim">—</span>
                     )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5" title={geoTitle(r.geo)}>
+                  <td className="border-b border-line/60 px-2 h-8" title={geoTitle(r.geo)}>
                     {r.geo?.en ? (
                       <span className="text-muted">{r.geo.en}</span>
                     ) : (
                       <span className="text-dim">—</span>
                     )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 num text-[12px] text-dim whitespace-nowrap">
+                  <td className="border-b border-line/60 px-2 h-8 num text-[12px] text-dim whitespace-nowrap">
                     {r.source}
                   </td>
                   <td
-                    className="border-b border-line/60 px-2 py-1.5 text-right"
+                    className="border-b border-line/60 px-2 h-8 text-right"
                     title={r.error ?? undefined}
                   >
                     {busy ? (
@@ -575,7 +625,7 @@ export default function ResultsTable() {
                     )}
                   </td>
                   <td
-                    className="border-b border-line/60 px-2 py-1.5 text-right"
+                    className="border-b border-line/60 px-2 h-8 text-right"
                     title={r.speedError ?? undefined}
                   >
                     {r.speedStatus === "fail" ? (
@@ -589,7 +639,7 @@ export default function ResultsTable() {
                       <span className="text-dim">—</span>
                     )}
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-right">
+                  <td className="border-b border-line/60 px-2 h-8 text-right">
                     <div className="flex items-center justify-end gap-1 opacity-80 group-hover:opacity-100">
                       <button
                         type="button"
@@ -620,6 +670,11 @@ export default function ResultsTable() {
                 </tr>
               );
             })}
+            {padBottom > 0 ? (
+              <tr aria-hidden style={{ height: padBottom }}>
+                <td colSpan={widths.length} style={{ padding: 0, border: 0 }} />
+              </tr>
+            ) : null}
           </tbody>
         </table>
 
