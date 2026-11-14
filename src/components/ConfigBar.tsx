@@ -164,11 +164,12 @@ export default function ConfigBar({
 
       {open ? (
         <div className="px-4 pb-3 pt-1 flex flex-wrap items-end gap-x-4 gap-y-3">
-          <Field label="节点模板" width="300px">
+          <Field label="节点模板" width="340px">
             <div className="flex items-center gap-1">
               <div className="relative flex-1">
                 <select
                   value={selected?.id ?? ""}
+                  title={selected?.name ?? "未选择模板"}
                   onChange={(event) => {
                     if (event.target.value === "__new__") {
                       setPanel("new");
@@ -180,7 +181,7 @@ export default function ConfigBar({
                 >
                   {templates.length === 0 ? <option value="">未选择模板</option> : null}
                   {templates.map((template) => (
-                    <option key={template.id} value={template.id}>
+                    <option key={template.id} value={template.id} title={template.name}>
                       {template.name}
                     </option>
                   ))}
@@ -226,9 +227,18 @@ export default function ConfigBar({
               onChange={(connectTimeoutS) => patch({ connectTimeoutS })}
             />
           </Field>
-          <Field label="请求总超时" width="92px">
-            <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted">
-              <span className="num text-text">{REQUEST_TIMEOUT_S}</span> s（固定）
+          <Field label="请求总超时">
+            <div className="flex items-center gap-1.5 whitespace-nowrap">
+              <div
+                className="h-8 w-[76px] flex items-center gap-1 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted"
+                title={`固定 ${REQUEST_TIMEOUT_S} 秒，不可修改`}
+              >
+                <span className="num text-text">{REQUEST_TIMEOUT_S}</span>
+                <span className="num text-dim">s</span>
+              </div>
+              <span className="text-[12px] text-dim" title="固定值，不可修改">
+                固定
+              </span>
             </div>
           </Field>
           <Field label="地址并发" width="86px">
@@ -244,15 +254,19 @@ export default function ConfigBar({
           <div className="hidden xl:block h-8 w-px bg-line mx-1" />
 
           <Field label="延迟采样">
-            <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted">
-              <span className="num text-text">{LATENCY_SAMPLES}</span> 次取最小
+            <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted whitespace-nowrap">
+              <span className="num text-text">{LATENCY_SAMPLES}</span>
+              <span>次取最小</span>
             </div>
           </Field>
           <Field label="测速">
-            <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted">
-              <span className="num text-text">{SPEED_PARAMS.streams}</span> 流 ·
-              <span className="num text-text">{SPEED_PARAMS.sizeMb}</span> MB ·
-              <span className="num text-text">{SPEED_PARAMS.timeoutS}</span> s
+            <div className="h-8 flex items-center gap-1.5 px-2 border border-line bg-panel-2 rounded-[3px] text-[12px] text-muted whitespace-nowrap">
+              <span className="num text-text">{SPEED_PARAMS.streams}</span>
+              <span>流 ·</span>
+              <span className="num text-text">{SPEED_PARAMS.sizeMb}</span>
+              <span>MB ·</span>
+              <span className="num text-text">{SPEED_PARAMS.timeoutS}</span>
+              <span>s</span>
             </div>
           </Field>
 

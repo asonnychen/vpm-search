@@ -292,7 +292,7 @@ export default function ResultsTable() {
     ]);
 
   return (
-    <section className="flex-1 min-h-0 flex flex-col bg-panel">
+    <section className="flex-1 min-h-0 flex flex-col overflow-hidden bg-panel">
       <div className="min-h-10 shrink-0 flex flex-wrap items-center gap-x-2 gap-y-1.5 px-4 py-1.5 border-b border-line bg-panel">
         <div className="flex items-center gap-0.5 border border-line rounded-[3px] p-0.5 bg-canvas/60">
           {filterDefs.map((f) => (
