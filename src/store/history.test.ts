@@ -80,11 +80,9 @@ describe("历史结果", () => {
         latencyMs: 88.4,
         speedMbps: 12.34,
         speedStatus: "ok",
-        exitIp: "203.0.113.9",
         country: "US",
         zh: "美国",
         en: "United States",
-        colo: "LAX",
       },
       {
         host: "104.16.1.2",
@@ -112,7 +110,6 @@ describe("历史结果", () => {
       speedMbps: 12.34,
       speedStatus: "ok",
       zh: "美国",
-      colo: "LAX",
     });
     // 成功却没有延迟、速度却为 0 的行按失败处理，不显示假的 0。
     expect(rows[1].status).toBe("fail");

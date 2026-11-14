@@ -11,7 +11,7 @@ export type ProbeResult = {
   status: ProbeStatus;
   /** 成功时的往返毫秒数。 */
   latencyMs: number | null;
-  /** 失败或超时的原因；sidecar 崩溃时含日志路径。 */
+  /** 失败或超时的原因。 */
   error: string | null;
 };
 
@@ -98,6 +98,7 @@ export type ProbeRowEvent = {
   speedMbps: number | null;
   countryZh: string | null;
   countryEn: string | null;
+  /** 历史字段：机房已废弃，后端恒为 null。 */
   colo: string | null;
   error: string | null;
 };
@@ -180,13 +181,12 @@ function mergeProbeRow(
   const en = row.countryEn ?? "";
   if (row.status !== "ok" || (zh === "" && en === "")) return false;
   geos[key] = {
-    exitIp: null,
+    ip: null,
     country: null,
     zh,
     en,
-    colo: row.colo,
     asn: null,
-    // 实时事件不带来源与出口 IP，留空等整轮结果补齐。
+    // 实时事件不带来源与 IP，留空等整轮结果补齐。
     source: "",
   };
   return true;
@@ -292,18 +292,16 @@ export type SpeedReport = {
 
 /** 一条地址的归属地结果，与延迟、测速分开保存。 */
 export type GeoResult = {
-  /** 经代理观测到的出口 IP，不是优选地址本身。 */
-  exitIp: string | null;
-  /** ISO 国家码；Cloudflare 落地为空。 */
+  /** 这条地址解析出的 IP，也就是被查询的对象。 */
+  ip: string | null;
+  /** ISO 国家码。 */
   country: string | null;
   /** 归属地中文名。 */
   zh: string;
   /** 归属地英文名。 */
   en: string;
-  /** Cloudflare 机房三字码；非 CF 落地或没有 colo 时为 null。 */
-  colo: string | null;
   asn: number | null;
-  /** 数据来源：offline / online / cache / trace。 */
+  /** 数据来源：offline / online / cache。 */
   source: string;
 };
 
@@ -489,28 +487,25 @@ export function normalizeGeoReport(raw: unknown): GeoReport {
         // 状态与归属地以「有没有中英文名」为准：后端说成功但没名字是坏数据。
         if (item.status === "untested") {
           return { host, port, alias, status: "untested" as const, error: null,
-            exitIp: null, country: null, zh: "", en: "", colo: null, asn: null, source: "" };
+            ip: null, country: null, zh: "", en: "", asn: null, source: "" };
         }
         if (item.status !== "ok" || (zh === "" && en === "")) {
           return { host, port, alias, status: "fail" as const,
             error: error ?? "归属地查询失败",
-            exitIp: null, country: null, zh: "", en: "", colo: null, asn: null, source: "" };
+            ip: null, country: null, zh: "", en: "", asn: null, source: "" };
         }
 
         const asn = num(item.asn, 0);
-        const colo = str(item.colo).trim();
         return {
           host,
           port,
           alias,
           status: "ok" as const,
           error: null,
-          exitIp: str(item.exitIp) || null,
+          ip: str(item.ip) || null,
           country: str(item.country) || null,
           zh,
           en,
-          // 无机房信息时第三段留空，不写占位符。
-          colo: colo === "" ? null : colo,
           asn: asn > 0 ? Math.round(asn) : null,
           source: str(item.source),
         };
@@ -737,11 +732,10 @@ export function createProbeStore(persistence: ProbePersistence) {
       for (const row of report.rows) {
         if (row.status !== "ok") continue;
         geos[probeKey(row.host, row.port)] = {
-          exitIp: row.exitIp,
+          ip: row.ip,
           country: row.country,
           zh: row.zh,
           en: row.en,
-          colo: row.colo,
           asn: row.asn,
           source: row.source,
         };
@@ -815,16 +809,16 @@ export const tauriProbePersistence: ProbePersistence = {
       : Promise.resolve({
           status: "fail",
           latencyMs: null,
-          error: "当前不在 Tauri 窗口内，无法启动 sing-box",
+          error: "当前不在 Tauri 窗口内，无法发起探测",
         }),
   startBatch: () =>
     isTauriRuntime()
       ? invoke<unknown>("probe_batch")
-      : Promise.reject(new Error("当前不在 Tauri 窗口内，无法启动 sing-box")),
+      : Promise.reject(new Error("当前不在 Tauri 窗口内，无法发起探测")),
   speedBatch: (targets) =>
     isTauriRuntime()
       ? invoke<unknown>("probe_speed_batch", { targets: targets ?? null })
-      : Promise.reject(new Error("当前不在 Tauri 窗口内，无法启动 sing-box")),
+      : Promise.reject(new Error("当前不在 Tauri 窗口内，无法发起探测")),
   geoBatch: (targets) =>
     isTauriRuntime()
       ? invoke<unknown>("probe_geo_batch", { targets: targets ?? null })

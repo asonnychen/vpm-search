@@ -3,8 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { errorMessage, isRecord, isTauriRuntime } from "./utils";
 
-/** 三类日志：操作日志、应用日志、sing-box 日志。 */
-export type LogKind = "operation" | "app" | "singbox";
+/** 三类日志：操作日志、应用日志、探测日志。 */
+export type LogKind = "operation" | "app" | "probe";
 
 export type LogLevel = "INFO" | "OK" | "WARN" | "ERROR";
 export type LevelFilter = "ALL" | LogLevel;
@@ -14,7 +14,7 @@ export type LogEntry = {
   /** ISO 8601 时间戳。 */
   ts: string;
   level: LogLevel;
-  /** 操作日志是中文单行；应用日志是原始 JSON 行；sing-box 是原始输出行。 */
+  /** 操作日志是中文单行；应用日志是原始 JSON 行；探测日志是原始输出行。 */
   text: string;
   traceId: string | null;
   spanId: string | null;
@@ -27,7 +27,7 @@ export type ClearReport = { entries: number; files: number };
 /** 界面内存里每类日志最多保留的行数，超出丢弃最旧的。 */
 export const MAX_LOG_LINES = 2000;
 
-export const LOG_KINDS: LogKind[] = ["operation", "app", "singbox"];
+export const LOG_KINDS: LogKind[] = ["operation", "app", "probe"];
 
 const LEVELS: LogLevel[] = ["INFO", "OK", "WARN", "ERROR"];
 
@@ -39,7 +39,7 @@ function str(value: unknown): string | null {
 export function normalizeLogEntry(raw: unknown): LogEntry | null {
   if (!isRecord(raw)) return null;
   const kind = raw.kind;
-  if (kind !== "operation" && kind !== "app" && kind !== "singbox") return null;
+  if (kind !== "operation" && kind !== "app" && kind !== "probe") return null;
 
   const levelText = typeof raw.level === "string" ? raw.level.toUpperCase() : "";
   const level = LEVELS.find((candidate) => candidate === levelText);
@@ -77,7 +77,7 @@ export function normalizeLogsSnapshot(raw: unknown): Record<LogKind, LogEntry[]>
   return {
     operation: normalizeLines(source.operation),
     app: normalizeLines(source.app),
-    singbox: normalizeLines(source.singbox),
+    probe: normalizeLines(source.probe),
   };
 }
 
@@ -132,13 +132,13 @@ export type LogsStore = {
 const EMPTY_LINES: Record<LogKind, LogEntry[]> = {
   operation: [],
   app: [],
-  singbox: [],
+  probe: [],
 };
 
 const DEFAULT_LEVELS: Record<LogKind, LevelFilter> = {
   operation: "ALL",
   app: "ALL",
-  singbox: "ALL",
+  probe: "ALL",
 };
 
 function normalizeReport(raw: unknown): ClearReport {

@@ -56,11 +56,9 @@ export type HistoryResult = {
   speedMbps: number | null;
   speedStatus: SpeedStatus;
   speedError: string | null;
-  exitIp: string | null;
   country: string | null;
   zh: string;
   en: string;
-  colo: string | null;
 };
 
 /** 某一轮的全部结果。 */
@@ -144,11 +142,9 @@ export function normalizeHistoryResult(raw: unknown): HistoryResult | null {
     speedMbps,
     speedStatus,
     speedError: speedStatus === "fail" ? nullableStr(raw.speedError) : null,
-    exitIp: nullableStr(raw.exitIp),
     country: nullableStr(raw.country),
     zh: str(raw.zh),
     en: str(raw.en),
-    colo: nullableStr(raw.colo),
   };
 }
 

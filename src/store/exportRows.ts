@@ -9,7 +9,7 @@ export type ExportRow = {
   alias: string;
   /** 来源标识，进入导出内容。 */
   source: string;
-  geo: { zh: string; en: string; colo: string | null } | null;
+  geo: { zh: string; en: string } | null;
 };
 
 /**

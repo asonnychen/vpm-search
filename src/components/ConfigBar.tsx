@@ -1,16 +1,12 @@
-import { useState } from "react";
 import { Btn, Field, Num } from "./ui";
-import TemplatePanel, { type TemplatePanelMode } from "./TemplatePanel";
 import {
   LATENCY_SAMPLES,
   REQUEST_TIMEOUT_S,
   SPEED_PARAMS,
   selectLastInput,
-  selectNodeTemplates,
   selectSettings,
   useSettingsStore,
 } from "../store/settings";
-import { activeTemplate, deleteTemplate } from "../store/template";
 import { selectProbeBatch, speedTargetsFromIds, useProbeStore } from "../store/probe";
 import { useSelectionStore } from "../store/selection";
 import { usePoolStore } from "../store/pool";
@@ -23,7 +19,6 @@ export default function ConfigBar({
   onToggle: () => void;
 }) {
   const settings = useSettingsStore(selectSettings);
-  const templates = useSettingsStore(selectNodeTemplates);
   const patch = useSettingsStore((state) => state.patch);
   const batch = useProbeStore(selectProbeBatch);
   const startBatch = useProbeStore((state) => state.startBatch);
@@ -31,7 +26,6 @@ export default function ConfigBar({
   const startGeoBatch = useProbeStore((state) => state.startGeoBatch);
   const cancelBatch = useProbeStore((state) => state.cancelBatch);
   const selectedIds = useSelectionStore((state) => state.ids);
-  const [panel, setPanel] = useState<TemplatePanelMode | null>(null);
 
   const refreshCatalog = usePoolStore((state) => state.refreshCatalog);
   const fetchPool = usePoolStore((state) => state.fetchPool);
@@ -54,17 +48,6 @@ export default function ConfigBar({
       ? Math.min(100, Math.round((batch.completed / batch.total) * 100))
       : 0;
 
-  const selected = activeTemplate(templates, settings.activeTemplateId);
-
-  const removeSelected = () => {
-    if (!selected) return;
-    const next = deleteTemplate(templates, settings.activeTemplateId, selected.id);
-    patch({
-      nodeTemplates: next.templates,
-      activeTemplateId: next.activeTemplateId,
-    });
-  };
-
   return (
     <section className="shrink-0 border-b border-line bg-panel/40">
       <div className="min-h-9 flex flex-wrap items-center gap-x-2 gap-y-1.5 px-4 py-1.5">
@@ -85,9 +68,8 @@ export default function ConfigBar({
           测试配置
         </button>
         <span className="text-[12px] text-dim num hidden sm:inline">
-          {selected?.name ?? "未选择模板"} · 最大延时 {settings.maxLatencyMs}ms · 并发{" "}
-          {settings.concurrency} · 超时 {settings.connectTimeoutS}s/
-          {REQUEST_TIMEOUT_S}s
+          最大延时 {settings.maxLatencyMs}ms · 并发 {settings.concurrency} · 超时{" "}
+          {settings.connectTimeoutS}s/{REQUEST_TIMEOUT_S}s
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Btn
@@ -127,7 +109,7 @@ export default function ConfigBar({
             title={
               batch.running
                 ? "测试进行中，结束后才能再发起一轮"
-                : `经代理取${speedScope}的出口 IP 并查归属地，不影响已有延迟与速度`
+                : `查${speedScope}地址本身的归属地，不影响已有延迟与速度`
             }
             onClick={() =>
               void startGeoBatch(
@@ -184,49 +166,6 @@ export default function ConfigBar({
 
       {open ? (
         <div className="px-4 pb-3 pt-1 flex flex-wrap items-end gap-x-4 gap-y-3">
-          <Field label="节点模板" width="340px">
-            <div className="flex items-center gap-1">
-              <div className="relative flex-1">
-                <select
-                  value={selected?.id ?? ""}
-                  title={selected?.name ?? "未选择模板"}
-                  onChange={(event) => {
-                    if (event.target.value === "__new__") {
-                      setPanel("new");
-                      return;
-                    }
-                    patch({ activeTemplateId: event.target.value });
-                  }}
-                  className="appearance-none w-full h-8 bg-panel border border-line rounded-[3px] px-2 pr-7 text-[12px] outline-none focus:border-accent-dim"
-                >
-                  {templates.length === 0 ? <option value="">未选择模板</option> : null}
-                  {templates.map((template) => (
-                    <option key={template.id} value={template.id} title={template.name}>
-                      {template.name}
-                    </option>
-                  ))}
-                  <option value="__new__">+ 新建模板…</option>
-                </select>
-                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-dim text-[12px]">
-                  ▼
-                </span>
-              </div>
-              <Btn variant="ghost" title="新建模板" onClick={() => setPanel("new")}>
-                + 新建
-              </Btn>
-              <Btn
-                variant="ghost"
-                title="重命名当前模板"
-                onClick={() => setPanel("rename")}
-              >
-                重命名
-              </Btn>
-              <Btn variant="danger" title="删除当前模板" onClick={removeSelected}>
-                删除
-              </Btn>
-            </div>
-          </Field>
-
           <Field label="最大延时" width="100px">
             <Num
               value={settings.maxLatencyMs}
@@ -298,13 +237,6 @@ export default function ConfigBar({
         </div>
       ) : null}
 
-      {panel ? (
-        <TemplatePanel
-          key={panel}
-          initialMode={panel}
-          onClose={() => setPanel(null)}
-        />
-      ) : null}
     </section>
   );
 }

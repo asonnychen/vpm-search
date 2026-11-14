@@ -100,11 +100,11 @@ describe("日志归一化", () => {
   it("快照按三类拆开，缺字段当空表", () => {
     const snapshot = normalizeLogsSnapshot({
       operation: [{ kind: "operation", level: "INFO", ts: "t", text: "一" }],
-      singbox: "不是数组",
+      probe: "不是数组",
     });
     expect(snapshot.operation).toHaveLength(1);
     expect(snapshot.app).toEqual([]);
-    expect(snapshot.singbox).toEqual([]);
+    expect(snapshot.probe).toEqual([]);
   });
 
   it("时间只显示时分秒毫秒", () => {
@@ -129,7 +129,7 @@ describe("日志 store", () => {
     expect(state.loaded).toBe(true);
     expect(state.lines.operation[0]!.text).toBe("第一条");
     expect(state.lines.app).toHaveLength(1);
-    expect(state.lines.singbox).toEqual([]);
+    expect(state.lines.probe).toEqual([]);
   });
 
   it("推送的日志按类型追加并遵守上限", () => {
@@ -147,14 +147,14 @@ describe("日志 store", () => {
     const clear = vi.fn(async () => ({ entries: 3, files: 1 }));
     const store = createLogsStore(fakePersistence({ clear }));
     store.getState().append(entry({ kind: "operation" }));
-    store.getState().append(entry({ kind: "singbox", text: "原始行" }));
+    store.getState().append(entry({ kind: "probe", text: "原始行" }));
 
     const report = await store.getState().clear("operation");
 
     expect(clear).toHaveBeenCalledWith("operation");
     expect(report).toEqual({ entries: 3, files: 1 });
     expect(store.getState().lines.operation).toEqual([]);
-    expect(store.getState().lines.singbox).toHaveLength(1);
+    expect(store.getState().lines.probe).toHaveLength(1);
   });
 
   it("清理失败保留界面内容并记录错误", async () => {

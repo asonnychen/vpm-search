@@ -56,11 +56,10 @@ function fakePersistence(
           port: 8443,
           alias: "",
           status: "ok",
-          exitIp: "104.16.1.1",
-          country: "",
-          zh: "Cloudflare",
-          en: "Cloudflare",
-          colo: "LAX",
+          ip: "104.16.1.1",
+          country: "US",
+          zh: "美国",
+          en: "United States",
           asn: 13335,
           error: null,
           source: "offline",
@@ -70,11 +69,10 @@ function fakePersistence(
           port: 8443,
           alias: "",
           status: "ok",
-          exitIp: "203.0.113.9",
+          ip: "198.51.100.7",
           country: "CA",
           zh: "加拿大",
           en: "Canada",
-          colo: null,
           asn: 15169,
           error: null,
           source: "online",
@@ -137,7 +135,7 @@ describe("单条测试", () => {
       probe: vi.fn(async () => ({
         status: "fail",
         latencyMs: null,
-        error: "sing-box 已退出（exit code: 1），日志见 C:\\logs\\singbox.log",
+        error: "连接失败：连接被拒绝",
       })),
     });
     const store = createProbeStore(persistence);
@@ -147,9 +145,9 @@ describe("单条测试", () => {
     const result = store.getState().results["104.16.1.1:8443"];
     expect(result.status).toBe("fail");
     expect(result.latencyMs).toBeNull();
-    expect(result.error).toContain("singbox.log");
-    // sidecar 崩溃要能提示日志路径。
-    expect(store.getState().error).toContain("singbox.log");
+    expect(result.error).toContain("连接被拒绝");
+    // 失败原因要留在页面顶部的提示里。
+    expect(store.getState().error).toContain("连接被拒绝");
   });
 
   it("测试过程中标记该行，结束后清除", async () => {
@@ -290,7 +288,7 @@ describe("批量测试", () => {
     const store = createProbeStore(
       fakePersistence({
         startBatch: vi.fn(async () => {
-          throw new Error("未找到 sing-box");
+          throw new Error("池里还没有地址，请先抓取优选源");
         }),
       }),
     );
@@ -298,7 +296,7 @@ describe("批量测试", () => {
     await store.getState().startBatch();
 
     expect(store.getState().batch.running).toBe(false);
-    expect(store.getState().error).toContain("sing-box");
+    expect(store.getState().error).toContain("池里还没有地址");
   });
 
   it("坏数据归一成空报告", () => {
@@ -389,7 +387,7 @@ describe("测速", () => {
 });
 
 describe("归属地", () => {
-  it("三段写进归属地表且不清空延迟与速度", async () => {
+  it("归属地写进归属地表且不清空延迟与速度", async () => {
     const persistence = fakePersistence();
     const store = createProbeStore(persistence);
 
@@ -404,18 +402,16 @@ describe("归属地", () => {
     expect(store.getState().results["104.16.1.1:8443"].latencyMs).toBe(120);
     expect(store.getState().speeds["104.16.1.1:8443"].mbps).toBe(12.3);
 
-    // Cloudflare 落地：机房有值。
+    // 归属地只代表地址本身，带 IP 与中英文名。
     expect(store.getState().geos["104.16.1.1:8443"]).toMatchObject({
-      zh: "Cloudflare",
-      en: "Cloudflare",
-      colo: "LAX",
+      ip: "104.16.1.1",
+      zh: "美国",
+      en: "United States",
       asn: 13335,
     });
-    // 非 CF 落地：机房为空。
     expect(store.getState().geos["104.16.2.2:8443"]).toMatchObject({
       zh: "加拿大",
       en: "Canada",
-      colo: null,
     });
   });
 
@@ -453,13 +449,12 @@ describe("归属地", () => {
             port: 8443,
             alias: "",
             status: "fail",
-            exitIp: null,
+            ip: null,
             country: null,
             zh: "",
             en: "",
-            colo: null,
             asn: null,
-            error: "取出口 IP 失败",
+            error: "解析失败",
             source: "",
           },
         ],
@@ -469,8 +464,7 @@ describe("归属地", () => {
     restarted.setState({ geos: store.getState().geos });
     await restarted.getState().startGeoBatch();
 
-    expect(restarted.getState().geos["104.16.1.1:8443"].zh).toBe("Cloudflare");
-    expect(restarted.getState().geos["104.16.1.1:8443"].colo).toBe("LAX");
+    expect(restarted.getState().geos["104.16.1.1:8443"].zh).toBe("美国");
   });
 
   it("归属地查询中标记为 geo 模式并记录进度", () => {
@@ -551,11 +545,10 @@ describe("实时结果事件", () => {
     store.setState({
       geos: {
         "104.16.1.1:8443": {
-          exitIp: null,
-          country: null,
-          zh: "Cloudflare",
-          en: "Cloudflare",
-          colo: "LAX",
+          ip: "104.16.1.1",
+          country: "US",
+          zh: "美国",
+          en: "United States",
           asn: null,
           source: "offline",
         },
@@ -564,11 +557,11 @@ describe("实时结果事件", () => {
     });
 
     store.getState().applyRows([
-      rowEvent({ kind: "geo", status: "fail", error: "取出口 IP 失败" }),
+      rowEvent({ kind: "geo", status: "fail", error: "解析失败" }),
       rowEvent({ kind: "speed", status: "untested" }),
     ]);
 
-    expect(store.getState().geos["104.16.1.1:8443"].zh).toBe("Cloudflare");
+    expect(store.getState().geos["104.16.1.1:8443"].zh).toBe("美国");
     expect(store.getState().speeds["104.16.1.1:8443"].mbps).toBe(12.3);
   });
 

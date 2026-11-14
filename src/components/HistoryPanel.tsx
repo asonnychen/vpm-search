@@ -198,15 +198,6 @@ export default function HistoryPanel() {
   if (!open) return null;
 
   const selectedRun = runs.find((run) => run.id === selectedRunId) ?? null;
-  const runKind = selectedRun ? String(selectedRun.params.kind ?? "") : "";
-  const runTransport = selectedRun ? String(selectedRun.params.transport ?? "") : "";
-  const runTls =
-    selectedRun && typeof selectedRun.params.tls === "boolean"
-      ? selectedRun.params.tls
-        ? "TLS"
-        : "无"
-      : "";
-
   return (
     <div
       className="fixed inset-0 z-40 bg-black/25 flex items-center justify-center p-6"
@@ -322,15 +313,11 @@ export default function HistoryPanel() {
                     <thead>
                       <tr className="text-dim">
                         {[
-                          "类型",
                           "别名",
                           "地址",
                           "端口",
-                          "传输",
                           "归属地(中)",
                           "归属地(英)",
-                          "机房",
-                          "TLS",
                           "延迟",
                           "速度",
                           "状态",
@@ -339,7 +326,7 @@ export default function HistoryPanel() {
                             key={label}
                             className={cn(
                               "sticky top-0 z-10 bg-panel-2 border-b border-line font-normal px-2 h-8 whitespace-nowrap",
-                              label === "端口" || label === "延迟" || label === "速度" || label === "机房" || label === "TLS"
+                              label === "端口" || label === "延迟" || label === "速度"
                                 ? "text-right"
                                 : "text-left",
                             )}
@@ -363,9 +350,6 @@ export default function HistoryPanel() {
                             )}
                             title="查看该地址跨轮对比"
                           >
-                            <td className="border-b border-line/60 px-2 py-1.5 text-muted">
-                              {runKind || <span className="text-dim">—</span>}
-                            </td>
                             <td className="border-b border-line/60 px-2 py-1.5 max-w-[200px] truncate text-text/85">
                               {row.alias || <span className="text-dim">—</span>}
                             </td>
@@ -375,20 +359,11 @@ export default function HistoryPanel() {
                             <td className="border-b border-line/60 px-2 py-1.5 num text-right text-muted">
                               {row.port}
                             </td>
-                            <td className="border-b border-line/60 px-2 py-1.5 num text-muted">
-                              {runTransport || <span className="text-dim">—</span>}
-                            </td>
                             <td className="border-b border-line/60 px-2 py-1.5">
                               {row.zh || <span className="text-dim">—</span>}
                             </td>
                             <td className="border-b border-line/60 px-2 py-1.5 text-muted">
                               {row.en || <span className="text-dim">—</span>}
-                            </td>
-                            <td className="border-b border-line/60 px-2 py-1.5 num text-right">
-                              {row.colo || <span className="text-dim">—</span>}
-                            </td>
-                            <td className="border-b border-line/60 px-2 py-1.5 text-right text-muted">
-                              {runTls || <span className="text-dim">—</span>}
                             </td>
                             <td
                               className={cn(

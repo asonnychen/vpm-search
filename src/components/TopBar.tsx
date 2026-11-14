@@ -43,7 +43,7 @@ export default function TopBar() {
 
       <div className="hidden md:flex items-center gap-2 text-[12px] text-muted">
         <Dot tone="ok" />
-        <span>sing-box 1.12.4 就绪</span>
+        <span>直连边缘探测就绪</span>
         <span className="text-dim">·</span>
         <span className="num text-dim">run 20261113-1203</span>
       </div>

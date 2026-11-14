@@ -9,7 +9,6 @@ import {
   selectColumnWidths,
   selectLastInput,
   selectLogRetention,
-  selectNodeTemplates,
   selectThresholdMs,
   type Settings,
   type SettingsPersistence,
@@ -40,13 +39,11 @@ describe("normalizeSettings", () => {
       maxLatencyMs: -1,
       concurrency: 999,
       columnWidths: [1, 2],
-      nodeTemplates: "不是数组",
       logRetention: { appDays: 0 },
     });
     expect(settings.maxLatencyMs).toBe(DEFAULT_SETTINGS.maxLatencyMs);
     expect(settings.concurrency).toBe(DEFAULT_SETTINGS.concurrency);
     expect(settings.columnWidths).toEqual(DEFAULT_SETTINGS.columnWidths);
-    expect(settings.nodeTemplates).toEqual(DEFAULT_SETTINGS.nodeTemplates);
     expect(settings.logRetention.appDays).toBe(DEFAULT_SETTINGS.logRetention.appDays);
     expect(settings.logRetention.operationDays).toBe(DEFAULT_SETTINGS.logRetention.operationDays);
   });
@@ -76,7 +73,7 @@ describe("设置 store 的读写", () => {
     const persistence = fakePersistence({
       load: async () => ({
         maxLatencyMs: 350,
-        columnWidths: Array(14).fill(100),
+        columnWidths: Array(10).fill(100),
         lastInput: { sourceUrls: "https://example.com/all.txt" },
       }),
     });
@@ -126,7 +123,7 @@ describe("设置 store 的读写", () => {
     store.getState().setColumnWidth(0, 5);
     expect(selectColumnWidths(store.getState())[0]).toBe(40);
     store.getState().setColumnWidth(99, 300);
-    expect(selectColumnWidths(store.getState())).toHaveLength(14);
+    expect(selectColumnWidths(store.getState())).toHaveLength(10);
   });
 
   it("读写失败不抛异常，只记录 saveError", async () => {
@@ -153,16 +150,13 @@ describe("设置 store 的读写", () => {
     const store = createSettingsStore(
       fakePersistence({
         load: async () => ({
-          logRetention: { operationDays: 7, appDays: 14, singboxDays: 60 },
-          nodeTemplates: [{ id: "t1", name: "备用", kind: "trojan", transport: "ws", tls: true }],
+          logRetention: { operationDays: 7, appDays: 14, probeDays: 60 },
         }),
       }),
     );
     await store.getState().load();
 
     const state = store.getState();
-    expect(selectLogRetention(state)).toEqual({ operationDays: 7, appDays: 14, singboxDays: 60 });
-    expect(selectNodeTemplates(state)).toHaveLength(1);
-    expect(selectNodeTemplates(state)[0].name).toBe("备用");
+    expect(selectLogRetention(state)).toEqual({ operationDays: 7, appDays: 14, probeDays: 60 });
   });
 });

@@ -11,7 +11,6 @@ import {
   type GeoResult,
 } from "../store/probe";
 import { selectColumnWidths, selectThresholdMs, useSettingsStore } from "../store/settings";
-import { activeTemplate, templateColumns } from "../store/template";
 import { useSelectionStore } from "../store/selection";
 import { sortRows, type SortDir, type SortKey } from "../store/tableSort";
 import { countMissingGeo, pickExportRange, type ExportRow } from "../store/exportRows";
@@ -20,7 +19,7 @@ import { cn } from "./ui";
 
 type RowStatus = "untested" | "ok" | "timeout" | "fail";
 
-/** 表格行来自优选域名池；类型/传输/TLS 三列来自当前节点模板。 */
+/** 表格行来自优选域名池，测量值来自探测结果。 */
 type Row = {
   id: string;
   host: string;
@@ -36,7 +35,7 @@ type Row = {
   error: string | null;
   /** 测速失败原因。 */
   speedError: string | null;
-  /** 出口 IP 的归属地；未查询或查询失败时为 null。 */
+  /** 地址本身的归属地；未查询或查询失败时为 null。 */
   geo: GeoResult | null;
 };
 
@@ -80,7 +79,7 @@ function latencyCell(row: Row, threshold: number) {
 function geoTitle(geo: GeoResult | null): string | undefined {
   if (!geo) return undefined;
   const parts = [
-    geo.exitIp ? `出口 ${geo.exitIp}` : "",
+    geo.ip ? `IP ${geo.ip}` : "",
     geo.country ? `国家码 ${geo.country}` : "",
     geo.source ? `来源 ${geo.source}` : "",
   ].filter(Boolean);
@@ -105,11 +104,6 @@ export default function ResultsTable() {
   } | null>(null);
 
   const poolEntries = usePoolStore((state) => state.entries);
-  const templates = useSettingsStore((state) => state.settings.nodeTemplates);
-  const activeId = useSettingsStore((state) => state.settings.activeTemplateId);
-  // 切换模板后这三列立刻跟着变；行数据仍来自池。
-  const columns = templateColumns(activeTemplate(templates, activeId));
-
   // 单条真连接延迟的结果按 `host:port` 覆盖到对应行，未测的行保持 null。
   const probeResults = useProbeStore(selectProbeResults);
   const probeSpeeds = useProbeStore(selectProbeSpeeds);
@@ -210,8 +204,7 @@ export default function ResultsTable() {
           r.alias.toLowerCase().includes(q) ||
           r.source.toLowerCase().includes(q) ||
           (r.geo?.zh.toLowerCase().includes(q) ?? false) ||
-          (r.geo?.en.toLowerCase().includes(q) ?? false) ||
-          (r.geo?.colo?.toLowerCase().includes(q) ?? false)
+          (r.geo?.en.toLowerCase().includes(q) ?? false)
         );
       }
       return true;
@@ -452,15 +445,11 @@ export default function ResultsTable() {
                 </div>
               </th>
               {[
-                { label: "类型" },
                 { label: "别名" },
                 { label: "地址" },
                 { label: "端口", align: "right" },
-                { label: "传输" },
                 { label: "归属地(中)" },
                 { label: "归属地(英)" },
-                { label: "机房", align: "right" },
-                { label: "TLS", align: "right" },
                 { label: "优选域名" },
                 { label: "延迟", align: "right", sortKey: "latency" as const },
                 { label: "速度", align: "right", sortKey: "speed" as const },
@@ -546,9 +535,6 @@ export default function ResultsTable() {
                       </svg>
                     </button>
                   </td>
-                  <td className="border-b border-line/60 px-2 py-1.5">
-                    <span className="text-muted">{columns.kind}</span>
-                  </td>
                   <td
                     className="border-b border-line/60 px-2 py-1.5 max-w-[260px] truncate text-text/85"
                     title={r.alias}
@@ -560,9 +546,6 @@ export default function ResultsTable() {
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-right text-muted">
                     {r.port}
-                  </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 num text-muted">
-                    {columns.transport}
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5" title={geoTitle(r.geo)}>
                     {r.geo?.zh ? (
@@ -577,23 +560,6 @@ export default function ResultsTable() {
                     ) : (
                       <span className="text-dim">—</span>
                     )}
-                  </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 num text-right" title={geoTitle(r.geo)}>
-                    {r.geo?.colo ? (
-                      <span className="text-text/90">{r.geo.colo}</span>
-                    ) : (
-                      <span className="text-dim">—</span>
-                    )}
-                  </td>
-                  <td className="border-b border-line/60 px-2 py-1.5 text-right">
-                    <span
-                      className={cn(
-                        "text-[12px]",
-                        columns.tls === "无" ? "text-dim" : "text-muted",
-                      )}
-                    >
-                      {columns.tls}
-                    </span>
                   </td>
                   <td className="border-b border-line/60 px-2 py-1.5 num text-[12px] text-dim whitespace-nowrap">
                     {r.source}

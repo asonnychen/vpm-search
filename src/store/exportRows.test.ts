@@ -14,8 +14,8 @@ function row(
   return { id: `${host}:${port}`, host, port, alias: "", source, geo };
 }
 
-const canada = { zh: "加拿大", en: "Canada", colo: null };
-const japan = { zh: "日本", en: "Japan", colo: "NRT" };
+const canada = { zh: "加拿大", en: "Canada" };
+const japan = { zh: "日本", en: "Japan" };
 
 describe("导出范围选择", () => {
   it("有勾选行时只取勾选行", () => {
@@ -77,14 +77,13 @@ describe("导出范围选择", () => {
 });
 
 describe("归属地缺失统计", () => {
-  it("中英文名都为空才算缺失，机房单独存在不算", () => {
+  it("中英文名都为空才算缺失", () => {
     const rows = [
       row("a.example", 443, canada),
       row("b.example", 443, null),
-      row("c.example", 443, { zh: "", en: "", colo: "LAX" }),
-      row("d.example", 443, { zh: "", en: "", colo: null }),
+      row("c.example", 443, { zh: "", en: "" }),
     ];
-    expect(countMissingGeo(rows)).toBe(3);
+    expect(countMissingGeo(rows)).toBe(2);
     expect(countMissingGeo([])).toBe(0);
   });
 });

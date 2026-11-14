@@ -16,7 +16,7 @@ import { Btn, Num, cn } from "./ui";
 const tabs: { id: LogKind; label: string }[] = [
   { id: "operation", label: "操作日志" },
   { id: "app", label: "应用日志" },
-  { id: "singbox", label: "sing-box 日志" },
+  { id: "probe", label: "探测日志" },
 ];
 
 const levelStyle: Record<LogLevel, string> = {
@@ -40,7 +40,7 @@ const LEVEL_OPTIONS: LevelFilter[] = ["ALL", "INFO", "OK", "WARN", "ERROR"];
 const retentionField = {
   operation: "operationDays",
   app: "appDays",
-  singbox: "singboxDays",
+  probe: "probeDays",
 } as const;
 
 export default function LogPanel({
