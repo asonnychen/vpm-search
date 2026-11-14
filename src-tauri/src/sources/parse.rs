@@ -96,11 +96,11 @@ pub fn top_limit(url: &str) -> Option<usize> {
     (limit > 0).then_some(limit)
 }
 
-/// bestcf 页面上「优选域名」区里的一条优选源。
+/// bestcf 页面上某个优选源区里的一条优选源。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogSource {
     pub url: String,
-    /// 来源标识，形如 `BestCF·vps789/top10.txt`。
+    /// 来源标识，形如 `优选域名·vps789/top10.txt`。
     pub name: String,
     /// 页面标注「更新异常」的源。
     pub broken: bool,
@@ -112,7 +112,7 @@ pub struct PoolCandidate {
     pub host: String,
     pub port: u16,
     pub alias: String,
-    /// 来源标识，形如 `BestCF·vps789/top10.txt` 或 `手动`。
+    /// 来源标识，形如 `优选域名·vps789/top10.txt` 或 `手动`。
     pub source: String,
     /// 对应的优选源地址；手动粘贴的地址没有来源地址。
     pub source_url: Option<String>,
@@ -130,7 +130,9 @@ pub fn dedupe(candidates: Vec<PoolCandidate>) -> (Vec<PoolCandidate>, usize) {
     (kept, dropped)
 }
 
-/// 来源标识：bestcf 的源用 `BestCF·<路径>`，其它手动源用 `host<路径>`。
+/// 手动粘贴的源标识：bestcf 的链接用 `BestCF·<路径>`，其它用 `host<路径>`。
+///
+/// 页面清单里的源不用它，改由 [`section_label`] 带上区名。
 pub fn source_label(url: &str) -> String {
     let without_scheme = url.split("://").nth(1).unwrap_or(url);
     let (host, path) = match without_scheme.find('/') {
@@ -146,35 +148,68 @@ pub fn source_label(url: &str) -> String {
     }
 }
 
-/// 从 bestcf 页面解析「优选域名」区（`id="yxym"`）的全部 txt 源。
+/// 需要抓取的优选源区：页面 section id 与它在来源标识里用的区名。
+///
+/// 顺序就是页面上从上到下的顺序，也是同一个 URL 出现在多个区时的优先级：
+/// 先出现的区胜出。
+pub const CATALOG_SECTIONS: [(&str, &str); 5] = [
+    ("yxym", "优选域名"),
+    ("yxip", "优选IP"),
+    ("yxwz", "优选网站"),
+    ("yxgj", "优选工具"),
+    ("proxyip", "ProxyIP"),
+];
+
+/// 从 bestcf 页面解析五个优选源区里的全部 txt 源。
 ///
 /// 页面把失效源渲染成 `<del>` 或 `line-through`，同组内的所有链接都按异常处理。
+/// 同一个 URL 只保留首次出现的那条，来源标识沿用首次出现那个区的区名；
+/// 某个区整段缺失时跳过它，不影响其它区。
 pub fn parse_catalog(html: &str) -> Vec<CatalogSource> {
     let cleaned = strip_comments(html);
-    let Some(section) = extract_section(&cleaned, "yxym") else {
-        return Vec::new();
-    };
+    let mut sources: Vec<CatalogSource> = Vec::new();
 
-    let mut sources = Vec::new();
-    for block in section.split("<div class=\"group-card\"").skip(1) {
-        let broken = block.contains("<del")
-            || block.contains("line-through")
-            || block.contains("更新异常");
-        for url in urls_in(block) {
-            if !url.ends_with(".txt") {
-                continue;
+    for (id, label) in CATALOG_SECTIONS {
+        let Some(section) = extract_section(&cleaned, id) else {
+            continue;
+        };
+        // 组卡可能带额外类名（`group-card extra-group`），按前缀切分两种都能取到。
+        for block in section.split("<div class=\"group-card").skip(1) {
+            let broken = block.contains("<del")
+                || block.contains("line-through")
+                || block.contains("更新异常");
+            for url in urls_in(block) {
+                if !url.ends_with(".txt") {
+                    continue;
+                }
+                if sources.iter().any(|s: &CatalogSource| s.url == url) {
+                    continue;
+                }
+                sources.push(CatalogSource {
+                    name: section_label(label, &url),
+                    url,
+                    broken,
+                });
             }
-            if sources.iter().any(|s: &CatalogSource| s.url == url) {
-                continue;
-            }
-            sources.push(CatalogSource {
-                name: source_label(&url),
-                url,
-                broken,
-            });
         }
     }
     sources
+}
+
+/// 区内的来源标识：`<区名>·<txt 路径>`，例如 `优选域名·domain/all.txt`。
+pub fn section_label(section: &str, url: &str) -> String {
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    match without_scheme.find('/') {
+        Some(index) => {
+            let path = without_scheme[index..].trim_start_matches('/');
+            if path.is_empty() {
+                section.to_string()
+            } else {
+                format!("{section}·{path}")
+            }
+        }
+        None => section.to_string(),
+    }
 }
 
 /// 去掉 HTML 注释：页面里被注释掉的源不应出现在清单中。
@@ -347,20 +382,83 @@ mod tests {
 <section id="yxip">
   <div class="group-card"><span class="url-text">https://bestcf.pages.dev/ip/all.txt</span></div>
 </section>
+<section id="yxwz">
+  <div class="group-card extra-group"><span class="url-text">https://bestcf.pages.dev/site/all.txt</span></div>
+</section>
+<section id="yxgj">
+  <div class="group-card"><span class="url-text">https://bestcf.pages.dev/tool/all.txt</span></div>
+</section>
+<section id="proxyip">
+  <div class="group-card"><span class="url-text">https://bestcf.pages.dev/proxy/all.txt</span></div>
+</section>
 "#;
 
     #[test]
-    fn 页面只解析优选域名区并识别异常源() {
+    fn 五个优选源区都被解析且带各自区名() {
         let sources = parse_catalog(PAGE);
 
-        assert_eq!(sources.len(), 3);
+        // yxym 三条 + 其余四区各一条。
+        assert_eq!(sources.len(), 7);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "优选域名·domain/all.txt",
+                "优选域名·domain/mini.txt",
+                "优选域名·luoli/all.txt",
+                "优选IP·ip/all.txt",
+                "优选网站·site/all.txt",
+                "优选工具·tool/all.txt",
+                "ProxyIP·proxy/all.txt",
+            ]
+        );
+        // 每个区的 txt 源都进了清单，按页面顺序排列。
         assert_eq!(sources[0].url, "https://bestcf.pages.dev/domain/all.txt");
-        assert_eq!(sources[0].name, "BestCF·domain/all.txt");
+        assert_eq!(sources[4].url, "https://bestcf.pages.dev/site/all.txt");
+        // 异常源判定保持原样：同组内的链接都按异常处理。
         assert!(!sources[0].broken);
         assert!(sources[2].broken);
-        // 优选 IP 区与注释掉的源不应混进来。
-        assert!(sources.iter().all(|s| !s.url.contains("/ip/")));
+        // 注释掉的源不应混进来。
         assert!(sources.iter().all(|s| !s.url.contains("/wuya/")));
+    }
+
+    #[test]
+    fn 重复_url_只留首次出现的区名() {
+        // 同一个 URL 同时出现在两个区：按 CATALOG_SECTIONS 的顺序取先出现的区名。
+        let page = r#"
+<section id="yxym">
+  <div class="group-card"><span class="url-text">https://bestcf.pages.dev/domain/all.txt</span></div>
+</section>
+<section id="yxip">
+  <div class="group-card"><span class="url-text">https://bestcf.pages.dev/domain/all.txt</span></div>
+</section>
+"#;
+
+        let sources = parse_catalog(page);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "优选域名·domain/all.txt");
+    }
+
+    #[test]
+    fn 某个区缺失时不影响其它区() {
+        // 只有 yxym 与 proxyip，中间三个区整段缺失。
+        let page = r#"
+<section id="yxym">
+  <div class="group-card"><span class="url-text">https://bestcf.pages.dev/domain/all.txt</span></div>
+</section>
+<section id="proxyip">
+  <div class="group-card"><span class="url-text">https://bestcf.pages.dev/proxy/all.txt</span></div>
+</section>
+"#;
+
+        let sources = parse_catalog(page);
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name, "优选域名·domain/all.txt");
+        assert_eq!(sources[1].name, "ProxyIP·proxy/all.txt");
     }
 
     #[test]
