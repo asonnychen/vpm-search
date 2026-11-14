@@ -2,18 +2,15 @@
 //!
 //! 设置以单行 KV 的形式存进 `settings` 表：每个字段一个 key，值是该字段的 JSON。
 //! 这样某个字段损坏或缺失时只会回落到该字段的默认值，不会让整份设置失效。
+//! 旧版本遗留的 key（如 `node_templates`）不在 [`SETTING_KEYS`] 里，读写时一律忽略。
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::template::NodeTemplate;
-
 /// 表格列数，与 `ResultsTable` 的列一一对应。
-pub const COLUMN_COUNT: usize = 14;
+pub const COLUMN_COUNT: usize = 10;
 
 /// 表格列宽的默认值，与界面原型的初始列宽一致。
-pub const DEFAULT_COLUMN_WIDTHS: [u32; COLUMN_COUNT] = [
-    64, 60, 172, 140, 58, 54, 84, 96, 54, 46, 156, 112, 88, 84,
-];
+pub const DEFAULT_COLUMN_WIDTHS: [u32; COLUMN_COUNT] = [64, 172, 140, 58, 84, 96, 156, 112, 88, 84];
 
 /// 三类日志的保留天数默认值。
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
@@ -32,11 +29,13 @@ fn default_latency_samples() -> u32 {
     FIXED_LATENCY_SAMPLES
 }
 
+fn default_retention_days() -> u32 {
+    DEFAULT_LOG_RETENTION_DAYS
+}
+
 /// 设置里每个字段在 `settings` 表中的 key。
-pub const SETTING_KEYS: [&str; 12] = [
+pub const SETTING_KEYS: [&str; 10] = [
     "last_input",
-    "node_templates",
-    "active_template_id",
     "max_latency_ms",
     "connect_timeout_s",
     "request_timeout_s",
@@ -91,7 +90,9 @@ impl Default for SpeedParams {
 pub struct LogRetention {
     pub operation_days: u32,
     pub app_days: u32,
-    pub singbox_days: u32,
+    /// 旧设置里这一项叫 `singboxDays`，缺失时回落到默认 30 天。
+    #[serde(default = "default_retention_days")]
+    pub probe_days: u32,
 }
 
 impl Default for LogRetention {
@@ -99,7 +100,7 @@ impl Default for LogRetention {
         Self {
             operation_days: DEFAULT_LOG_RETENTION_DAYS,
             app_days: DEFAULT_LOG_RETENTION_DAYS,
-            singbox_days: DEFAULT_LOG_RETENTION_DAYS,
+            probe_days: DEFAULT_LOG_RETENTION_DAYS,
         }
     }
 }
@@ -130,9 +131,6 @@ impl Default for UiState {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub last_input: LastInput,
-    pub node_templates: Vec<NodeTemplate>,
-    /// 当前选中的模板 id；为空表示没有模板。
-    pub active_template_id: String,
     /// 超阈值判定用的最大延时。
     pub max_latency_ms: u32,
     pub connect_timeout_s: u32,
@@ -158,8 +156,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             last_input: LastInput::default(),
-            node_templates: vec![NodeTemplate::default()],
-            active_template_id: NodeTemplate::default().id,
             max_latency_ms: 200,
             connect_timeout_s: 5,
             request_timeout_s: 10,
@@ -201,6 +197,18 @@ impl Settings {
         self.speed = SpeedParams::default();
     }
 
+    /// 列宽数组长度不对（例如旧版本 14 列）时整体回落默认值。
+    pub fn normalize_column_widths(&mut self) {
+        if self.column_widths.len() != COLUMN_COUNT
+            || self
+                .column_widths
+                .iter()
+                .any(|width| *width < 40 || *width > 2000)
+        {
+            self.column_widths = DEFAULT_COLUMN_WIDTHS.to_vec();
+        }
+    }
+
     /// 参数校验。命令层只做校验与转发，落库前必须通过这里。
     pub fn validate(&self) -> Result<(), ValidationError> {
         in_range("最大延时", self.max_latency_ms, 1, 10_000)?;
@@ -218,12 +226,7 @@ impl Settings {
             3650,
         )?;
         in_range("应用日志保留天数", self.log_retention.app_days, 1, 3650)?;
-        in_range(
-            "sing-box 日志保留天数",
-            self.log_retention.singbox_days,
-            1,
-            3650,
-        )?;
+        in_range("探测日志保留天数", self.log_retention.probe_days, 1, 3650)?;
         in_range("日志面板高度", self.ui.log_height, 80, 4000)?;
 
         if self.column_widths.len() != COLUMN_COUNT {
@@ -239,57 +242,6 @@ impl Settings {
                     i + 1
                 )));
             }
-        }
-
-        for template in &self.node_templates {
-            if template.id.trim().is_empty() {
-                return Err(ValidationError("节点模板 id 不能为空".to_string()));
-            }
-            if template.name.trim().is_empty() {
-                return Err(ValidationError("节点模板名称不能为空".to_string()));
-            }
-            if !crate::template::KINDS.contains(&template.kind.as_str()) {
-                return Err(ValidationError(format!(
-                    "节点模板「{}」的协议类型「{}」不支持",
-                    template.name, template.kind
-                )));
-            }
-            if !crate::template::TRANSPORTS.contains(&template.transport.as_str()) {
-                return Err(ValidationError(format!(
-                    "节点模板「{}」的传输方式「{}」不支持",
-                    template.name, template.transport
-                )));
-            }
-            if template.port == 0 {
-                return Err(ValidationError(format!(
-                    "节点模板「{}」的端口必须在 1–65535 之间",
-                    template.name
-                )));
-            }
-            if self
-                .node_templates
-                .iter()
-                .filter(|other| other.id == template.id)
-                .count()
-                > 1
-            {
-                return Err(ValidationError(format!(
-                    "节点模板 id「{}」重复",
-                    template.id
-                )));
-            }
-        }
-
-        if !self.active_template_id.is_empty()
-            && !self
-                .node_templates
-                .iter()
-                .any(|template| template.id == self.active_template_id)
-        {
-            return Err(ValidationError(format!(
-                "当前节点模板「{}」不在模板列表中",
-                self.active_template_id
-            )));
         }
 
         if self.last_input.source_urls.chars().count() > 64 * 1024
@@ -330,10 +282,14 @@ mod tests {
     }
 
     #[test]
-    fn 节点模板名称不能为空() {
-        let mut settings = Settings::default();
-        settings.node_templates[0].name = "  ".to_string();
-        assert!(settings.validate().is_err());
+    fn 旧版_14_列列宽回落默认值() {
+        let mut settings = Settings {
+            column_widths: vec![64, 60, 172, 140, 58, 54, 84, 96, 54, 46, 156, 112, 88, 84],
+            ..Settings::default()
+        };
+        settings.normalize_column_widths();
+        assert_eq!(settings.column_widths, DEFAULT_COLUMN_WIDTHS.to_vec());
+        settings.validate().unwrap();
     }
 
     #[test]
@@ -359,8 +315,27 @@ mod tests {
     fn 旧设置_json_缺少只读字段也能反序列化() {
         let json = serde_json::json!({
             "lastInput": { "sourceUrls": "", "manualAddresses": "" },
-            "nodeTemplates": [],
-            "activeTemplateId": "",
+            "maxLatencyMs": 200,
+            "connectTimeoutS": 5,
+            "concurrency": 10,
+            "columnWidths": DEFAULT_COLUMN_WIDTHS,
+            "logRetention": { "operationDays": 30, "appDays": 30 },
+            "ui": { "logHeight": 214, "logCollapsed": false, "configOpen": true, "poolOpen": false }
+        });
+        let settings: Settings = serde_json::from_value(json).expect("旧 JSON 应能解析");
+        assert_eq!(settings.request_timeout_s, FIXED_REQUEST_TIMEOUT_S);
+        assert_eq!(settings.latency_samples, FIXED_LATENCY_SAMPLES);
+        assert_eq!(settings.speed, SpeedParams::default());
+        // 旧的 singboxDays 缺失时回落到默认 30 天。
+        assert_eq!(settings.log_retention.probe_days, DEFAULT_LOG_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn 旧设置_json_里的模板字段被忽略() {
+        let json = serde_json::json!({
+            "lastInput": { "sourceUrls": "", "manualAddresses": "" },
+            "nodeTemplates": [{ "id": "t1", "name": "旧模板" }],
+            "activeTemplateId": "t1",
             "maxLatencyMs": 200,
             "connectTimeoutS": 5,
             "concurrency": 10,
@@ -369,8 +344,6 @@ mod tests {
             "ui": { "logHeight": 214, "logCollapsed": false, "configOpen": true, "poolOpen": false }
         });
         let settings: Settings = serde_json::from_value(json).expect("旧 JSON 应能解析");
-        assert_eq!(settings.request_timeout_s, FIXED_REQUEST_TIMEOUT_S);
-        assert_eq!(settings.latency_samples, FIXED_LATENCY_SAMPLES);
-        assert_eq!(settings.speed, SpeedParams::default());
+        settings.validate().unwrap();
     }
 }

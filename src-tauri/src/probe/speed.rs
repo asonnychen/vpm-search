@@ -1,6 +1,6 @@
-//! 测速：经同一条代理链路并发下载固定字节数，换算成 MB/s。
+//! 测速：直连优选地址并发下载固定字节数，换算成 MB/s。
 //!
-//! 设计要点（见 GLOSSARY 的「测速」与阶段 8）：
+//! 设计要点（见 GLOSSARY 的「测速」）：
 //! - 4 条并发流、合计 10MB、总时长上限 15 秒；
 //! - 1MB = 1,000,000 字节，结果保留一位小数；
 //! - 任一流失败或整体超时按失败处理，绝不写入错误的 0。
@@ -99,31 +99,15 @@ pub fn evaluate(bytes: &[u64], elapsed: Duration, limit: Duration) -> Result<f64
     Ok(round_mbps(combined_mbps(bytes, elapsed)))
 }
 
-/// 经本地 mixed 入站并发下载固定字节数，返回 MB/s。
+/// 并发下载固定字节数，返回 MB/s。
 ///
-/// `proxy` 是 sing-box 本地入站地址；整轮只建一个客户端，4 条流共享。
+/// 客户端由调用方建好（已把探测主机名钉到目标地址）；4 条流共享同一个客户端。
 /// 任一流失败、被停止或整体超过上限都会返回 `Err`，不会写入 0。
 pub fn download_streams(
-    proxy: Option<&str>,
-    connect_timeout: Duration,
+    client: &reqwest::blocking::Client,
     speed: &SpeedOptions,
     cancel: &AtomicBool,
 ) -> Result<f64, String> {
-    let mut builder = reqwest::blocking::Client::builder()
-        .connect_timeout(connect_timeout)
-        .timeout(speed.timeout);
-    if let Some(proxy) = proxy {
-        builder = builder.proxy(
-            reqwest::Proxy::all(proxy).map_err(|e| format!("本地代理地址无效：{e}"))?,
-        );
-    } else {
-        // 显式禁用系统代理：没有本地入站时也不读取系统代理（ADR-0004）。
-        builder = builder.no_proxy();
-    }
-    let client = builder
-        .build()
-        .map_err(|e| format!("创建测速客户端失败：{e}"))?;
-
     let url = speed.url();
     let per_stream = speed.bytes_per_stream();
     let started = std::time::Instant::now();
@@ -131,7 +115,6 @@ pub fn download_streams(
     let results: Vec<Result<u64, String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..speed.streams)
             .map(|_| {
-                let client = &client;
                 let url = &url;
                 scope.spawn(move || download_one(client, url, per_stream, cancel))
             })
@@ -383,7 +366,6 @@ pub fn persist_speed(store: &Store, run_id: &str, rows: &[SpeedRow]) -> Result<(
 mod tests {
     use super::*;
     use crate::probe::Attempt;
-    use crate::template::NodeTemplate;
 
     #[test]
     fn 吞吐换算按百万字节与耗时() {
@@ -471,7 +453,6 @@ mod tests {
     #[test]
     fn 测速批量写进同一结果行且不清空延迟() {
         let store = Store::open_in_memory().unwrap();
-        let template = NodeTemplate::default();
         let items = vec![item("104.16.9.1", 8443), item("104.16.9.2", 8443)];
 
         // 先跑一轮延迟批量并落库，形成两行结果。
@@ -482,7 +463,6 @@ mod tests {
         let report = crate::probe::batch::run_batch(
             &latency,
             &items,
-            &template,
             &ProbeOptions::default(),
             crate::probe::batch::BatchOptions::new(3, 2),
             &AtomicBool::new(false),

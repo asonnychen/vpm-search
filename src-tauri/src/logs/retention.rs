@@ -157,14 +157,14 @@ mod tests {
     #[test]
     fn 手动清理删除全部文件并返回条数() {
         let dir = tempfile::tempdir().unwrap();
-        write_log(dir.path(), "singbox-2026-11-12.log", 4, 1);
-        write_log(dir.path(), "singbox-2026-11-13.log", 3, 0);
+        write_log(dir.path(), "probe-2026-11-12.log", 4, 1);
+        write_log(dir.path(), "probe-2026-11-13.log", 3, 0);
 
-        let report = clear(dir.path(), LogKind::Singbox).unwrap();
+        let report = clear(dir.path(), LogKind::Probe).unwrap();
 
         assert_eq!(report.files, 2);
         assert_eq!(report.entries, 7);
-        assert!(log_files(dir.path(), LogKind::Singbox).unwrap().is_empty());
+        assert!(log_files(dir.path(), LogKind::Probe).unwrap().is_empty());
     }
 
     #[test]

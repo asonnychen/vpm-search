@@ -1,14 +1,13 @@
-//! 测试用的假探测器：不启动任何进程，按预设返回结论。
+//! 测试用的假探测器：不发起任何网络请求，按预设返回结论。
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
-use crate::template::NodeTemplate;
-
-use super::batch::{BatchItem, BatchProber};
+use super::batch::BatchProber;
 use super::speed::{SpeedOptions, SpeedProber};
-use super::{Attempt, Endpoint, ProbeOptions, ProbeOutcome, Prober};
+use super::{Attempt, Endpoint, HostResolver, ProbeOptions, ProbeOutcome, Prober};
 
 /// 按预设尝试结果返回，并记录调用过的地址。
 #[cfg_attr(not(test), allow(dead_code))] // 只在测试里构造
@@ -20,11 +19,10 @@ pub struct FakeProber {
     scripted: Mutex<HashMap<(String, u16), Vec<Attempt>>>,
     /// 按地址预设的测速结果。
     speeds: Mutex<HashMap<(String, u16), Result<f64, String>>>,
-    /// 按地址预设的出口 IP。
-    exits: Mutex<HashMap<(String, u16), Result<crate::geo::ExitIp, String>>>,
+    /// 按地址预设的解析结果。
+    ips: Mutex<HashMap<(String, u16), Result<IpAddr, String>>>,
     calls: Mutex<Vec<(String, u16)>>,
     speed_calls: Mutex<Vec<(String, u16)>>,
-    geo_calls: Mutex<Vec<(String, u16)>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // 只在测试里构造
@@ -32,12 +30,7 @@ impl FakeProber {
     pub fn new(attempts: Vec<Attempt>) -> Self {
         Self {
             attempts: Mutex::new(attempts),
-            scripted: Mutex::new(HashMap::new()),
-            speeds: Mutex::new(HashMap::new()),
-            exits: Mutex::new(HashMap::new()),
-            calls: Mutex::new(Vec::new()),
-            speed_calls: Mutex::new(Vec::new()),
-            geo_calls: Mutex::new(Vec::new()),
+            ..Self::default()
         }
     }
 
@@ -53,13 +46,8 @@ impl FakeProber {
             .map(|((host, port), attempts)| ((host.to_string(), port), attempts))
             .collect();
         Self {
-            attempts: Mutex::new(Vec::new()),
             scripted: Mutex::new(scripted),
-            speeds: Mutex::new(HashMap::new()),
-            exits: Mutex::new(HashMap::new()),
-            calls: Mutex::new(Vec::new()),
-            speed_calls: Mutex::new(Vec::new()),
-            geo_calls: Mutex::new(Vec::new()),
+            ..Self::default()
         }
     }
 
@@ -76,28 +64,18 @@ impl FakeProber {
         self
     }
 
-    pub fn calls(&self) -> Vec<(String, u16)> {
-        self.calls.lock().map(|calls| calls.clone()).unwrap_or_default()
-    }
-
-    /// 预设每条地址的出口 IP；没预设的地址返回失败。
-    pub fn with_exits(
-        self,
-        entries: Vec<((&str, u16), Result<crate::geo::ExitIp, String>)>,
-    ) -> Self {
-        if let Ok(mut exits) = self.exits.lock() {
+    /// 预设每条地址的解析结果；没预设的地址按 IP 直接解析。
+    pub fn with_ips(self, entries: Vec<((&str, u16), Result<IpAddr, String>)>) -> Self {
+        if let Ok(mut ips) = self.ips.lock() {
             for ((host, port), result) in entries {
-                exits.insert((host.to_string(), port), result);
+                ips.insert((host.to_string(), port), result);
             }
         }
         self
     }
 
-    pub fn geo_calls(&self) -> Vec<(String, u16)> {
-        self.geo_calls
-            .lock()
-            .map(|calls| calls.clone())
-            .unwrap_or_default()
+    pub fn calls(&self) -> Vec<(String, u16)> {
+        self.calls.lock().map(|calls| calls.clone()).unwrap_or_default()
     }
 
     pub fn speed_calls(&self) -> Vec<(String, u16)> {
@@ -130,12 +108,7 @@ impl FakeProber {
 }
 
 impl Prober for FakeProber {
-    fn measure_latency(
-        &self,
-        endpoint: &Endpoint,
-        _template: &NodeTemplate,
-        _options: &ProbeOptions,
-    ) -> ProbeOutcome {
+    fn measure_latency(&self, endpoint: &Endpoint, _options: &ProbeOptions) -> ProbeOutcome {
         if let Ok(mut calls) = self.calls.lock() {
             calls.push((endpoint.host.clone(), endpoint.port));
         }
@@ -144,40 +117,22 @@ impl Prober for FakeProber {
 }
 
 impl BatchProber for FakeProber {
-    fn prepare(
-        &self,
-        _items: &[BatchItem],
-        _template: &NodeTemplate,
-        _concurrency: usize,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn sample(
-        &self,
-        endpoint: &Endpoint,
-        template: &NodeTemplate,
-        options: &ProbeOptions,
-    ) -> ProbeOutcome {
-        self.measure_latency(endpoint, template, options)
+    fn sample(&self, endpoint: &Endpoint, options: &ProbeOptions) -> ProbeOutcome {
+        self.measure_latency(endpoint, options)
     }
 }
 
-impl crate::geo::GeoProber for FakeProber {
-    fn exit_ip_sample(
-        &self,
-        endpoint: &Endpoint,
-        _options: &ProbeOptions,
-        _cancel: &AtomicBool,
-    ) -> Result<crate::geo::ExitIp, String> {
-        if let Ok(mut calls) = self.geo_calls.lock() {
-            calls.push((endpoint.host.clone(), endpoint.port));
-        }
-        self.exits
+impl HostResolver for FakeProber {
+    fn resolve(&self, endpoint: &Endpoint) -> Result<IpAddr, String> {
+        if let Some(result) = self
+            .ips
             .lock()
             .ok()
-            .and_then(|exits| exits.get(&(endpoint.host.clone(), endpoint.port)).cloned())
-            .unwrap_or_else(|| Err("假探测器没有预设出口 IP".to_string()))
+            .and_then(|ips| ips.get(&(endpoint.host.clone(), endpoint.port)).cloned())
+        {
+            return result;
+        }
+        super::resolve_host(&endpoint.host)
     }
 }
 
@@ -216,19 +171,18 @@ mod tests {
             Attempt::no_response("超时"),
             Attempt::connect_failed("拒绝"),
         ]);
-        let template = NodeTemplate::default();
         let options = ProbeOptions::default();
 
         assert_eq!(
-            prober.measure_latency(&endpoint(), &template, &options).status,
+            prober.measure_latency(&endpoint(), &options).status,
             ProbeStatus::Ok
         );
         assert_eq!(
-            prober.measure_latency(&endpoint(), &template, &options).status,
+            prober.measure_latency(&endpoint(), &options).status,
             ProbeStatus::Timeout
         );
         assert_eq!(
-            prober.measure_latency(&endpoint(), &template, &options).status,
+            prober.measure_latency(&endpoint(), &options).status,
             ProbeStatus::Fail
         );
         assert_eq!(prober.calls().len(), 3);
@@ -246,33 +200,55 @@ mod tests {
                 vec![Attempt::connect_failed("拒绝")],
             ),
         ]);
-        let template = NodeTemplate::default();
         let options = ProbeOptions::default();
 
         assert_eq!(
             prober
-                .measure_latency(&Endpoint::new("104.16.1.1", 8443), &template, &options)
+                .measure_latency(&Endpoint::new("104.16.1.1", 8443), &options)
                 .latency_ms,
             Some(90)
         );
         assert_eq!(
             prober
-                .measure_latency(&Endpoint::new("104.16.1.1", 8443), &template, &options)
+                .measure_latency(&Endpoint::new("104.16.1.1", 8443), &options)
                 .latency_ms,
             Some(70)
         );
         // 序列用尽后重复最后一次。
         assert_eq!(
             prober
-                .measure_latency(&Endpoint::new("104.16.1.1", 8443), &template, &options)
+                .measure_latency(&Endpoint::new("104.16.1.1", 8443), &options)
                 .latency_ms,
             Some(70)
         );
         assert_eq!(
             prober
-                .measure_latency(&Endpoint::new("104.16.1.2", 8443), &template, &options)
+                .measure_latency(&Endpoint::new("104.16.1.2", 8443), &options)
                 .status,
             ProbeStatus::Fail
+        );
+    }
+
+    #[test]
+    fn 解析结果可以按地址预设() {
+        let prober = FakeProber::default().with_ips(vec![(
+            ("cdn.example.com", 443),
+            Ok("203.0.113.7".parse().unwrap()),
+        )]);
+        assert_eq!(
+            prober
+                .resolve(&Endpoint::new("cdn.example.com", 443))
+                .unwrap()
+                .to_string(),
+            "203.0.113.7"
+        );
+        // 没预设时按 IP 直接解析。
+        assert_eq!(
+            prober
+                .resolve(&Endpoint::new("104.16.1.1", 8443))
+                .unwrap()
+                .to_string(),
+            "104.16.1.1"
         );
     }
 }

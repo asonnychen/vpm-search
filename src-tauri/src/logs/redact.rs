@@ -1,8 +1,8 @@
 //! 日志脱敏。
 //!
-//! 节点凭据（UUID、password、token、secret）不允许出现在任何日志里，
+//! 凭据与密钥（UUID、password、token、secret）不允许出现在任何日志里，
 //! 一律替换成 `****`。规则对整行文本生效，操作日志、应用日志 JSON 行
-//! 与 sing-box 输出都走同一个函数。
+//! 与探测日志都走同一个函数。
 
 /// 替换后的占位符。
 pub const MASK: &str = "****";

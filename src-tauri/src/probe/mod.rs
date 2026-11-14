@@ -1,25 +1,22 @@
-//! 单条真连接延迟：为一条优选地址开临时 sing-box 链路并测一次往返。
+//! 直连边缘探测：不经过任何代理，直接对优选地址发起 TLS 请求。
 //!
-//! 设计要点（见 ADR-0001 与 ADR-0004）：
-//! - sing-box 作为 sidecar 随包内置，按需启动，测完即销毁进程与临时配置；
-//! - 探测请求只经本地 mixed 入站出去，不读取系统代理；
+//! 设计要点（见 ADR-0007 与 ADR-0004）：
+//! - 探测主机名 `speed.cloudflare.com` 被静态解析到「目标 IP + 目标端口」，
+//!   于是 TLS SNI 与 Host 都是探测主机名，TCP 连接却落在优选地址上；
+//! - 探测请求一律 `no_proxy()`，不读取系统代理；
 //! - 连接阶段未建立记「失败」，连上但总超时内没有响应记「超时」。
 
 pub mod batch;
-pub mod config;
+pub mod direct;
 pub mod fake;
-pub mod port;
-pub mod singbox;
-pub mod slot;
 pub mod speed;
 
-pub use singbox::SingBoxProber;
+pub use direct::DirectProber;
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-
-use crate::template::NodeTemplate;
 
 /// 连接超时允许的秒数范围。
 pub const MIN_CONNECT_TIMEOUT_S: u32 = 1;
@@ -28,45 +25,18 @@ pub const MAX_CONNECT_TIMEOUT_S: u32 = 10;
 /// 单次请求的总超时，固定 10 秒，不随设置变化。
 pub const REQUEST_TIMEOUT_S: u64 = 10;
 
-/// 探测用的 204 端点。
-pub const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
+/// 每条地址的延迟采样次数，取最小值。
+pub const LATENCY_SAMPLES: usize = 3;
 
-/// 204 端点返回非 204 状态码时的失败摘要。
-///
-/// 连接已建立但响应不符合契约（不是 204）仍归为「失败」而非「超时」：
-/// 这不是等不到响应，而是对端明确给了别的状态码，摘要里必须写明实际状态码。
-pub fn non_204_status(status: u16) -> String {
-    if status == 403 {
-        return WORKER_403_HINT.to_string();
-    }
-    format!("204 端点返回 HTTP {status}")
-}
+/// 探测主机名：TLS SNI 与 Host 都是它，连接却落在优选地址上。
+pub const PROBE_HOST: &str = "speed.cloudflare.com";
 
-/// 403 的可操作摘要：worker 拒绝了这次隧道，通常是模板与 worker 对不上。
-pub const WORKER_403_HINT: &str =
-    "worker 拒绝（403）：检查模板的 path / Host / UUID 是否与 worker 一致";
+/// 延迟探测端点；`bytes=0` 只取响应头，不计传输时间。
+pub const PROBE_URL: &str = "https://speed.cloudflare.com/__down?bytes=0";
 
-/// 一条错误摘要是否属于 worker 的 403 拒绝。
-///
-/// sing-box 的 ws 传输在升级阶段拿到 403 时会输出
-/// `unexpected HTTP response status: 403`，reqwest 侧把它包装成连接失败，
-/// 原文对用户毫无意义，统一换成语义化的提示。
-fn is_worker_403(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("unexpected http response status: 403")
-        || lower.contains("unexpected http response status 403")
-        || lower.contains("http 403")
-        || lower.contains("status 403")
-        || lower.contains("status code: 403")
-}
-
-/// 把底层错误摘要翻译成可操作的文案；其它错误原样返回（去掉首尾空白）。
+/// 把底层错误摘要收拾成可读文案（去掉首尾空白）。
 pub fn describe_error(error: &str) -> String {
-    if is_worker_403(error) {
-        WORKER_403_HINT.to_string()
-    } else {
-        error.trim().to_string()
-    }
+    error.trim().to_string()
 }
 
 /// 一条待测优选地址。
@@ -159,9 +129,9 @@ impl ProbeOutcome {
 /// 一次探测尝试的原始观测，分类只依赖这三个事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attempt {
-    /// 连接阶段是否已建立（本地入站能连上且出站握手完成）。
+    /// 连接阶段是否已建立（TCP 与 TLS 握手完成）。
     pub connected: bool,
-    /// 收到 204 响应的往返毫秒数；`None` 表示没有收到。
+    /// 收到响应的往返毫秒数；`None` 表示没有收到。
     pub responded_ms: Option<u64>,
     /// 失败原因，成功时为 `None`。
     pub error: Option<String>,
@@ -209,7 +179,7 @@ pub fn classify(attempt: Attempt) -> ProbeOutcome {
 /// 逐行实时事件（`probe:row`）的数据部分。
 ///
 /// `runId` 与 `kind`（`delay` / `speed` / `geo`）由命令层补齐，这里只管一行地址的结论。
-/// 事件里绝不出现凭据：只有地址、状态与测量值。
+/// `colo` 是历史字段：机房已废弃，恒为 `null`，保留它只为不破坏事件契约。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RowEvent {
@@ -251,7 +221,8 @@ impl RowEvent {
     }
 }
 
-/// 一次探测的参数。连接超时来自设置（1–10 秒），总超时固定 10 秒。#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 一次探测的参数。连接超时来自设置（1–10 秒），总超时固定 10 秒。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeOptions {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -274,40 +245,55 @@ impl ProbeOptions {
     }
 }
 
-/// 三个动作的统一接口。本期只实现测延迟，其余两个留空待阶段 8 / 9。
-pub trait Prober: Send + Sync {
-    /// 测一次真连接延迟。
-    fn measure_latency(
-        &self,
-        endpoint: &Endpoint,
-        template: &NodeTemplate,
-        options: &ProbeOptions,
-    ) -> ProbeOutcome;
-
-    /// 测速；阶段 8 实现。
-    #[allow(dead_code)] // 阶段 8 接入
-    fn measure_speed(
-        &self,
-        _endpoint: &Endpoint,
-        _template: &NodeTemplate,
-        _options: &ProbeOptions,
-    ) -> Result<f64, String> {
-        Err("测速将在阶段 8 实现".to_string())
+/// 把域名解析成 IP：IP 直接用，域名走系统 DNS。
+pub fn resolve_host(host: &str) -> Result<IpAddr, String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("地址为空".to_string());
     }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+    use std::net::ToSocketAddrs;
+    let mut addresses = (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("解析 {host} 失败：{e}"))?;
+    addresses
+        .next()
+        .map(|address| address.ip())
+        .ok_or_else(|| format!("解析 {host} 没有得到任何 IP"))
+}
+
+/// 把域名解析成 IP 的能力：真探测器走系统 DNS，假探测器返回预设值。
+pub trait HostResolver: Send + Sync {
+    fn resolve(&self, endpoint: &Endpoint) -> Result<IpAddr, String>;
+}
+
+/// 系统 DNS 解析器。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemResolver;
+
+impl HostResolver for SystemResolver {
+    fn resolve(&self, endpoint: &Endpoint) -> Result<IpAddr, String> {
+        resolve_host(&endpoint.host)
+    }
+}
+
+/// 测延迟的统一接口。
+pub trait Prober: Send + Sync {
+    /// 采样 [`LATENCY_SAMPLES`] 次并取最小值。
+    fn measure_latency(&self, endpoint: &Endpoint, options: &ProbeOptions) -> ProbeOutcome;
 }
 
 /// 一条单条测试的输入。
 pub struct SingleProbe<'a> {
     pub endpoint: &'a Endpoint,
-    pub template: &'a NodeTemplate,
     pub alias: &'a str,
     pub options: ProbeOptions,
 }
 
 /// 跑一条地址的测试并落库：一条测试轮次 + 一条结果。
-///
-/// 阶段 6 只写单条；阶段 7 的整轮并发会复用同一套落库结构。
-#[cfg_attr(not(test), allow(dead_code))] // 命令层直接调 measure + persist_single
+#[cfg_attr(not(test), allow(dead_code))] // 命令层走 measure_latency + persist_single
 pub fn run_single(
     prober: &dyn Prober,
     store: &crate::store::Store,
@@ -315,7 +301,7 @@ pub fn run_single(
     started_at: &str,
     probe: SingleProbe<'_>,
 ) -> Result<ProbeOutcome, String> {
-    let outcome = prober.measure_latency(probe.endpoint, probe.template, &probe.options);
+    let outcome = prober.measure_latency(probe.endpoint, &probe.options);
     persist_single(store, run_id, started_at, &probe, &outcome)?;
     Ok(outcome)
 }
@@ -332,14 +318,12 @@ pub fn persist_single(
 ) -> Result<(), String> {
     let finished_at = crate::logs::now_iso8601();
 
-    // 参数快照只记协议与超时，凭据绝不入库。
+    // 参数快照只记协议与超时；探测不涉及任何凭据。
     let params = serde_json::json!({
-        "kind": probe.template.kind,
-        "transport": probe.template.transport,
-        "tls": probe.template.tls,
+        "mode": "latency",
         "connectTimeoutS": probe.options.connect_timeout.as_secs(),
         "requestTimeoutS": probe.options.request_timeout.as_secs(),
-        "samples": 1,
+        "samples": LATENCY_SAMPLES,
     });
 
     store
@@ -391,27 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn 连接成功但返回非_204_记为失败并写明状态码() {
-        let outcome = classify(Attempt::connect_failed(non_204_status(503)));
-        assert_eq!(outcome.status, ProbeStatus::Fail);
-        assert_eq!(outcome.latency_ms, None);
-        assert_eq!(outcome.error.as_deref(), Some("204 端点返回 HTTP 503"));
-    }
-
-    #[test]
-    fn worker_返回_403_时换成可操作摘要且仍记失败() {
-        let outcome = classify(Attempt::connect_failed(
-            "连接阶段失败：error sending request for url: unexpected HTTP response status: 403",
-        ));
-
-        assert_eq!(outcome.status, ProbeStatus::Fail);
-        assert_eq!(outcome.latency_ms, None);
-        assert_eq!(outcome.error.as_deref(), Some(WORKER_403_HINT));
-
-        // 204 端点直接给出 403 也是同一种语义。
-        assert_eq!(non_204_status(403), WORKER_403_HINT);
-        assert_eq!(non_204_status(502), "204 端点返回 HTTP 502");
-        // 其它错误原样保留，只去掉首尾空白。
+    fn 错误摘要只去掉首尾空白() {
         assert_eq!(describe_error("  连接被拒绝  "), "连接被拒绝");
     }
 
@@ -441,20 +405,25 @@ mod tests {
         assert_eq!(ProbeOutcome::ok(0).latency_ms, Some(1));
     }
 
-    fn single<'a>(endpoint: &'a Endpoint, template: &'a NodeTemplate) -> SingleProbe<'a> {
-        SingleProbe {
-            endpoint,
-            template,
-            alias: "测试别名",
-            options: ProbeOptions::default(),
-        }
+    #[test]
+    fn ip_直接使用而域名走_dns() {
+        assert_eq!(
+            resolve_host("104.16.1.1").unwrap(),
+            "104.16.1.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_host("2606:4700::1111").unwrap(),
+            "2606:4700::1111".parse::<IpAddr>().unwrap()
+        );
+        assert!(resolve_host("  ").is_err());
+        // localhost 一定能在本机解析出来。
+        assert!(resolve_host("localhost").is_ok());
     }
 
     #[test]
     fn 单条测试落库一条轮次与一条结果() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let prober = fake::FakeProber::always_ok(120);
-        let template = NodeTemplate::default();
         let endpoint = Endpoint::new("104.16.1.1", 8443);
 
         let outcome = run_single(
@@ -462,7 +431,11 @@ mod tests {
             &store,
             "run-1",
             "2026-11-13T00:00:00.000Z",
-            single(&endpoint, &template),
+            SingleProbe {
+                endpoint: &endpoint,
+                alias: "测试别名",
+                options: ProbeOptions::default(),
+            },
         )
         .unwrap();
 
@@ -485,7 +458,6 @@ mod tests {
     fn 失败的测试也落库且不计成功() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let prober = fake::FakeProber::new(vec![Attempt::connect_failed("连接被拒绝")]);
-        let template = NodeTemplate::default();
         let endpoint = Endpoint::new("104.16.2.2", 2053);
 
         let outcome = run_single(
@@ -493,7 +465,11 @@ mod tests {
             &store,
             "run-2",
             "2026-11-13T00:00:01.000Z",
-            single(&endpoint, &template),
+            SingleProbe {
+                endpoint: &endpoint,
+                alias: "",
+                options: ProbeOptions::default(),
+            },
         )
         .unwrap();
 

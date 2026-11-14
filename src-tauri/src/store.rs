@@ -65,10 +65,8 @@ CREATE TABLE IF NOT EXISTS test_result (
     status     TEXT NOT NULL,
     latency_ms INTEGER,
     speed_mbps REAL,
-    exit_ip    TEXT,
     geo_zh     TEXT,
     geo_en     TEXT,
-    colo       TEXT,
     error      TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -93,10 +91,10 @@ ALTER TABLE test_result ADD COLUMN speed_status TEXT NOT NULL DEFAULT 'untested'
 ALTER TABLE test_result ADD COLUMN speed_error TEXT;
 "#;
 
-/// 阶段 9：归属地补上国家码，并新增按出口 IP 的查询缓存。
+/// 阶段 9：归属地补上国家码，并新增按 IP 的查询缓存。
 ///
-/// `test_result` 的 `exit_ip` / `geo_zh` / `geo_en` / `colo` 在阶段 2 就留好了，
-/// 这里只补国家码；缓存表让同一出口 IP 只查一次。
+/// `test_result` 的 `geo_zh` / `geo_en` 在阶段 2 就留好了，这里只补国家码；
+/// 缓存表让同一 IP 只查一次。旧库里的 `exit_ip` / `colo` 列不再读写，也不删除。
 const SCHEMA_V6: &str = r#"
 ALTER TABLE test_result ADD COLUMN geo_country TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS geo_cache (
@@ -108,81 +106,6 @@ CREATE TABLE IF NOT EXISTS geo_cache (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 "#;
-
-/// 阶段 5：节点模板补上凭据与传输细节，并记录当前选中的模板。
-/// 旧模板是阶段 2 的 JSON，只含 id / name / kind / transport / tls / sni / path，
-/// 这里逐个补齐缺失字段，保留已有值，不重建、不清空。
-fn migrate_node_templates(tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    let raw: Option<String> = tx
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'node_templates'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(raw) = raw else {
-        return Ok(());
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        // 已经损坏的 JSON 交给读取逻辑回落默认值，迁移不覆盖用户数据。
-        return Ok(());
-    };
-    let Some(items) = value.as_array_mut() else {
-        return Ok(());
-    };
-
-    let defaults: [(&str, serde_json::Value); 7] = [
-        ("server", serde_json::json!("")),
-        ("port", serde_json::json!(443)),
-        ("uuid", serde_json::json!("")),
-        ("password", serde_json::json!("")),
-        ("method", serde_json::json!("")),
-        ("host", serde_json::json!("")),
-        ("serviceName", serde_json::json!("")),
-    ];
-    for item in items.iter_mut() {
-        let Some(object) = item.as_object_mut() else {
-            continue;
-        };
-        for (key, default) in &defaults {
-            object
-                .entry((*key).to_string())
-                .or_insert_with(|| default.clone());
-        }
-    }
-
-    let normalized = serde_json::to_string(&value)?;
-    tx.execute(
-        "UPDATE settings
-         SET value = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE key = 'node_templates'",
-        rusqlite::params![normalized],
-    )?;
-
-    // 首次升级时把当前模板指向第一条，保证界面有选中项。
-    let active_exists: Option<String> = tx
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'active_template_id'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if active_exists.is_none() {
-        let first_id = value
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(|item| item.get("id"))
-            .and_then(|id| id.as_str())
-            .unwrap_or("")
-            .to_string();
-        tx.execute(
-            "INSERT INTO settings (key, value) VALUES ('active_template_id', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![serde_json::to_string(&first_id)?],
-        )?;
-    }
-    Ok(())
-}
 
 #[derive(Debug)]
 #[allow(dead_code)] // 阶段 3 起会用到全部变体
@@ -280,9 +203,6 @@ impl Store {
         if version < 2 {
             tx.execute_batch(SCHEMA_V2)?;
         }
-        if version < 3 {
-            migrate_node_templates(&tx)?;
-        }
         if version < 4 {
             tx.execute_batch(SCHEMA_V4)?;
         }
@@ -356,33 +276,17 @@ impl Store {
     }
 
     /// 读整份设置：缺失或单个字段损坏时只回落该字段的默认值。
+    ///
+    /// 旧版本写下的 `node_templates` / `active_template_id` 已不在 [`SETTING_KEYS`]
+    /// 里，读取时自然被忽略；列宽数组长度不符（旧版 14 列）时整体回落默认值。
     pub fn load_settings(&self) -> Result<Settings> {
         let defaults = Settings::default();
-        let node_templates: Vec<crate::template::NodeTemplate> = self
-            .read_json("node_templates")?
-            .unwrap_or(defaults.node_templates);
-        // 当前模板被删除或 id 不存在时回落到第一条，界面不会出现空选中。
-        let mut active_template_id = self
-            .read_json::<String>("active_template_id")?
-            .unwrap_or(defaults.active_template_id);
-        if !active_template_id.is_empty()
-            && !node_templates
-                .iter()
-                .any(|template| template.id == active_template_id)
-        {
-            active_template_id = node_templates
-                .first()
-                .map(|template| template.id.clone())
-                .unwrap_or_default();
-        }
 
         Ok({
             let mut settings = Settings {
                 last_input: self
                     .read_json("last_input")?
                     .unwrap_or(defaults.last_input),
-                node_templates,
-                active_template_id,
                 max_latency_ms: self
                     .read_json("max_latency_ms")?
                     .unwrap_or(defaults.max_latency_ms),
@@ -409,6 +313,7 @@ impl Store {
             };
             // 旧库里存过的只读参数在这里钳回契约值，界面与日志不会出现矛盾值。
             settings.normalize_reserved();
+            settings.normalize_column_widths();
             settings
         })
     }
@@ -707,7 +612,7 @@ impl Store {
 
     /// 把归属地写进该轮已有的结果行；没有行时才新建（状态记未测）。
     ///
-    /// 只更新 `exit_ip` / `geo_*` / `colo` 五列，绝不触碰延迟、速度与采样，
+    /// 只更新 `geo_*` 三列，绝不触碰延迟、速度与采样，
     /// 因此归属地查询失败或重查都不会覆盖已有测试结论。
     pub fn upsert_test_result_geo(
         &self,
@@ -718,17 +623,15 @@ impl Store {
     ) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE test_result
-             SET exit_ip = ?4, geo_country = ?5, geo_zh = ?6, geo_en = ?7, colo = ?8
+             SET geo_country = ?4, geo_zh = ?5, geo_en = ?6
              WHERE run_id = ?1 AND host = ?2 AND port = ?3",
             rusqlite::params![
                 run_id,
                 endpoint.host,
                 i64::from(endpoint.port),
-                info.exit_ip,
                 info.country,
                 info.zh,
                 info.en,
-                info.colo,
             ],
         )?;
         if changed > 0 {
@@ -738,24 +641,22 @@ impl Store {
         self.conn.execute(
             "INSERT INTO test_result
                  (run_id, host, port, alias, status, latency_ms,
-                  exit_ip, geo_country, geo_zh, geo_en, colo)
-             VALUES (?1, ?2, ?3, ?4, 'untested', NULL, ?5, ?6, ?7, ?8, ?9)",
+                  geo_country, geo_zh, geo_en)
+             VALUES (?1, ?2, ?3, ?4, 'untested', NULL, ?5, ?6, ?7)",
             rusqlite::params![
                 run_id,
                 endpoint.host,
                 i64::from(endpoint.port),
                 alias,
-                info.exit_ip,
                 info.country,
                 info.zh,
                 info.en,
-                info.colo,
             ],
         )?;
         Ok(())
     }
 
-    /// 写一条出口 IP 的归属地缓存；同一 IP 覆盖为最新结论。
+    /// 写一个 IP 的归属地缓存；同一 IP 覆盖为最新结论。
     pub fn upsert_geo_cache(&self, ip: &str, record: &crate::geo::GeoRecord) -> Result<()> {
         self.conn.execute(
             "INSERT INTO geo_cache (ip, country, zh, en, asn, updated_at)
@@ -817,7 +718,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT run_id, host, port, alias, status, latency_ms, error, samples_json,
                     speed_mbps, speed_status, speed_error,
-                    exit_ip, geo_country, geo_zh, geo_en, colo
+                    geo_country, geo_zh, geo_en
              FROM test_result
              WHERE run_id = ?1
              ORDER BY id",
@@ -836,11 +737,9 @@ impl Store {
                 speed_mbps: row.get(8)?,
                 speed_status: row.get(9)?,
                 speed_error: row.get(10)?,
-                exit_ip: row.get(11)?,
-                geo_country: row.get(12)?,
-                geo_zh: row.get(13)?,
-                geo_en: row.get(14)?,
-                colo: row.get(15)?,
+                geo_country: row.get(11)?,
+                geo_zh: row.get(12)?,
+                geo_en: row.get(13)?,
             })
         })?;
         let mut results = Vec::new();
@@ -1003,19 +902,15 @@ pub struct TestResultRow {
     pub speed_status: String,
     /// 测速失败原因，成功时为 `None`。
     pub speed_error: Option<String>,
-    /// 经代理观测到的出口 IP；未查询时为 `None`。
-    pub exit_ip: Option<String>,
-    /// 出口 IP 的 ISO 国家码；Cloudflare 落地为空。
+    /// 地址本身的 ISO 国家码；未查询时为空。
     pub geo_country: Option<String>,
     /// 归属地中文名。
     pub geo_zh: Option<String>,
     /// 归属地英文名。
     pub geo_en: Option<String>,
-    /// Cloudflare 机房三字码；非 CF 落地为空。
-    pub colo: Option<String>,
 }
 
-/// `geo_cache` 的一行：出口 IP 到归属地的缓存。
+/// `geo_cache` 的一行：IP 到归属地的缓存。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeoCacheRow {
     pub ip: String,
@@ -1086,14 +981,6 @@ pub struct PoolEntryRow {
 fn settings_to_pairs(settings: &Settings) -> Result<Vec<(&'static str, String)>> {
     Ok(vec![
         ("last_input", serde_json::to_string(&settings.last_input)?),
-        (
-            "node_templates",
-            serde_json::to_string(&settings.node_templates)?,
-        ),
-        (
-            "active_template_id",
-            serde_json::to_string(&settings.active_template_id)?,
-        ),
         (
             "max_latency_ms",
             serde_json::to_string(&settings.max_latency_ms)?,
@@ -1186,7 +1073,7 @@ mod tests {
         settings.column_widths = DEFAULT_COLUMN_WIDTHS.map(|w| w + 4).to_vec();
         settings.log_retention.operation_days = 7;
         settings.log_retention.app_days = 14;
-        settings.log_retention.singbox_days = 60;
+        settings.log_retention.probe_days = 60;
 
         store.save_settings(&settings).unwrap();
         let loaded = store.load_settings().unwrap();
@@ -1201,84 +1088,31 @@ mod tests {
     }
 
     #[test]
-    fn 多条模板与当前选中项重启后仍在() {
-        let (_dir, path) = temp_db();
-        let mut first = crate::template::NodeTemplate::default();
-        first.server = "a.example.com".to_string();
-        first.uuid = "550e8400-e29b-41d4-a716-446655440000".to_string();
-        let mut second = first.clone();
-        second.id = "t2".to_string();
-        second.name = "备用 Trojan".to_string();
-        second.kind = "trojan".to_string();
-        second.uuid.clear();
-        second.password = "hunter2".to_string();
-        second.port = 8443;
-
-        {
-            let store = Store::open(&path).unwrap();
-            let settings = Settings {
-                node_templates: vec![first.clone(), second.clone()],
-                active_template_id: "t2".to_string(),
-                ..Settings::default()
-            };
-            store.save_settings(&settings).unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let loaded = store.load_settings().unwrap();
-        assert_eq!(loaded.node_templates.len(), 2);
-        assert_eq!(loaded.active_template_id, "t2");
-        assert_eq!(loaded.node_templates[1].password, "hunter2");
-        assert_eq!(
-            loaded.node_templates[0].uuid,
-            "550e8400-e29b-41d4-a716-446655440000"
-        );
-    }
-
-    #[test]
-    fn 当前模板不存在时回落到第一条() {
+    fn 旧库里的模板字段被忽略且不影响读取() {
         let store = Store::open_in_memory().unwrap();
         store.save_settings(&Settings::default()).unwrap();
+        // 旧版本留下的 key 不在白名单里，读写都被忽略。
         store
-            .set_setting("active_template_id", "\"已经删掉的模板\"")
+            .conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('node_templates', ?1)",
+                [r#"[{"id":"old","name":"旧模板"}]"#],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('active_template_id', '\"old\"')",
+                [],
+            )
             .unwrap();
 
         let loaded = store.load_settings().unwrap();
-        assert_eq!(loaded.active_template_id, loaded.node_templates[0].id);
-    }
-
-    #[test]
-    fn 从阶段二的旧模板升级会补齐凭据字段() {
-        let (_dir, path) = temp_db();
-        {
-            // 模拟阶段 2/3/4 的库：schema 到 V2，模板只有旧字段。
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(SCHEMA_V1).unwrap();
-            conn.execute_batch(SCHEMA_V2).unwrap();
-            conn.pragma_update(None, "user_version", 2).unwrap();
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES ('node_templates', ?1)",
-                [r#"[{"id":"old","name":"旧模板","kind":"vless","transport":"ws","tls":true,"sni":"cdn.example.com","path":"/ws"}]"#],
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        let settings = store.load_settings().unwrap();
-        let template = &settings.node_templates[0];
-        assert_eq!(template.id, "old");
-        assert_eq!(template.sni, "cdn.example.com");
-        assert_eq!(template.path, "/ws");
-        // 新字段补齐为默认值，旧值不丢。
-        assert_eq!(template.port, 443);
-        assert_eq!(template.server, "");
-        assert_eq!(template.uuid, "");
-        assert_eq!(settings.active_template_id, "old");
-
-        // 迁移后保存再读回仍然一致。
-        store.save_settings(&settings).unwrap();
-        assert_eq!(store.load_settings().unwrap(), settings);
+        assert_eq!(loaded, Settings::default());
+        // 保存时也不会把它们写回去。
+        store.save_settings(&loaded).unwrap();
+        assert_eq!(store.get_setting("node_templates").unwrap(), None);
+        assert_eq!(store.get_setting("active_template_id").unwrap(), None);
     }
 
     #[test]

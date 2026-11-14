@@ -1,14 +1,14 @@
 //! 导出 txt（阶段 10）。
 //!
-//! 每行 `host:port#<归属地> | <来源标识>`，归属地为「中文 / English / 机房」，
-//! 无机房时两段；归属地缺失时该段留空但保留 `#` 与 ` | `。
+//! 每行 `host:port#<归属地> \| <来源标识>`，归属地为「中文 / English」两段；
+//! 归属地缺失时该段留空但保留 `#` 与 ` \| `。
 //! 内容为 UTF-8 无 BOM、LF 换行。
 
 use std::path::Path;
 
 use serde::Deserialize;
 
-/// 一条导出行的归属地三段。空串表示该段没有值。
+/// 一条导出行的归属地两段。空串表示该段没有值。
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GeoText {
@@ -16,8 +16,6 @@ pub struct GeoText {
     pub zh: String,
     #[serde(default)]
     pub en: String,
-    #[serde(default)]
-    pub colo: Option<String>,
 }
 
 /// 一条待导出的优选地址。`alias` 只用于识别，不进入导出内容。
@@ -41,9 +39,7 @@ impl ExportRow {
     }
 }
 
-/// 归属地段：`中文 / English`，有机房时再接 ` / 机房`；整段缺失时为空串。
-///
-/// 中文与英文都缺时视为没有归属地，机房不再单独输出（避免出现 ` /  / LAX`）。
+/// 归属地段：`中文 / English`；整段缺失时为空串。
 pub fn geo_text(geo: Option<&GeoText>) -> String {
     let Some(geo) = geo else {
         return String::new();
@@ -53,13 +49,7 @@ pub fn geo_text(geo: Option<&GeoText>) -> String {
     if zh.is_empty() && en.is_empty() {
         return String::new();
     }
-    let colo = geo.colo.as_deref().unwrap_or("").trim();
-    let mut text = format!("{zh} / {en}");
-    if !colo.is_empty() {
-        text.push_str(" / ");
-        text.push_str(colo);
-    }
-    text
+    format!("{zh} / {en}")
 }
 
 /// 按导出格式拼装整份内容；每行以 LF 结尾，末尾也带一个换行。
@@ -119,11 +109,10 @@ mod tests {
     use super::*;
     use chrono::{Local, TimeZone};
 
-    fn geo(zh: &str, en: &str, colo: Option<&str>) -> Option<GeoText> {
+    fn geo(zh: &str, en: &str) -> Option<GeoText> {
         Some(GeoText {
             zh: zh.to_string(),
             en: en.to_string(),
-            colo: colo.map(str::to_string),
         })
     }
 
@@ -149,40 +138,28 @@ mod tests {
     }
 
     #[test]
-    fn 三段归属地与来源标识按格式拼装() {
+    fn 两段归属地与来源标识按格式拼装() {
         let rows = vec![row(
             "104.16.1.1",
             8443,
             "备注",
             "BestCF·vps789/top10.txt",
-            geo("加拿大", "Canada", Some("LAX")),
+            geo("加拿大", "Canada"),
         )];
         assert_eq!(
             line_of(&rows),
-            "104.16.1.1:8443#加拿大 / Canada / LAX | BestCF·vps789/top10.txt\n"
+            "104.16.1.1:8443#加拿大 / Canada | BestCF·vps789/top10.txt\n"
         );
     }
 
     #[test]
-    fn 无机房时只有两段仍用斜杠连接() {
+    fn 归属地两段用斜杠连接() {
         let rows = vec![row(
             "203.0.113.9",
             2053,
             "",
             "BestCF·all.txt",
-            geo("日本", "Japan", None),
-        )];
-        assert_eq!(
-            line_of(&rows),
-            "203.0.113.9:2053#日本 / Japan | BestCF·all.txt\n"
-        );
-        // 空串的机房与 None 等价，不产生第三段。
-        let rows = vec![row(
-            "203.0.113.9",
-            2053,
-            "",
-            "BestCF·all.txt",
-            geo("日本", "Japan", Some("")),
+            geo("日本", "Japan"),
         )];
         assert_eq!(
             line_of(&rows),
@@ -205,7 +182,7 @@ mod tests {
             8443,
             "东京|高速|备用",
             "BestCF·all.txt",
-            geo("加拿大", "Canada", None),
+            geo("加拿大", "Canada"),
         )];
         let text = line_of(&rows);
         assert_eq!(
@@ -219,9 +196,9 @@ mod tests {
     #[test]
     fn 有勾选时只导出勾选行且顺序跟表格() {
         let rows = vec![
-            row("a.example", 443, "", "s1", geo("加拿大", "Canada", None)),
-            row("b.example", 443, "", "s1", geo("日本", "Japan", None)),
-            row("c.example", 443, "", "s2", geo("美国", "United States", None)),
+            row("a.example", 443, "", "s1", geo("加拿大", "Canada")),
+            row("b.example", 443, "", "s1", geo("日本", "Japan")),
+            row("c.example", 443, "", "s2", geo("美国", "United States")),
         ];
         // 表格顺序是 b → a；勾选只勾了 a 与 c。
         let selected = vec!["a.example:443".to_string(), "c.example:443".to_string()];
@@ -260,10 +237,9 @@ mod tests {
     #[test]
     fn 缺失归属地的条数按选中范围统计() {
         let rows = vec![
-            row("a.example", 443, "", "s1", geo("加拿大", "Canada", None)),
+            row("a.example", 443, "", "s1", geo("加拿大", "Canada")),
             row("b.example", 443, "", "s1", None),
-            row("c.example", 443, "", "s2", geo("", "", Some("LAX"))),
-            row("d.example", 443, "", "s2", geo("", "", None)),
+            row("c.example", 443, "", "s2", geo("", "")),
         ];
         let chosen = select_rows(
             &rows,
@@ -274,16 +250,9 @@ mod tests {
                 "c.example:443".to_string(),
             ],
         );
-        // b 完全没有归属地；c 只有机房、没有中英文名，同样算缺归属地。
+        // b 与 c 的中英文名都为空，算缺归属地。
         assert_eq!(missing_geo(&chosen), 2);
-        assert_eq!(
-            geo_text(Some(&GeoText {
-                zh: String::new(),
-                en: String::new(),
-                colo: Some("LAX".into()),
-            })),
-            ""
-        );
+        assert_eq!(geo_text(Some(&GeoText::default())), "");
     }
 
     #[test]
@@ -297,7 +266,7 @@ mod tests {
     #[test]
     fn 导出内容是_utf8_无_bom_且只用_lf_换行() {
         let rows = vec![
-            row("a.example", 443, "", "s1", geo("加拿大", "Canada", None)),
+            row("a.example", 443, "", "s1", geo("加拿大", "Canada")),
             row("b.example", 443, "", "s1", None),
         ];
         let refs: Vec<&ExportRow> = rows.iter().collect();

@@ -5,7 +5,6 @@ mod probe;
 mod settings;
 mod sources;
 mod store;
-mod template;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,28 +19,18 @@ use store::{PoolEntryRow, PoolSourceRow, Store, TestRunSummaryRow};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
-use logs::{AppLogRecord, LogEntry, LogKind, LogLevel, LogWriter, LogsSnapshot, SingboxLog};
+use logs::{AppLogRecord, LogEntry, LogKind, LogLevel, LogWriter, LogsSnapshot};
 use probe::Prober;
 
 /// 启动时与界面初次加载读回的日志行数上限。
 const LOG_READ_LIMIT: usize = 500;
 
-/// 随包内置的 sing-box 可执行文件名（Tauri externalBin 按目标三元组命名）。
-const SINGBOX_BINARY: &str = "sing-box-x86_64-pc-windows-msvc.exe";
-
-/// Tauri 打包时给 sidecar 用的名字：去掉目标三元组后缀。
-const SINGBOX_BUNDLED_BINARY: &str = "sing-box.exe";
-
-/// 应用级共享状态：数据库连接、三类日志写入器与 sing-box 日志通道。
+/// 应用级共享状态：数据库连接、三类日志写入器与归属地查询器。
 pub struct AppState {
     /// 打开失败时为 `None`，此时命令返回错误但界面照常可用。
     store: Mutex<Option<Store>>,
     logs: Arc<LogWriter>,
-    /// sing-box 子进程输出统一从这里落盘。
-    singbox: Arc<SingboxLog>,
-    /// 临时配置目录，测完即删。
-    temp_dir: PathBuf,
-    /// 归属地查询器：离线库优先、在线兜底、按出口 IP 缓存。
+    /// 归属地查询器：离线库优先、在线兜底、按 IP 缓存。
     geo: Arc<geo::GeoResolver>,
     /// 正在跑的一轮批量测试；停止按钮通过它发信号。
     batch: Mutex<Option<Arc<BatchControl>>>,
@@ -211,48 +200,10 @@ fn save_settings(
                         "logRetention": {
                             "operationDays": settings.log_retention.operation_days,
                             "appDays": settings.log_retention.app_days,
-                            "singboxDays": settings.log_retention.singbox_days,
+                            "probeDays": settings.log_retention.probe_days,
                         },
-                        "templates": settings.node_templates.len(),
-                        "activeTemplate": settings
-                            .node_templates
-                            .iter()
-                            .find(|template| template.id == settings.active_template_id)
-                            .map(|template| template.name.clone()),
                     })),
             );
-
-            // 模板的新增 / 重命名 / 删除 / 切换各留一条操作日志，只记名称与数量。
-            let templates_changed = previous
-                .as_ref()
-                .is_none_or(|old| old.node_templates != settings.node_templates);
-            if templates_changed {
-                log_operation(
-                    state.inner(),
-                    &app,
-                    LogLevel::Info,
-                    &trace,
-                    &format!("节点模板已更新：共 {} 条", settings.node_templates.len()),
-                );
-            }
-            let active_changed = previous
-                .as_ref()
-                .is_none_or(|old| old.active_template_id != settings.active_template_id);
-            if active_changed {
-                let name = settings
-                    .node_templates
-                    .iter()
-                    .find(|template| template.id == settings.active_template_id)
-                    .map(|template| template.name.as_str())
-                    .unwrap_or("无");
-                log_operation(
-                    state.inner(),
-                    &app,
-                    LogLevel::Info,
-                    &trace,
-                    &format!("已切换节点模板：{name}"),
-                );
-            }
 
             // 保留天数修改后立即生效；其余设置保存不重复触发清理。
             if previous.as_ref().map(|old| old.log_retention) != Some(settings.log_retention) {
@@ -262,10 +213,10 @@ fn save_settings(
                     LogLevel::Info,
                     &trace,
                     &format!(
-                        "日志保留期已更新：操作 {} 天 / 应用 {} 天 / sing-box {} 天",
+                        "日志保留期已更新：操作 {} 天 / 应用 {} 天 / 探测 {} 天",
                         settings.log_retention.operation_days,
                         settings.log_retention.app_days,
-                        settings.log_retention.singbox_days
+                        settings.log_retention.probe_days
                     ),
                 );
                 for (_, _, entry) in state
@@ -288,87 +239,6 @@ fn save_settings(
         ),
     }
     saved
-}
-
-/// 解析一条分享链接成节点模板。失败时返回可读错误，不写入任何东西。
-///
-/// 链接本身含凭据，绝不写进日志；日志只记协议、名称与脱敏后的摘要。
-#[tauri::command]
-fn parse_node_link(
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-    link: String,
-) -> Result<template::NodeTemplate, String> {
-    let trace = logs::new_trace_id();
-    let started = Instant::now();
-    match template::parse_link(&link) {
-        Ok(mut parsed) => {
-            parsed.id = format!("tpl-{}", logs::new_span_id());
-            let summary = parsed.summary();
-            log_app(
-                state.inner(),
-                &app,
-                AppLogRecord::new(LogLevel::Info, "template", "template.parse")
-                    .trace(&trace)
-                    .duration(started.elapsed().as_millis() as u64)
-                    .params(serde_json::json!({
-                        "kind": parsed.kind,
-                        "transport": parsed.transport,
-                        "tls": parsed.tls,
-                    }))
-                    .result(serde_json::json!({ "template": summary })),
-            );
-            Ok(parsed)
-        }
-        Err(error) => {
-            let message = error.to_string();
-            log_app(
-                state.inner(),
-                &app,
-                AppLogRecord::new(LogLevel::Error, "template", "template.parse")
-                    .trace(&trace)
-                    .duration(started.elapsed().as_millis() as u64)
-                    .error(&message, None),
-            );
-            log_operation(
-                state.inner(),
-                &app,
-                LogLevel::Error,
-                &trace,
-                &format!("节点模板解析失败：{message}"),
-            );
-            Err(message)
-        }
-    }
-}
-
-/// sing-box 可执行文件的候选路径：打包后与主程序同目录 → 资源目录 → 开发期 binaries。
-fn singbox_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let resource_dir = app.path().resource_dir().ok();
-    singbox_candidate_paths(exe_dir.as_deref(), resource_dir.as_deref())
-}
-
-/// 纯函数版候选路径，便于测试打包后的文件名差异。
-///
-/// Tauri 打包 sidecar 时会把 `sing-box-<target-triple>.exe` 改名为 `sing-box.exe`，
-/// 所以两种名字都要找，否则安装后会出现「未找到 sing-box」。
-fn singbox_candidate_paths(exe_dir: Option<&Path>, resource_dir: Option<&Path>) -> Vec<PathBuf> {
-    let names = [SINGBOX_BINARY, SINGBOX_BUNDLED_BINARY];
-    let mut candidates = Vec::new();
-    for dir in [exe_dir, resource_dir].into_iter().flatten() {
-        for name in names {
-            candidates.push(dir.join(name));
-        }
-    }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("binaries")
-            .join(SINGBOX_BINARY),
-    );
-    candidates
 }
 
 /// 内置离线归属地库的候选路径：打包后与主程序同目录 → 资源目录 → 开发期 resources。
@@ -404,25 +274,17 @@ fn geo_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     candidates
 }
 
-fn resolve_singbox(app: &tauri::AppHandle) -> Result<PathBuf, String> {    probe::singbox::pick_existing(&singbox_candidates(app)).ok_or_else(|| {
-        format!(
-            "未找到 sing-box（{SINGBOX_BINARY}），请先运行 scripts/fetch-singbox.ps1"
-        )
-    })
-}
-
 /// 真正的探测在阻塞线程里跑，避免占住异步运行时。
 fn probe_blocking(
     app: &tauri::AppHandle,
     endpoint: &probe::Endpoint,
     alias: &str,
-    trace: &str,
     run_id: &str,
 ) -> Result<probe::ProbeOutcome, String> {
     let state = app.state::<AppState>();
 
-    // 只短暂加锁读模板与超时，测试期间不占着数据库。
-    let (mut template, connect_timeout_s) = {
+    // 只短暂加锁读连接超时，测试期间不占着数据库。
+    let connect_timeout_s = {
         let guard = state
             .store
             .lock()
@@ -431,30 +293,14 @@ fn probe_blocking(
             return Err("数据库不可用".to_string());
         };
         let settings = store.load_settings().map_err(|e| e.to_string())?;
-        let template = settings
-            .node_templates
-            .iter()
-            .find(|template| template.id == settings.active_template_id)
-            .or_else(|| settings.node_templates.first())
-            .cloned()
-            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
-        (template, settings.connect_timeout_s)
+        settings.connect_timeout_s
     };
 
-    // 模板缺凭据时不启动 sing-box：直接给可读原因。
-    prepare_template(state.inner(), app, trace, &mut template)?;
-
-    let binary = resolve_singbox(app)?;
     let options = probe::ProbeOptions::from_connect_timeout_s(connect_timeout_s);
-    let prober = probe::SingBoxProber::new(
-        binary,
-        state.singbox.clone(),
-        state.logs.today_path(LogKind::Singbox),
-        state.temp_dir.clone(),
-    );
+    let prober = probe::DirectProber::new(state.logs.clone());
 
     let started_at = logs::now_iso8601();
-    let outcome = prober.measure_latency(endpoint, &template, &options);
+    let outcome = prober.measure_latency(endpoint, &options);
 
     // 结果落库：一条轮次 + 一条结果。写库失败不影响已经测出的结论。
     {
@@ -469,7 +315,6 @@ fn probe_blocking(
                 &started_at,
                 &probe::SingleProbe {
                     endpoint,
-                    template: &template,
                     alias,
                     options,
                 },
@@ -481,36 +326,8 @@ fn probe_blocking(
     Ok(outcome)
 }
 
-/// 测试前置校验：模板缺凭据时写应用日志与操作日志，并返回可读错误。
-fn prepare_template(
-    state: &AppState,
-    app: &tauri::AppHandle,
-    trace: &str,
-    template: &mut template::NodeTemplate,
-) -> Result<(), String> {
-    match template.prepare_for_probe() {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let message = error.to_string();
-            log_app(
-                state,
-                app,
-                AppLogRecord::new(LogLevel::Error, "probe", "probe.precheck")
-                    .trace(trace)
-                    .params(serde_json::json!({
-                        "template": template.name,
-                        "kind": template.kind,
-                        "transport": template.transport,
-                    }))
-                    .error(&message, None),
-            );
-            log_operation(state, app, LogLevel::Error, trace, &message);
-            Err(message)
-        }
-    }
-}
-
-/// 单条真连接延迟：为一个优选地址生成临时 sing-box 配置并测一次。
+/// 单条直连延迟：把一个优选地址解析到 IP 后直连边缘测三次。
+/// 单条直连延迟：把一个优选地址解析到 IP 后直连边缘测三次。
 #[tauri::command]
 async fn probe_single(
     app: tauri::AppHandle,
@@ -530,9 +347,8 @@ async fn probe_single(
         let app = app.clone();
         let endpoint = endpoint.clone();
         let alias = alias.clone();
-        let trace = trace.clone();
         let run_id = run_id.clone();
-        move || probe_blocking(&app, &endpoint, &alias, &trace, &run_id)
+        move || probe_blocking(&app, &endpoint, &alias, &run_id)
     })
     .await
     .map_err(|e| format!("测试任务异常结束：{e}"))?;
@@ -646,7 +462,7 @@ struct BatchReportDto {
     rows: Vec<BatchRowDto>,
 }
 
-/// 一键测试真连接延迟：整池地址按设置里的并发与采样次数跑一轮。
+/// 一键直连测延迟：整池地址按设置里的并发与采样次数跑一轮。
 ///
 /// 停止后已完成的地址保留结论，未开始的地址落库为「未测」。
 #[tauri::command]
@@ -655,7 +471,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
     let state = app.state::<AppState>();
 
     // 读设置与池：只短暂加锁，测试期间不占着数据库。
-    let (mut template, options, batch, entries) = {
+    let (options, batch, entries) = {
         let guard = state
             .store
             .lock()
@@ -664,15 +480,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
             return Err("数据库不可用".to_string());
         };
         let settings = store.load_settings().map_err(|e| e.to_string())?;
-        let template = settings
-            .node_templates
-            .iter()
-            .find(|template| template.id == settings.active_template_id)
-            .or_else(|| settings.node_templates.first())
-            .cloned()
-            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
         (
-            template,
             probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
             probe::batch::BatchOptions::new(
                 probe::batch::DEFAULT_SAMPLES,
@@ -686,10 +494,6 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         return Err("池里还没有地址，请先抓取优选源".to_string());
     }
 
-    // 模板缺凭据时直接返回可读错误，不启动 sing-box。
-    prepare_template(state.inner(), &app, &run_id, &mut template)?;
-
-    let binary = resolve_singbox(&app)?;
     let items: Vec<probe::batch::BatchItem> = entries
         .into_iter()
         .map(|entry| {
@@ -718,9 +522,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
     let started_at = logs::now_iso8601();
     let started = Instant::now();
     let params = serde_json::json!({
-        "kind": template.kind,
-        "transport": template.transport,
-        "tls": template.tls,
+        "mode": "latency",
         "connectTimeoutS": options.connect_timeout.as_secs(),
         "requestTimeoutS": options.request_timeout.as_secs(),
         "samples": batch.samples,
@@ -741,7 +543,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         ),
     );
 
-    // 槽位池与调度都在阻塞线程里跑，进度通过事件推给界面。
+    // 直连探测与调度都在阻塞线程里跑，进度通过事件推给界面。
     let app_for_events = app.clone();
     let run_for_events = run_id.clone();
     let on_event = move |event: probe::batch::BatchEvent| match event {
@@ -761,34 +563,18 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         }
     };
     let cancel = control.clone();
-    let singbox = state.singbox.clone();
-    let log_path = state.logs.today_path(LogKind::Singbox);
-    let temp_dir = state.temp_dir.clone();
+    let prober = probe::DirectProber::new(state.logs.clone());
     let blocking_items = items.clone();
-    let blocking_template = template.clone();
 
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let pool = probe::slot::SlotPool::start(
-            binary,
-            singbox,
-            log_path,
-            temp_dir,
+        probe::batch::run_batch(
+            &prober,
             &blocking_items,
-            &blocking_template,
-            batch.concurrency,
-        )?;
-        let report = probe::batch::run_batch(
-            &pool,
-            &blocking_items,
-            &blocking_template,
             &options,
             batch,
             &cancel.cancel,
             &on_event,
-        )?;
-        // 整轮结束（含停止）后立刻回收全部槽位进程与临时配置。
-        drop(pool);
-        Ok::<_, String>(report)
+        )
     })
     .await;
 
@@ -935,7 +721,7 @@ struct SpeedReportDto {
     rows: Vec<SpeedRowDto>,
 }
 
-/// 一键多线程测速：整池地址或指定选中行，经同一代理链路下载并换算 MB/s。
+/// 一键多线程测速：整池地址或指定选中行，直连下载并换算 MB/s。
 ///
 /// 结果写进最近一轮 `test_result` 的速度字段，延迟列不受影响；
 /// 没有历史轮次时才新建一轮。停止后已开始的行标失败，未开始的行保持原值。
@@ -947,7 +733,7 @@ async fn probe_speed_batch(
     let state = app.state::<AppState>();
 
     // 读设置与池：只短暂加锁，测速期间不占着数据库。
-    let (mut template, options, concurrency, entries) = {
+    let (options, concurrency, entries) = {
         let guard = state
             .store
             .lock()
@@ -956,15 +742,7 @@ async fn probe_speed_batch(
             return Err("数据库不可用".to_string());
         };
         let settings = store.load_settings().map_err(|e| e.to_string())?;
-        let template = settings
-            .node_templates
-            .iter()
-            .find(|template| template.id == settings.active_template_id)
-            .or_else(|| settings.node_templates.first())
-            .cloned()
-            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
         (
-            template,
             probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
             settings.concurrency as usize,
             store.list_pool_entries().map_err(|e| e.to_string())?,
@@ -997,11 +775,6 @@ async fn probe_speed_batch(
         return Err("没有可测速的地址，请先抓取优选源或选中行".to_string());
     }
 
-    // 模板缺凭据时直接返回可读错误，不启动 sing-box。
-    let precheck_trace = logs::new_trace_id();
-    prepare_template(state.inner(), &app, &precheck_trace, &mut template)?;
-
-    let binary = resolve_singbox(&app)?;
     let speed = probe::speed::SpeedOptions::default();
 
     // 与延迟测试共用同一个「正在跑」槽位：同一时间只允许一轮。
@@ -1023,9 +796,6 @@ async fn probe_speed_batch(
     let started = Instant::now();
     let params = serde_json::json!({
         "mode": "speed",
-        "kind": template.kind,
-        "transport": template.transport,
-        "tls": template.tls,
         "streams": speed.streams,
         "sizeMb": speed.total_bytes / 1_000_000,
         "timeoutS": speed.timeout.as_secs(),
@@ -1098,33 +868,19 @@ async fn probe_speed_batch(
     };
 
     let cancel = control.clone();
-    let singbox = state.singbox.clone();
-    let log_path = state.logs.today_path(LogKind::Singbox);
-    let temp_dir = state.temp_dir.clone();
+    let prober = probe::DirectProber::new(state.logs.clone());
     let blocking_items = items.clone();
-    let blocking_template = template.clone();
 
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let pool = probe::slot::SlotPool::start(
-            binary,
-            singbox,
-            log_path,
-            temp_dir,
-            &blocking_items,
-            &blocking_template,
-            concurrency,
-        )?;
-        let report = probe::speed::run_speed_batch(
-            &pool,
+        probe::speed::run_speed_batch(
+            &prober,
             &blocking_items,
             &options,
             &speed,
             concurrency,
             &cancel.cancel,
             &on_event,
-        )?;
-        drop(pool);
-        Ok::<_, String>(report)
+        )
     })
     .await;
 
@@ -1235,11 +991,9 @@ struct GeoRowDto {
     alias: String,
     /// `ok` / `fail` / `untested`，与延迟状态互不影响。
     status: &'static str,
-    exit_ip: Option<String>,
     country: Option<String>,
     zh: Option<String>,
     en: Option<String>,
-    colo: Option<String>,
     asn: Option<u32>,
     error: Option<String>,
 }
@@ -1256,9 +1010,9 @@ struct GeoReportDto {
     rows: Vec<GeoRowDto>,
 }
 
-/// 一键查归属地：整池或选中行，经各自代理链路取出口 IP 后查归属地。
+/// 一键查归属地：整池或选中行，查地址本身解析出的 IP 的归属地。
 ///
-/// 结果写进最近一轮 `test_result` 的出口 IP 与归属地列，延迟、速度不受影响；
+/// 结果写进最近一轮 `test_result` 的归属地列，延迟、速度不受影响；
 /// 查询失败的行只留空归属地，不清空已有结论。
 #[tauri::command]
 async fn probe_geo_batch(
@@ -1268,7 +1022,7 @@ async fn probe_geo_batch(
     let state = app.state::<AppState>();
 
     // 读设置与池：只短暂加锁，查询期间不占着数据库。
-    let (mut template, options, concurrency, entries) = {
+    let (concurrency, entries) = {
         let guard = state
             .store
             .lock()
@@ -1277,16 +1031,7 @@ async fn probe_geo_batch(
             return Err("数据库不可用".to_string());
         };
         let settings = store.load_settings().map_err(|e| e.to_string())?;
-        let template = settings
-            .node_templates
-            .iter()
-            .find(|template| template.id == settings.active_template_id)
-            .or_else(|| settings.node_templates.first())
-            .cloned()
-            .ok_or_else(|| "还没有节点模板，请先新建一条模板".to_string())?;
         (
-            template,
-            probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
             settings.concurrency as usize,
             store.list_pool_entries().map_err(|e| e.to_string())?,
         )
@@ -1318,12 +1063,6 @@ async fn probe_geo_batch(
         return Err("没有可查归属地的地址，请先抓取优选源或选中行".to_string());
     }
 
-    // 模板缺凭据时直接返回可读错误，不启动 sing-box。
-    let precheck_trace = logs::new_trace_id();
-    prepare_template(state.inner(), &app, &precheck_trace, &mut template)?;
-
-    let binary = resolve_singbox(&app)?;
-
     // 与延迟、测速共用同一个「正在跑」槽位：同一时间只允许一轮。
     let control = Arc::new(BatchControl {
         cancel: AtomicBool::new(false),
@@ -1343,9 +1082,6 @@ async fn probe_geo_batch(
     let started = Instant::now();
     let params = serde_json::json!({
         "mode": "geo",
-        "kind": template.kind,
-        "transport": template.transport,
-        "tls": template.tls,
         "concurrency": concurrency,
         "total": items.len(),
     });
@@ -1380,7 +1116,7 @@ async fn probe_geo_batch(
         }
     };
 
-    // 落库的缓存先灌进内存，同一出口 IP 不重复查询。
+    // 落库的缓存先灌进内存，同一 IP 不重复查询。
     let cached = {
         let guard = state
             .store
@@ -1436,34 +1172,19 @@ async fn probe_geo_batch(
     };
 
     let cancel = control.clone();
-    let singbox = state.singbox.clone();
-    let log_path = state.logs.today_path(LogKind::Singbox);
-    let temp_dir = state.temp_dir.clone();
     let blocking_items = items.clone();
-    let blocking_template = template.clone();
     let resolver = state.geo.clone();
+    let host_resolver = probe::SystemResolver;
 
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let pool = probe::slot::SlotPool::start(
-            binary,
-            singbox,
-            log_path,
-            temp_dir,
-            &blocking_items,
-            &blocking_template,
-            concurrency,
-        )?;
-        let report = geo::run_geo_batch(
-            &pool,
+        geo::run_geo_batch(
+            &host_resolver,
             &resolver,
             &blocking_items,
-            &options,
             concurrency,
             &cancel.cancel,
             &on_event,
-        );
-        drop(pool);
-        Ok::<_, String>(report)
+        )
     })
     .await;
 
@@ -1472,7 +1193,7 @@ async fn probe_geo_batch(
         *guard = None;
     }
 
-    let report = joined.map_err(|e| format!("归属地查询任务异常结束：{e}"))??;
+    let report = joined.map_err(|e| format!("归属地查询任务异常结束：{e}"))?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     {
@@ -1506,11 +1227,10 @@ async fn probe_geo_batch(
         match &row.info {
             Some(info) => {
                 record = record.result(serde_json::json!({
-                    "exitIp": info.exit_ip,
+                    "ip": info.ip,
                     "country": info.country,
                     "zh": info.zh,
                     "en": info.en,
-                    "colo": info.colo,
                     "asn": info.asn,
                     "source": info.source,
                 }));
@@ -1578,11 +1298,9 @@ async fn probe_geo_batch(
                     port: row.endpoint.port,
                     alias: row.alias,
                     status,
-                    exit_ip: info.as_ref().map(|info| info.exit_ip.clone()),
                     country: info.as_ref().map(|info| info.country.clone()),
                     zh: info.as_ref().map(|info| info.zh.clone()),
                     en: info.as_ref().map(|info| info.en.clone()),
-                    colo: info.as_ref().and_then(|info| info.colo.clone()),
                     asn: info.as_ref().and_then(|info| info.asn),
                     error: row.error,
                 }
@@ -1705,11 +1423,9 @@ struct HistoryResultDto {
     speed_mbps: Option<f64>,
     speed_status: String,
     speed_error: Option<String>,
-    exit_ip: Option<String>,
     country: Option<String>,
     zh: Option<String>,
     en: Option<String>,
-    colo: Option<String>,
 }
 
 impl From<store::TestResultRow> for HistoryResultDto {
@@ -1724,11 +1440,9 @@ impl From<store::TestResultRow> for HistoryResultDto {
             speed_mbps: row.speed_mbps,
             speed_status: row.speed_status,
             speed_error: row.speed_error,
-            exit_ip: row.exit_ip,
             country: row.geo_country,
             zh: row.geo_zh,
             en: row.geo_en,
-            colo: row.colo,
         }
     }
 }
@@ -2773,8 +2487,6 @@ pub fn run() {
             let db_path = app_dir.join("data.db");
 
             let log_writer = Arc::new(LogWriter::new(log_dir));
-            let singbox = Arc::new(SingboxLog::spawn(log_writer.clone()));
-            let temp_dir = app_dir.join("tmp");
 
             // 旧数据库只在目标不存在时复制一次；失败只记日志，不阻塞启动。
             if let Some(legacy_dir) = legacy_dir.as_deref() {
@@ -2834,8 +2546,6 @@ pub fn run() {
             app.manage(AppState {
                 store: Mutex::new(store),
                 logs: log_writer,
-                singbox,
-                temp_dir,
                 geo: Arc::new(geo::GeoResolver::new(geo_candidates(app.handle()))),
                 batch: Mutex::new(None),
             });
@@ -2846,7 +2556,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
-            parse_node_link,
             get_pool,
             refresh_source_catalog,
             fetch_pool,
@@ -2868,9 +2577,6 @@ pub fn run() {
         .on_window_event(|window, event| {
             // 关闭窗口即结束进程，避免残留后台进程；先收掉日志写入线程。
             if let tauri::WindowEvent::CloseRequested { .. } = event {
-                if let Some(state) = window.try_state::<AppState>() {
-                    state.singbox.shutdown();
-                }
                 window.app_handle().exit(0);
             }
         })
@@ -2894,31 +2600,6 @@ mod packaging_tests {
     }
 
     #[test]
-    fn 安装后能在主程序同目录找到改名后的_sing_box() {
-        let dir = 临时目录("bundled-singbox");
-        // Tauri 打包 sidecar 时去掉目标三元组后缀，安装目录里就是 sing-box.exe。
-        let bundled = dir.join("sing-box.exe");
-        std::fs::write(&bundled, b"stub").expect("写桩文件");
-
-        let candidates = singbox_candidate_paths(Some(&dir), None);
-        assert_eq!(probe::singbox::pick_existing(&candidates), Some(bundled));
-        std::fs::remove_dir_all(&dir).expect("清临时目录");
-    }
-
-    #[test]
-    fn 开发期的三元组文件名仍然优先() {
-        let dir = 临时目录("dev-singbox");
-        let dev = dir.join(SINGBOX_BINARY);
-        let bundled = dir.join(SINGBOX_BUNDLED_BINARY);
-        std::fs::write(&dev, b"stub").expect("写桩文件");
-        std::fs::write(&bundled, b"stub").expect("写桩文件");
-
-        let candidates = singbox_candidate_paths(Some(&dir), None);
-        assert_eq!(probe::singbox::pick_existing(&candidates), Some(dev));
-        std::fs::remove_dir_all(&dir).expect("清临时目录");
-    }
-
-    #[test]
     fn 逐行事件负载字段齐全且不带凭据() {
         let row = probe::RowEvent {
             host: "104.16.1.1".to_string(),
@@ -2928,7 +2609,7 @@ mod packaging_tests {
             speed_mbps: Some(12.3),
             country_zh: Some("加拿大".to_string()),
             country_en: Some("Canada".to_string()),
-            colo: Some("LAX".to_string()),
+            colo: None,
             error: None,
         };
 

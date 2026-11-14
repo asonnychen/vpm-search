@@ -1,13 +1,13 @@
-//! 三类日志：操作日志、应用日志、sing-box 日志。
+//! 三类日志：操作日志、应用日志、探测日志。
 //!
 //! 落盘位置为 `%APPDATA%\vpm-search\logs\`（与数据库同目录；非 Windows 平台
 //! 回落到 `app_data_dir()/logs/`），每类日志按天一个文件：
-//! `operation-YYYY-MM-DD.log`、`app-YYYY-MM-DD.log`、`singbox-YYYY-MM-DD.log`。
+//! `operation-YYYY-MM-DD.log`、`app-YYYY-MM-DD.log`、`probe-YYYY-MM-DD.log`。
 //!
 //! - 操作日志：人读的中文单行，`<ts> <LEVEL> <traceId> <文本>`；
 //! - 应用日志：JSON Lines，字段 `ts / level / traceId / spanId / module /
 //!   event / durationMs / params / result / error.stack`；
-//! - sing-box 日志：子进程 stdout/stderr 原样落盘（阶段 6 接入进程）。
+//! - 探测日志：每次探测尝试一行原文，便于排障。
 
 pub mod redact;
 pub mod retention;
@@ -17,8 +17,6 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
@@ -34,7 +32,7 @@ use retention::CleanupReport;
 pub enum LogKind {
     Operation,
     App,
-    Singbox,
+    Probe,
 }
 
 /// 一类日志的元数据：前缀、中文名、保留天数字段都集中在这张表里。
@@ -53,8 +51,8 @@ fn app_days(retention: &LogRetention) -> u32 {
     retention.app_days
 }
 
-fn singbox_days(retention: &LogRetention) -> u32 {
-    retention.singbox_days
+fn probe_days(retention: &LogRetention) -> u32 {
+    retention.probe_days
 }
 
 const LOG_KIND_META: [LogKindMeta; 3] = [
@@ -71,15 +69,15 @@ const LOG_KIND_META: [LogKindMeta; 3] = [
         retention_days: app_days,
     },
     LogKindMeta {
-        kind: LogKind::Singbox,
-        prefix: "singbox",
-        label: "sing-box 日志",
-        retention_days: singbox_days,
+        kind: LogKind::Probe,
+        prefix: "probe",
+        label: "探测日志",
+        retention_days: probe_days,
     },
 ];
 
 impl LogKind {
-    pub const ALL: [LogKind; 3] = [LogKind::Operation, LogKind::App, LogKind::Singbox];
+    pub const ALL: [LogKind; 3] = [LogKind::Operation, LogKind::App, LogKind::Probe];
 
     fn meta(self) -> &'static LogKindMeta {
         LOG_KIND_META
@@ -145,7 +143,7 @@ impl LogLevel {
         }
     }
 
-    /// sing-box 输出没有统一格式，只能按关键字猜一个级别。
+    /// 探测日志没有统一格式，只能按关键字猜一个级别。
     pub fn infer(text: &str) -> Self {
         let lower = text.to_ascii_lowercase();
         if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
@@ -162,11 +160,11 @@ impl LogLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
-    /// `operation` / `app` / `singbox`。
+    /// `operation` / `app` / `probe`。
     pub kind: String,
     pub ts: String,
     pub level: String,
-    /// 操作日志是中文单行；应用日志是原始 JSON 行；sing-box 是原始输出行。
+    /// 操作日志是中文单行；应用日志是原始 JSON 行；探测日志是原始输出行。
     pub text: String,
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
@@ -252,7 +250,7 @@ impl AppLogRecord {
 pub struct LogsSnapshot {
     pub operation: Vec<LogEntry>,
     pub app: Vec<LogEntry>,
-    pub singbox: Vec<LogEntry>,
+    pub probe: Vec<LogEntry>,
 }
 
 /// 三类日志的落盘与读取。
@@ -273,11 +271,6 @@ impl LogWriter {
     /// 某类日志当天的文件路径。
     pub fn path_for(&self, kind: LogKind, date: &str) -> PathBuf {
         self.dir.join(format!("{}-{date}.log", kind.prefix()))
-    }
-
-    /// 某类日志今天的文件路径；错误提示里直接给用户看。
-    pub fn today_path(&self, kind: LogKind) -> PathBuf {
-        self.path_for(kind, &local_date(Local::now()))
     }
 
     /// 写一条操作日志（人读的中文单行）。
@@ -350,12 +343,12 @@ impl LogWriter {
         })
     }
 
-    /// 把 sing-box 子进程的一行输出原样落盘（凭据同样脱敏）。
-    pub fn append_singbox_line(&self, _stream: &str, line: &str) -> io::Result<LogEntry> {
+    /// 把探测日志的一行原文落盘（同样脱敏）。
+    pub fn append_probe_line(&self, line: &str) -> io::Result<LogEntry> {
         let line = redact(line);
-        self.append(LogKind::Singbox, &line)?;
+        self.append(LogKind::Probe, &line)?;
         Ok(LogEntry {
-            kind: LogKind::Singbox.as_str().to_string(),
+            kind: LogKind::Probe.as_str().to_string(),
             ts: now_iso8601(),
             level: LogLevel::infer(&line).as_str().to_string(),
             text: line,
@@ -414,7 +407,7 @@ impl LogWriter {
         LogsSnapshot {
             operation: self.read_tail(LogKind::Operation, max),
             app: self.read_tail(LogKind::App, max),
-            singbox: self.read_tail(LogKind::Singbox, max),
+            probe: self.read_tail(LogKind::Probe, max),
         }
     }
 
@@ -520,7 +513,7 @@ fn parse_line(kind: LogKind, line: &str, fallback_ts: &str) -> Option<LogEntry> 
                 duration_ms: value.get("durationMs").and_then(Value::as_u64),
             })
         }
-        LogKind::Singbox => Some(LogEntry {
+        LogKind::Probe => Some(LogEntry {
             kind: kind.as_str().to_string(),
             ts: fallback_ts.to_string(),
             level: LogLevel::infer(line).as_str().to_string(),
@@ -530,51 +523,6 @@ fn parse_line(kind: LogKind, line: &str, fallback_ts: &str) -> Option<LogEntry> 
             event: None,
             duration_ms: None,
         }),
-    }
-}
-
-/// sing-box 日志的写入通道：阶段 6 把子进程的 stdout/stderr 推进来即可。
-#[allow(dead_code)] // 阶段 6 接入 sing-box 进程后使用
-pub struct SingboxLog {
-    sender: Mutex<Option<mpsc::Sender<(String, String)>>>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-}
-
-#[allow(dead_code)] // 阶段 6 接入 sing-box 进程后使用
-impl SingboxLog {
-    /// 起一个后台线程，把通道里的行顺序写进文件。
-    pub fn spawn(writer: Arc<LogWriter>) -> Self {
-        let (sender, receiver) = mpsc::channel::<(String, String)>();
-        let handle = std::thread::spawn(move || {
-            for (stream, line) in receiver {
-                let _ = writer.append_singbox_line(&stream, &line);
-            }
-        });
-        Self {
-            sender: Mutex::new(Some(sender)),
-            handle: Mutex::new(Some(handle)),
-        }
-    }
-
-    /// 推一行子进程输出。
-    pub fn push(&self, stream: &str, line: impl Into<String>) {
-        if let Ok(slot) = self.sender.lock() {
-            if let Some(sender) = slot.as_ref() {
-                let _ = sender.send((stream.to_string(), line.into()));
-            }
-        }
-    }
-
-    /// 关闭通道并等待写入线程结束。
-    pub fn shutdown(&self) {
-        if let Ok(mut slot) = self.sender.lock() {
-            slot.take();
-        }
-        if let Ok(mut slot) = self.handle.lock() {
-            if let Some(handle) = slot.take() {
-                let _ = handle.join();
-            }
-        }
     }
 }
 
@@ -672,6 +620,7 @@ pub fn new_span_id() -> String {
 mod tests {
     use super::*;
     use crate::settings::LogRetention;
+    use std::sync::Arc;
     use serde_json::json;
     use std::fs::File;
 
@@ -696,13 +645,13 @@ mod tests {
         let retention = LogRetention {
             operation_days: 7,
             app_days: 14,
-            singbox_days: 60,
+            probe_days: 60,
         };
         assert_eq!(LogKind::Operation.retention_days(&retention), 7);
         assert_eq!(LogKind::App.retention_days(&retention), 14);
-        assert_eq!(LogKind::Singbox.retention_days(&retention), 60);
+        assert_eq!(LogKind::Probe.retention_days(&retention), 60);
         assert_eq!(LogKind::Operation.as_str(), "operation");
-        assert_eq!(LogKind::parse("singbox"), Some(LogKind::Singbox));
+        assert_eq!(LogKind::parse("probe"), Some(LogKind::Probe));
         assert_eq!(LogKind::parse("乱写"), None);
     }
 
@@ -823,7 +772,7 @@ mod tests {
         let retention = LogRetention {
             operation_days: 30,
             app_days: 30,
-            singbox_days: 30,
+            probe_days: 30,
         };
         let reports = writer.cleanup_expired(&retention, SystemTime::now());
 
@@ -847,24 +796,23 @@ mod tests {
     }
 
     #[test]
-    fn singbox_输出原样落盘并推断级别() {
+    fn 探测日志原样落盘并推断级别() {
         let (dir, writer) = writer();
-        let sink = SingboxLog::spawn(writer.clone());
-        sink.push("stdout", "sing-box 1.12.4 (go1.24) windows/amd64");
-        sink.push("stderr", "outbound/vless[out-5]: WARN handshake timeout");
-        sink.shutdown();
+        writer
+            .append_probe_line("104.16.1.1:8443 -> 104.16.1.1 88ms")
+            .unwrap();
+        writer
+            .append_probe_line("104.16.1.2:8443 -> 104.16.1.2 连接失败：WARN handshake timeout")
+            .unwrap();
 
-        let lines = raw_lines(dir.path(), LogKind::Singbox);
+        let lines = raw_lines(dir.path(), LogKind::Probe);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "sing-box 1.12.4 (go1.24) windows/amd64");
+        assert_eq!(lines[0], "104.16.1.1:8443 -> 104.16.1.1 88ms");
 
-        let entries = writer.read_tail(LogKind::Singbox, 10);
+        let entries = writer.read_tail(LogKind::Probe, 10);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].level, "WARN");
-        assert_eq!(
-            entries[1].text,
-            "outbound/vless[out-5]: WARN handshake timeout"
-        );
+        assert!(entries[1].text.contains("handshake timeout"));
     }
 
     #[test]

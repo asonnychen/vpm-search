@@ -1,6 +1,6 @@
 //! 批量并发测试：整池地址按并发上限调度，每条采样多次后聚合、落库。
 //!
-//! 调度与聚合与具体探测器无关；sing-box 的槽位池通过 [`BatchProber`] 接入，
+//! 调度与聚合与具体探测器无关；直连探测器通过 [`BatchProber`] 接入，
 //! 测试里换成假探测器即可跑通整轮。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,7 +9,6 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use crate::store::Store;
-use crate::template::NodeTemplate;
 
 use super::{Endpoint, ProbeOptions, ProbeOutcome, ProbeStatus};
 
@@ -61,26 +60,15 @@ impl BatchOptions {
     }
 }
 
-/// 可复用资源的批量探测器：sing-box 槽位池在 `prepare` 里一次性起进程，
-/// 整轮采样都复用这些进程，`cleanup` 回收。
+/// 批量探测器：`prepare` 做整轮前的准备（直连探测器什么都不做），`cleanup` 收尾。
 pub trait BatchProber: Send + Sync {
     /// 整轮开始前准备资源。默认什么都不做。
-    fn prepare(
-        &self,
-        _items: &[BatchItem],
-        _template: &NodeTemplate,
-        _concurrency: usize,
-    ) -> Result<(), String> {
+    fn prepare(&self, _items: &[BatchItem], _concurrency: usize) -> Result<(), String> {
         Ok(())
     }
 
     /// 对一条地址采一次样。
-    fn sample(
-        &self,
-        endpoint: &Endpoint,
-        template: &NodeTemplate,
-        options: &ProbeOptions,
-    ) -> ProbeOutcome;
+    fn sample(&self, endpoint: &Endpoint, options: &ProbeOptions) -> ProbeOutcome;
 
     /// 整轮结束后回收资源。默认什么都不做。
     fn cleanup(&self) {}
@@ -204,14 +192,13 @@ fn error_summary(samples: &[ProbeOutcome], fallback: &str) -> String {
 pub fn run_batch(
     prober: &dyn BatchProber,
     items: &[BatchItem],
-    template: &NodeTemplate,
     options: &ProbeOptions,
     batch: BatchOptions,
     cancel: &AtomicBool,
     on_event: &(dyn Fn(BatchEvent) + Sync),
 ) -> Result<BatchReport, String> {
     let total = items.len();
-    prober.prepare(items, template, batch.concurrency)?;
+    prober.prepare(items, batch.concurrency)?;
 
     let next = AtomicUsize::new(0);
     let completed = AtomicUsize::new(0);
@@ -234,7 +221,7 @@ pub fn run_batch(
                 let item = &items[index];
                 let mut samples = Vec::with_capacity(batch.samples);
                 for _ in 0..batch.samples {
-                    samples.push(prober.sample(&item.endpoint, template, options));
+                    samples.push(prober.sample(&item.endpoint, options));
                 }
                 let outcome = aggregate(&samples);
                 if let Ok(mut slot) = results[index].lock() {
@@ -415,7 +402,6 @@ mod tests {
         fn sample(
             &self,
             _endpoint: &Endpoint,
-            _template: &NodeTemplate,
             _options: &ProbeOptions,
         ) -> ProbeOutcome {
             let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
@@ -437,7 +423,6 @@ mod tests {
         let report = run_batch(
             &prober,
             &items,
-            &NodeTemplate::default(),
             &ProbeOptions::default(),
             BatchOptions::new(1, 3),
             &cancel,
@@ -471,7 +456,6 @@ mod tests {
         fn sample(
             &self,
             _endpoint: &Endpoint,
-            _template: &NodeTemplate,
             _options: &ProbeOptions,
         ) -> ProbeOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -494,7 +478,6 @@ mod tests {
         let report = run_batch(
             &prober,
             &items,
-            &NodeTemplate::default(),
             &ProbeOptions::default(),
             BatchOptions::new(3, 1),
             &cancel,
@@ -540,7 +523,6 @@ mod tests {
         let report = run_batch(
             &prober,
             &items,
-            &NodeTemplate::default(),
             &ProbeOptions::default(),
             BatchOptions::new(3, 2),
             &AtomicBool::new(false),
@@ -628,7 +610,6 @@ mod tests {
         let report = run_batch(
             &prober,
             &items,
-            &NodeTemplate::default(),
             &ProbeOptions::default(),
             BatchOptions::new(3, 2),
             &AtomicBool::new(false),

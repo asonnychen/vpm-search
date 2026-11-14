@@ -93,7 +93,7 @@ impl CountryDb for OfflineDb {
         };
         let address: IpAddr = ip
             .parse()
-            .map_err(|_| format!("出口 IP 不是合法地址：{ip}"))?;
+            .map_err(|_| format!("不是合法的 IP：{ip}"))?;
         let lookup = reader
             .lookup(address)
             .map_err(|e| format!("离线库查询失败：{e}"))?;
