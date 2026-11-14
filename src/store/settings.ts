@@ -41,6 +41,8 @@ export type UiState = {
   logCollapsed: boolean;
   configOpen: boolean;
   poolOpen: boolean;
+  /** 表格里的「延时 ≤ N ms」过滤，null 表示不过滤。 */
+  latencyFilterMs: number | null;
 };
 
 export type Settings = {
@@ -72,7 +74,13 @@ export const DEFAULT_SETTINGS: Settings = {
   concurrency: defaultConcurrency(),
   columnWidths: [...DEFAULT_COLUMN_WIDTHS],
   logRetention: { operationDays: 30, appDays: 30, probeDays: 30 },
-  ui: { logHeight: 214, logCollapsed: false, configOpen: true, poolOpen: false },
+  ui: {
+    logHeight: 214,
+    logCollapsed: false,
+    configOpen: true,
+    poolOpen: false,
+    latencyFilterMs: null,
+  },
 };
 
 /** 只接受区间内的有限数字，其余一律回落默认值，避免脏值进入界面。 */
@@ -138,6 +146,10 @@ export function normalizeSettings(raw: unknown): Settings {
       logCollapsed: bool(ui.logCollapsed, DEFAULT_SETTINGS.ui.logCollapsed),
       configOpen: bool(ui.configOpen, DEFAULT_SETTINGS.ui.configOpen),
       poolOpen: bool(ui.poolOpen, DEFAULT_SETTINGS.ui.poolOpen),
+      latencyFilterMs:
+        typeof ui.latencyFilterMs === "number" && Number.isFinite(ui.latencyFilterMs)
+          ? Math.min(60_000, Math.max(1, Math.round(ui.latencyFilterMs)))
+          : null,
     },
   };
 }

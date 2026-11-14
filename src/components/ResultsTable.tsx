@@ -161,6 +161,8 @@ export default function ResultsTable() {
   const widths = useSettingsStore(selectColumnWidths);
   const setColumnWidth = useSettingsStore((state) => state.setColumnWidth);
   const threshold = useSettingsStore(selectThresholdMs);
+  const latencyFilterMs = useSettingsStore((state) => state.settings.ui.latencyFilterMs);
+  const patchSettings = useSettingsStore((state) => state.patch);
   const resizeRef = useRef<{ i: number; x: number; w: number } | null>(null);
 
   useEffect(() => {
@@ -203,6 +205,10 @@ export default function ResultsTable() {
       if (filter === "timeout" && r.status !== "timeout") return false;
       if (filter === "fail" && r.status !== "fail") return false;
       if (filter === "slow" && !(r.latency !== null && r.latency > threshold)) return false;
+      // 延时上限过滤：未测的行没有延时，过滤开启时一并隐藏。
+      if (latencyFilterMs !== null && !(r.latency !== null && r.latency <= latencyFilterMs)) {
+        return false;
+      }
       if (query) {
         const q = query.toLowerCase();
         return (
@@ -215,7 +221,7 @@ export default function ResultsTable() {
       }
       return true;
     });
-  }, [filter, query, threshold, sortedRows]);
+  }, [filter, query, threshold, latencyFilterMs, sortedRows]);
 
   const toggle = (id: string) =>
     setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
@@ -379,6 +385,36 @@ export default function ResultsTable() {
               {exportMissing} 条缺少归属地，导出时该段留空
             </span>
           ) : null}
+          <label
+            className="flex items-center gap-1 whitespace-nowrap"
+            title="只看延时不超过该值的地址；清空表示不限"
+          >
+            <span>延时 ≤</span>
+            <input
+              value={latencyFilterMs ?? ""}
+              onChange={(e) => {
+                const digits = e.target.value.replace(/[^\d]/g, "");
+                patchSettings({
+                  ui: { latencyFilterMs: digits === "" ? null : Number(digits) },
+                });
+              }}
+              inputMode="numeric"
+              placeholder="不限"
+              aria-label="延时过滤上限（毫秒）"
+              className="h-7 w-16 border border-line rounded-[3px] bg-panel px-1.5 text-right text-[12px] text-text outline-none focus:border-accent-dim placeholder:text-dim/70"
+            />
+            <span>ms</span>
+            {latencyFilterMs !== null ? (
+              <button
+                type="button"
+                onClick={() => patchSettings({ ui: { latencyFilterMs: null } })}
+                title="清除延时过滤"
+                className="text-dim hover:text-text px-0.5"
+              >
+                ×
+              </button>
+            ) : null}
+          </label>
           <button
             type="button"
             onClick={() => void handleExport()}
@@ -396,6 +432,11 @@ export default function ResultsTable() {
           <span>
             共 <span className="text-text">{rows.length}</span> 条
           </span>
+          {latencyFilterMs !== null ? (
+            <span>
+              筛后 <span className="text-text">{shown.length}</span> 条
+            </span>
+          ) : null}
           <span>
             未测 <span className="text-text">{rows.length - counts.ok - counts.timeout - counts.fail}</span>
           </span>
