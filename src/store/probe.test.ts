@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  createProbeRowQueue,
   createProbeStore,
   normalizeBatchReport,
   normalizeGeoReport,
   normalizeProbeResult,
+  normalizeProbeRow,
   normalizeSpeedReport,
   probeKey,
   type ProbePersistence,
+  type ProbeRowEvent,
 } from "./probe";
 
 function fakePersistence(
@@ -480,5 +483,145 @@ describe("归属地", () => {
       completed: 1,
       total: 4,
     });
+  });
+});
+
+/** 造一条实时结果事件，未指定的字段一律为空。 */
+function rowEvent(overrides: Partial<ProbeRowEvent> = {}): ProbeRowEvent {
+  return {
+    runId: "run-1",
+    kind: "delay",
+    host: "104.16.1.1",
+    port: 8443,
+    status: "ok",
+    latencyMs: null,
+    speedMbps: null,
+    countryZh: null,
+    countryEn: null,
+    colo: null,
+    error: null,
+    ...overrides,
+  };
+}
+
+describe("实时结果事件", () => {
+  it("归一化事件，缺地址或坏数据直接丢弃", () => {
+    expect(normalizeProbeRow(null)).toBeNull();
+    expect(normalizeProbeRow({ host: "", port: 443 })).toBeNull();
+    expect(normalizeProbeRow({ host: "104.16.1.1", port: 0 })).toBeNull();
+
+    expect(
+      normalizeProbeRow({
+        runId: "run-1",
+        kind: "delay",
+        host: "104.16.1.1",
+        port: 8443,
+        status: "ok",
+        latencyMs: 88.4,
+        error: null,
+      }),
+    ).toMatchObject({ kind: "delay", latencyMs: 88, speedMbps: null });
+  });
+
+  it("延迟、速度、归属地各自写进对应的表", () => {
+    const store = createProbeStore(fakePersistence());
+
+    store.getState().applyRows([
+      rowEvent({ latencyMs: 88 }),
+      rowEvent({ kind: "speed", status: "ok", speedMbps: 9.5 }),
+      rowEvent({ kind: "geo", countryZh: "加拿大", countryEn: "Canada" }),
+    ]);
+
+    expect(store.getState().results["104.16.1.1:8443"]).toMatchObject({
+      status: "ok",
+      latencyMs: 88,
+    });
+    expect(store.getState().speeds["104.16.1.1:8443"]).toMatchObject({
+      status: "ok",
+      mbps: 9.5,
+    });
+    expect(store.getState().geos["104.16.1.1:8443"]).toMatchObject({
+      zh: "加拿大",
+      en: "Canada",
+    });
+  });
+
+  it("失败不抹掉已有归属地，未测的测速不覆盖旧速度", () => {
+    const store = createProbeStore(fakePersistence());
+    store.setState({
+      geos: {
+        "104.16.1.1:8443": {
+          exitIp: null,
+          country: null,
+          zh: "Cloudflare",
+          en: "Cloudflare",
+          colo: "LAX",
+          asn: null,
+          source: "offline",
+        },
+      },
+      speeds: { "104.16.1.1:8443": { status: "ok", mbps: 12.3, error: null } },
+    });
+
+    store.getState().applyRows([
+      rowEvent({ kind: "geo", status: "fail", error: "取出口 IP 失败" }),
+      rowEvent({ kind: "speed", status: "untested" }),
+    ]);
+
+    expect(store.getState().geos["104.16.1.1:8443"].zh).toBe("Cloudflare");
+    expect(store.getState().speeds["104.16.1.1:8443"].mbps).toBe(12.3);
+  });
+
+  it("整轮收尾后迟到的事件被丢弃，最终结果以报告为准", async () => {
+    const store = createProbeStore(fakePersistence());
+    await store.getState().startBatch();
+
+    store.getState().applyRows([
+      rowEvent({ status: "fail", latencyMs: null, error: "迟到的失败" }),
+    ]);
+
+    expect(store.getState().results["104.16.1.1:8443"]).toMatchObject({
+      status: "ok",
+      latencyMs: 80,
+    });
+  });
+
+  it("同一窗口内的同类事件合并成一次写入", () => {
+    vi.useFakeTimers();
+    try {
+      const batches: ProbeRowEvent[][] = [];
+      const queue = createProbeRowQueue((rows) => batches.push(rows), 50);
+
+      queue.push(rowEvent({ latencyMs: 100 }));
+      queue.push(rowEvent({ latencyMs: 120 }));
+      queue.push(rowEvent({ host: "104.16.2.2", latencyMs: 60 }));
+
+      // 还没到窗口，先不写。
+      expect(batches).toHaveLength(0);
+      vi.advanceTimersByTime(50);
+
+      expect(batches).toHaveLength(1);
+      // 同一行只保留最后一次，不同行各自保留。
+      expect(batches[0]).toHaveLength(2);
+      expect(batches[0].find((row) => row.host === "104.16.1.1")?.latencyMs).toBe(120);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("取消订阅时丢弃未写出的结果", () => {
+    vi.useFakeTimers();
+    try {
+      const batches: ProbeRowEvent[][] = [];
+      const queue = createProbeRowQueue((rows) => batches.push(rows), 50);
+
+      queue.push(rowEvent({ latencyMs: 100 }));
+      queue.clear();
+      vi.advanceTimersByTime(100);
+
+      expect(batches).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

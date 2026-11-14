@@ -81,6 +81,164 @@ export type BatchProgress = {
   total: number;
 };
 
+/** 单条实时结果事件的类型：延迟、测速、归属地三条链路各推各的。 */
+export type ProbeRowKind = "delay" | "speed" | "geo";
+
+/**
+ * 后端逐条推送的实时结果（`probe:row`）。
+ * 延迟、测速、归属地以及单条重测都走这个事件。
+ */
+export type ProbeRowEvent = {
+  runId: string;
+  kind: ProbeRowKind;
+  host: string;
+  port: number;
+  status: ProbeStatus;
+  latencyMs: number | null;
+  speedMbps: number | null;
+  countryZh: string | null;
+  countryEn: string | null;
+  colo: string | null;
+  error: string | null;
+};
+
+/** 把后端推来的任意 JSON 归一成一条实时结果；缺 host/port 的直接丢弃。 */
+export function normalizeProbeRow(raw: unknown): ProbeRowEvent | null {
+  if (!isRecord(raw)) return null;
+
+  const host = str(raw.host).trim();
+  const port = Math.round(num(raw.port));
+  if (host === "" || port <= 0 || port > 65535) return null;
+
+  const kind: ProbeRowKind =
+    raw.kind === "speed" ? "speed" : raw.kind === "geo" ? "geo" : "delay";
+  const status: ProbeStatus =
+    raw.status === "ok" ||
+    raw.status === "timeout" ||
+    raw.status === "fail" ||
+    raw.status === "untested"
+      ? raw.status
+      : "fail";
+
+  const latency = raw.latencyMs;
+  const speed = raw.speedMbps;
+  const text = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() !== "" ? value : null;
+
+  return {
+    runId: str(raw.runId),
+    kind,
+    host,
+    port,
+    status,
+    latencyMs:
+      typeof latency === "number" && Number.isFinite(latency) && latency >= 0
+        ? Math.max(1, Math.round(latency))
+        : null,
+    speedMbps:
+      typeof speed === "number" && Number.isFinite(speed) && speed > 0 ? speed : null,
+    countryZh: text(raw.countryZh),
+    countryEn: text(raw.countryEn),
+    colo: text(raw.colo),
+    error: text(raw.error),
+  };
+}
+
+/** 把一条实时结果并进本地结果表；返回是否有字段被改动。 */
+function mergeProbeRow(
+  row: ProbeRowEvent,
+  results: Record<string, ProbeResult>,
+  speeds: Record<string, SpeedResult>,
+  geos: Record<string, GeoResult>,
+): boolean {
+  const key = probeKey(row.host, row.port);
+
+  if (row.kind === "delay") {
+    const next = normalizeProbeResult({
+      status: row.status,
+      latencyMs: row.latencyMs,
+      error: row.error,
+    });
+    results[key] = next;
+    return true;
+  }
+
+  if (row.kind === "speed") {
+    // 未轮到的行不覆盖已有速度，与整轮结果的语义保持一致。
+    if (row.status === "untested") return false;
+    const ok = row.status === "ok" && row.speedMbps !== null;
+    speeds[key] = {
+      status: ok ? "ok" : "fail",
+      mbps: ok ? row.speedMbps : null,
+      error: ok ? row.error : (row.error ?? "测速结果缺少速度"),
+    };
+    return true;
+  }
+
+  // 归属地：只有真正拿到地名才覆盖，失败不抹掉上一次的结果。
+  const zh = row.countryZh ?? "";
+  const en = row.countryEn ?? "";
+  if (row.status !== "ok" || (zh === "" && en === "")) return false;
+  geos[key] = {
+    exitIp: null,
+    country: null,
+    zh,
+    en,
+    colo: row.colo,
+    asn: null,
+    // 实时事件不带来源与出口 IP，留空等整轮结果补齐。
+    source: "",
+  };
+  return true;
+}
+
+/**
+ * 高频实时结果的合并队列：同一条地址的同一类结果只保留最后一次，
+ * 每 `intervalMs` 最多触发一次写入，避免每条事件都整表重排。
+ */
+export type ProbeRowQueue = {
+  push: (row: ProbeRowEvent) => void;
+  /** 立即写出待处理的结果，用于测试与收尾。 */
+  flush: () => void;
+  /** 丢弃待处理的结果并取消定时器。 */
+  clear: () => void;
+};
+
+export function createProbeRowQueue(
+  handler: (rows: ProbeRowEvent[]) => void,
+  intervalMs = 50,
+): ProbeRowQueue {
+  let pending = new Map<string, ProbeRowEvent>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const flush = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (pending.size === 0) return;
+    const rows = [...pending.values()];
+    pending = new Map();
+    handler(rows);
+  };
+
+  return {
+    push: (row) => {
+      // 同一地址的同一类结果合并成最后一次，减少渲染次数。
+      pending.set(`${row.kind}:${probeKey(row.host, row.port)}`, row);
+      if (timer === null) timer = setTimeout(flush, intervalMs);
+    },
+    flush,
+    clear: () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      pending = new Map();
+    },
+  };
+}
+
 export type BatchState = {
   /** 正在跑一轮。 */
   running: boolean;
@@ -413,9 +571,19 @@ export type ProbeStore = {
   startGeoBatch: (targets?: SpeedTarget[]) => Promise<void>;
   cancelBatch: () => Promise<void>;
   applyProgress: (progress: BatchProgress) => void;
+  /** 把一批实时结果写进对应行（已按 `host:port` 合并）。 */
+  applyRows: (rows: ProbeRowEvent[]) => void;
 };
 
 export function createProbeStore(persistence: ProbePersistence) {
+  // 已经收尾的轮次：迟到的事件不再写入，避免行停在中间态。
+  const finishedRuns: string[] = [];
+  const markFinished = (runId: string) => {
+    if (runId === "" || finishedRuns.includes(runId)) return;
+    finishedRuns.push(runId);
+    if (finishedRuns.length > 8) finishedRuns.shift();
+  };
+
   return create<ProbeStore>()((set, get) => ({
     results: {},
     speeds: {},
@@ -479,6 +647,8 @@ export function createProbeStore(persistence: ProbePersistence) {
           error: row.error,
         };
       }
+      // 收尾后迟到的事件不再写入，最终结果以整轮报告为准。
+      markFinished(report.runId);
 
       set({
         results,
@@ -525,6 +695,7 @@ export function createProbeStore(persistence: ProbePersistence) {
           error: row.error,
         };
       }
+      markFinished(report.runId);
 
       set({
         speeds,
@@ -575,6 +746,7 @@ export function createProbeStore(persistence: ProbePersistence) {
           source: row.source,
         };
       }
+      markFinished(report.runId);
 
       set({
         geos,
@@ -613,6 +785,24 @@ export function createProbeStore(persistence: ProbePersistence) {
           total: progress.total,
         },
       });
+    },
+
+    applyRows: (rows) => {
+      if (rows.length === 0) return;
+
+      // 一次性复制三张表，写完再 set，避免每条事件都触发整表重排。
+      const results = { ...get().results };
+      const speeds = { ...get().speeds };
+      const geos = { ...get().geos };
+      let changed = false;
+
+      for (const row of rows) {
+        // 该轮已经收尾，迟到的事件直接丢弃，最终结果以报告为准。
+        if (row.runId !== "" && finishedRuns.includes(row.runId)) continue;
+        if (mergeProbeRow(row, results, speeds, geos)) changed = true;
+      }
+
+      if (changed) set({ results, speeds, geos });
     },
   }));
 }
@@ -665,6 +855,28 @@ export async function subscribeProbeProgress(
       total: count(payload.total),
     });
   });
+}
+
+/**
+ * 订阅后端逐条推送的实时结果；内部按 50ms 合并同类结果，避免整表频繁重排。
+ * 返回取消订阅函数，取消时丢弃尚未写出的结果。
+ */
+export async function subscribeProbeRow(
+  handler: (rows: ProbeRowEvent[]) => void,
+  intervalMs = 50,
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => {};
+
+  const queue = createProbeRowQueue(handler, intervalMs);
+  const unlisten = await listen<unknown>("probe:row", (event) => {
+    const row = normalizeProbeRow(event.payload);
+    if (row) queue.push(row);
+  });
+
+  return () => {
+    queue.clear();
+    unlisten();
+  };
 }
 
 export const selectProbeResults = (state: ProbeStore) => state.results;
