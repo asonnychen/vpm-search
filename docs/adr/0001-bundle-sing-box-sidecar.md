@@ -1,3 +1,5 @@
+**Status: superseded by [ADR-0007](0007-direct-edge-probing.md)**
+
 # 内置 sing-box 作为 sidecar，而非在 Rust 里实现代理协议
 
 测试必须经真实代理链路才能拿到出口 IP 与速度，而优选地址只提供 `host:port`，协议与凭据来自节点模板。自己用 Rust 实现 vless/trojan 尚可，但 vmess 的 AEAD、hysteria2 的 QUIC 都要重写一遍，且每加一种协议就是一轮新坑。选择随安装包内置 sing-box 可执行文件，用临时配置为每个并发槽开一个 `mixed` 入站，测完即销毁。

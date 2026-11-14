@@ -1,3 +1,5 @@
+**Status: superseded by [ADR-0007](0007-direct-edge-probing.md)**
+
 # 归属地查出口 IP，而不是优选地址
 
 优选地址是 Cloudflare 的 anycast 边缘，直接查它的归属地永远得到"美国 / Cloudflare"，没有任何信息量。真正有意义的是这条线路落地在哪里。因此归属地查询分两步：先经代理请求 `api.ipify.org` 与 `cdn-cgi/trace` 拿到出口 IP（双源交叉取多数），再对出口 IP 做地理查询。
