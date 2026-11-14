@@ -65,6 +65,8 @@ export default function LogPanel({
 
   const current = tabs.find((t) => t.id === tab)!;
   const visible = filterByLevel(lines[tab], levels[tab]);
+  // 日志倒序：最新的一条在最上面，与终端 tail 的方向相反但更符合排障习惯。
+  const ordered = [...visible].reverse();
 
   const onClear = async () => {
     const report = await clear(tab);
@@ -72,7 +74,7 @@ export default function LogPanel({
   };
 
   const onCopy = async () => {
-    const text = visible
+    const text = ordered
       .map((line) => `${formatLogClock(line.ts)} ${line.level} ${line.text}`)
       .join("\n");
     try {
@@ -176,7 +178,7 @@ export default function LogPanel({
                 : `（没有 ${levels[tab]} 级别的${current.label}）`}
             </div>
           ) : (
-            visible.map((line, index) => (
+            ordered.map((line, index) => (
               <div
                 key={`${line.ts}-${index}`}
                 className="grid grid-cols-[92px_64px_1fr] gap-3 hover:bg-panel-2/60 -mx-1 px-1"

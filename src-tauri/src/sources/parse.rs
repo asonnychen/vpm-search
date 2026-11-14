@@ -197,18 +197,17 @@ pub fn parse_catalog(html: &str) -> Vec<CatalogSource> {
 }
 
 /// 区内的来源标识：`<区名>·<txt 路径>`，例如 `优选域名·domain/all.txt`。
+/// 非 bestcf 站点保留主机名，避免不同站点的同名路径混在一起。
 pub fn section_label(section: &str, url: &str) -> String {
     let without_scheme = url.split("://").nth(1).unwrap_or(url);
-    match without_scheme.find('/') {
-        Some(index) => {
-            let path = without_scheme[index..].trim_start_matches('/');
-            if path.is_empty() {
-                section.to_string()
-            } else {
-                format!("{section}·{path}")
-            }
-        }
-        None => section.to_string(),
+    let relative = without_scheme
+        .strip_prefix("bestcf.pages.dev/")
+        .unwrap_or(without_scheme);
+    let relative = relative.trim_start_matches('/');
+    if relative.is_empty() {
+        section.to_string()
+    } else {
+        format!("{section}·{relative}")
     }
 }
 
@@ -236,7 +235,9 @@ fn extract_section<'a>(html: &'a str, id: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// 页面把链接放在 `<span class="url-text">…</span>` 里。
+/// 页面有两种链接形态：`<span class="url-text">…</span>` 展示的地址，
+/// 以及 `<a href="…">` 直接给出的下载地址（ProxyIP、CIDR 这类区只有后者）。
+/// 两种都要收，相对路径按 bestcf 站点补全。
 fn urls_in(block: &str) -> Vec<String> {
     const MARKER: &str = "url-text\">";
     let mut urls = Vec::new();
@@ -246,11 +247,36 @@ fn urls_in(block: &str) -> Vec<String> {
         let end = after.find('<').unwrap_or(after.len());
         let url = after[..end].trim();
         if !url.is_empty() {
-            urls.push(url.to_string());
+            urls.push(resolve_url(url));
         }
         rest = &after[end..];
     }
+
+    let mut rest = block;
+    while let Some(index) = rest.find("href=\"") {
+        let after = &rest[index + "href=\"".len()..];
+        let end = after.find('"').unwrap_or(after.len());
+        let url = after[..end].trim();
+        if !url.is_empty() {
+            urls.push(resolve_url(url));
+        }
+        rest = &after[end..];
+    }
+
     urls
+}
+
+/// 把相对路径补成绝对地址；已经是 http(s) 的原样返回。
+fn resolve_url(raw: &str) -> String {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else if let Some(rest) = raw.strip_prefix("//") {
+        format!("https://{rest}")
+    } else if raw.starts_with('/') {
+        format!("https://bestcf.pages.dev{raw}")
+    } else {
+        format!("https://bestcf.pages.dev/{raw}")
+    }
 }
 
 #[cfg(test)]
@@ -422,6 +448,57 @@ mod tests {
         assert!(sources[2].broken);
         // 注释掉的源不应混进来。
         assert!(sources.iter().all(|s| !s.url.contains("/wuya/")));
+    }
+
+    #[test]
+    fn href_形式的_txt_源也被收进清单() {
+        // ProxyIP 区只给 `<a href>`，没有 url-text；CIDR 这类相对路径要补全。
+        let page = r#"
+<section id="proxyip">
+  <div class="group-card">
+    <span class="url-text">github.com/Xiaobei09</span>
+    <a href="https://github.com/Xiaobei09/proxyip/raw/refs/heads/main/all_ltd.txt">打开链接</a>
+  </div>
+</section>
+<section id="yxgj">
+  <div class="group-card">
+    <span class="url-text">CIDR 转换</span>
+    <a href="CIDR/all.txt">下载文件</a>
+  </div>
+</section>
+"#;
+
+        let sources = parse_catalog(page);
+
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://bestcf.pages.dev/CIDR/all.txt",
+                "https://github.com/Xiaobei09/proxyip/raw/refs/heads/main/all_ltd.txt",
+            ]
+        );
+        assert_eq!(sources[0].name, "优选工具·CIDR/all.txt");
+        assert_eq!(
+            sources[1].name,
+            "ProxyIP·github.com/Xiaobei09/proxyip/raw/refs/heads/main/all_ltd.txt"
+        );
+    }
+
+    #[test]
+    fn 同一区块里_url_text_与_href_指向同一地址时只算一条() {
+        let page = r#"
+<section id="yxym">
+  <div class="group-card">
+    <span class="url-text">https://bestcf.pages.dev/domain/all.txt</span>
+    <a href="https://bestcf.pages.dev/domain/all.txt">打开链接</a>
+  </div>
+</section>
+"#;
+
+        assert_eq!(parse_catalog(page).len(), 1);
     }
 
     #[test]

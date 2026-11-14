@@ -5,6 +5,7 @@ import {
   LATENCY_SAMPLES,
   REQUEST_TIMEOUT_S,
   SPEED_PARAMS,
+  selectLastInput,
   selectNodeTemplates,
   selectSettings,
   useSettingsStore,
@@ -12,6 +13,7 @@ import {
 import { activeTemplate, deleteTemplate } from "../store/template";
 import { selectProbeBatch, speedTargetsFromIds, useProbeStore } from "../store/probe";
 import { useSelectionStore } from "../store/selection";
+import { usePoolStore } from "../store/pool";
 
 export default function ConfigBar({
   open,
@@ -30,6 +32,18 @@ export default function ConfigBar({
   const cancelBatch = useProbeStore((state) => state.cancelBatch);
   const selectedIds = useSelectionStore((state) => state.ids);
   const [panel, setPanel] = useState<TemplatePanelMode | null>(null);
+
+  const refreshCatalog = usePoolStore((state) => state.refreshCatalog);
+  const fetchPool = usePoolStore((state) => state.fetchPool);
+  const refreshing = usePoolStore((state) => state.refreshing);
+  const fetching = usePoolStore((state) => state.fetching);
+  const lastInput = useSettingsStore(selectLastInput);
+
+  /** 一键抓取：先刷新源清单，再抓取勾选的源。 */
+  const fetchEverything = async () => {
+    await refreshCatalog();
+    await fetchPool(lastInput.manualAddresses, lastInput.sourceUrls);
+  };
 
   const runningSpeed = batch.running && batch.mode === "speed";
   const runningGeo = batch.running && batch.mode === "geo";
@@ -76,7 +90,13 @@ export default function ConfigBar({
           {REQUEST_TIMEOUT_S}s
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-2">
-          <Btn variant="secondary">抓取优选源</Btn>
+          <Btn
+            variant="secondary"
+            onClick={() => void fetchEverything()}
+            title="刷新源清单并抓取勾选的优选源"
+          >
+            {refreshing ? "刷新中…" : fetching ? "抓取中…" : "抓取优选源"}
+          </Btn>
           <Btn
             variant="primary"
             disabled={batch.running}
