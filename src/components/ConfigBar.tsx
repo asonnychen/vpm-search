@@ -43,6 +43,14 @@ export default function ConfigBar({
   const runningGeo = batch.running && batch.mode === "geo";
   const speedScope = selectedIds.length > 0 ? `选中 ${selectedIds.length} 行` : "整池";
 
+  // 抓取与刷新期间池子内容会整体换掉，测试与导出先让路，避免对着半份数据操作。
+  const poolBusy = fetching || refreshing;
+  const poolBusyReason = fetching ? "正在抓取优选源" : "正在刷新源清单";
+  const testDisabled = batch.running || poolBusy;
+  const testDisabledReason = poolBusy
+    ? `${poolBusyReason}，结束后才能发起测试`
+    : "测试进行中，结束后才能再发起一轮";
+
   const percent =
     batch.total > 0
       ? Math.min(100, Math.round((batch.completed / batch.total) * 100))
@@ -74,25 +82,32 @@ export default function ConfigBar({
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Btn
             variant="secondary"
+            disabled={poolBusy || batch.running}
             onClick={() => void fetchEverything()}
-            title="刷新源清单并抓取勾选的优选源"
+            title={
+              batch.running
+                ? "测试进行中，结束后才能抓取优选源"
+                : poolBusy
+                  ? `${poolBusyReason}，请等待完成`
+                  : "刷新源清单并抓取勾选的优选源"
+            }
           >
             {refreshing ? "刷新中…" : fetching ? "抓取中…" : "抓取优选源"}
           </Btn>
           <Btn
             variant="primary"
-            disabled={batch.running}
-            title={batch.running ? "测试进行中，结束后才能再发起一轮" : "对整池地址跑一轮真连接延迟"}
+            disabled={testDisabled}
+            title={testDisabled ? testDisabledReason : "对整池地址跑一轮真连接延迟"}
             onClick={() => void startBatch()}
           >
             {batch.running && batch.mode === "latency" ? "测试中…" : "一键测试真连接延迟"}
           </Btn>
           <Btn
             variant="accent"
-            disabled={batch.running}
+            disabled={testDisabled}
             title={
-              batch.running
-                ? "测试进行中，结束后才能再发起一轮"
+              testDisabled
+                ? testDisabledReason
                 : `对${speedScope}跑一轮多流测速，不影响已有延迟`
             }
             onClick={() =>
@@ -105,10 +120,10 @@ export default function ConfigBar({
           </Btn>
           <Btn
             variant="secondary"
-            disabled={batch.running}
+            disabled={testDisabled}
             title={
-              batch.running
-                ? "测试进行中，结束后才能再发起一轮"
+              testDisabled
+                ? testDisabledReason
                 : `查${speedScope}地址本身的归属地，不影响已有延迟与速度`
             }
             onClick={() =>
@@ -127,7 +142,13 @@ export default function ConfigBar({
           >
             {batch.stopping ? "停止中…" : "停止"}
           </Btn>
-          <Btn variant="secondary">导出 txt</Btn>
+          <Btn
+            variant="secondary"
+            disabled={poolBusy}
+            title={poolBusy ? `${poolBusyReason}，结束后才能导出` : "在表格工具栏导出当前结果"}
+          >
+            导出 txt
+          </Btn>
         </div>
       </div>
 

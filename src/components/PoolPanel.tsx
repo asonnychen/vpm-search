@@ -1,4 +1,5 @@
 import { formatFetchedAt, usePoolStore } from "../store/pool";
+import { selectProbeBatch, useProbeStore } from "../store/probe";
 import { selectLastInput, useSettingsStore } from "../store/settings";
 import { Btn, cn } from "./ui";
 
@@ -18,6 +19,16 @@ export default function PoolPanel() {
   const refreshCatalog = usePoolStore((state) => state.refreshCatalog);
   const fetchPool = usePoolStore((state) => state.fetchPool);
   const toggleSource = usePoolStore((state) => state.toggleSource);
+  const batch = useProbeStore(selectProbeBatch);
+
+  // 抓取、刷新与测试互斥：池子内容在换的时候不让重复发起，测试进行中也不抓。
+  const poolBusy = fetching || refreshing;
+  const fetchDisabled = poolBusy || batch.running;
+  const fetchReason = batch.running
+    ? "测试进行中，结束后才能抓取优选源"
+    : fetching
+      ? "正在抓取优选源，请等待完成"
+      : "正在刷新源清单，请等待完成";
 
   const checkedCount = sources.filter((s) => s.checked).length;
   const failedCount = sources.filter((s) => s.lastError).length;
@@ -99,16 +110,20 @@ export default function PoolPanel() {
             <div className="shrink-0 flex items-center gap-2 px-2 py-2 border-t border-line bg-panel-2/40">
               <Btn
                 variant="primary"
+                disabled={fetchDisabled}
                 onClick={() =>
                   void fetchPool(lastInput.manualAddresses, lastInput.sourceUrls)
                 }
+                title={fetchDisabled ? fetchReason : "抓取勾选的优选源与手动地址"}
                 className="h-7 px-2.5"
               >
                 {fetching ? "抓取中…" : "抓取选中源"}
               </Btn>
               <Btn
                 variant="secondary"
+                disabled={fetchDisabled}
                 onClick={() => void refreshCatalog()}
+                title={fetchDisabled ? fetchReason : "从 bestcf 页面重新读取源清单"}
                 className="h-7 px-2.5"
               >
                 {refreshing ? "刷新中…" : "刷新源清单"}
