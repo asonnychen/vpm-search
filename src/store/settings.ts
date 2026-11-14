@@ -55,11 +55,21 @@ export type Settings = {
 
 export const DEFAULT_COLUMN_WIDTHS = [64, 172, 140, 58, 84, 96, 156, 112, 88, 84];
 
+/**
+ * 地址并发默认值：逻辑核数 × 2，夹在 8–32 之间。
+ * 多核机器才能把并发槽位铺满；用户在设置里改过的值优先。
+ */
+export function defaultConcurrency(
+  cores = typeof navigator === "undefined" ? 1 : navigator.hardwareConcurrency || 1,
+): number {
+  return Math.min(32, Math.max(8, Math.round(cores) * 2));
+}
+
 export const DEFAULT_SETTINGS: Settings = {
   lastInput: { sourceUrls: "", manualAddresses: "" },
   maxLatencyMs: 200,
   connectTimeoutS: 5,
-  concurrency: 10,
+  concurrency: defaultConcurrency(),
   columnWidths: [...DEFAULT_COLUMN_WIDTHS],
   logRetention: { operationDays: 30, appDays: 30, probeDays: 30 },
   ui: { logHeight: 214, logCollapsed: false, configOpen: true, poolOpen: false },

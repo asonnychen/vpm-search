@@ -159,7 +159,9 @@ impl Default for Settings {
             max_latency_ms: 200,
             connect_timeout_s: 5,
             request_timeout_s: 10,
-            concurrency: 10,
+            // 并发默认按逻辑核数 × 2 算（夹在 8–32），多核机器才能跑满；
+            // 用户改过之后以库里存的值为准。
+            concurrency: crate::probe::batch::default_concurrency() as u32,
             latency_samples: 3,
             speed: SpeedParams::default(),
             column_widths: DEFAULT_COLUMN_WIDTHS.to_vec(),
@@ -261,6 +263,22 @@ mod tests {
     #[test]
     fn 默认设置通过校验() {
         Settings::default().validate().unwrap();
+    }
+
+    #[test]
+    fn 默认并发按核数放大且夹在_8_到_32() {
+        let concurrency = Settings::default().concurrency;
+        assert!(
+            (8..=32).contains(&concurrency),
+            "默认并发 {concurrency} 超出 8–32"
+        );
+        // 用户设置里的值仍然优先，不会被默认值覆盖。
+        let settings = Settings {
+            concurrency: 5,
+            ..Settings::default()
+        };
+        settings.validate().unwrap();
+        assert_eq!(settings.concurrency, 5);
     }
 
     #[test]

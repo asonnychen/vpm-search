@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use super::batch::BatchProber;
 use super::speed::{SpeedOptions, SpeedProber};
@@ -23,6 +24,12 @@ pub struct FakeProber {
     ips: Mutex<HashMap<(String, u16), Result<IpAddr, String>>>,
     calls: Mutex<Vec<(String, u16)>>,
     speed_calls: Mutex<Vec<(String, u16)>>,
+    /// 每次采样模拟的耗时，用来让并发真正重叠。
+    delay: Duration,
+    /// 当前正在采样的线程数，用来断言并发峰值。
+    in_flight: AtomicUsize,
+    /// 观察到的并发峰值。
+    peak_in_flight: AtomicUsize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // 只在测试里构造
@@ -78,6 +85,17 @@ impl FakeProber {
         self.calls.lock().map(|calls| calls.clone()).unwrap_or_default()
     }
 
+    /// 让每次采样先睡一会儿，制造可以重叠的并发窗口。
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// 观察到的并发峰值（同时在采样中的线程数）。
+    pub fn peak_concurrency(&self) -> usize {
+        self.peak_in_flight.load(Ordering::SeqCst)
+    }
+
     pub fn speed_calls(&self) -> Vec<(String, u16)> {
         self.speed_calls
             .lock()
@@ -109,10 +127,17 @@ impl FakeProber {
 
 impl Prober for FakeProber {
     fn measure_latency(&self, endpoint: &Endpoint, _options: &ProbeOptions) -> ProbeOutcome {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
         if let Ok(mut calls) = self.calls.lock() {
             calls.push((endpoint.host.clone(), endpoint.port));
         }
-        super::classify(self.next_attempt(endpoint))
+        let attempt = self.next_attempt(endpoint);
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        super::classify(attempt)
     }
 }
 

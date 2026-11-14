@@ -2,6 +2,12 @@
 //!
 //! 调度与聚合与具体探测器无关；直连探测器通过 [`BatchProber`] 接入，
 //! 测试里换成假探测器即可跑通整轮。
+//!
+//! 并发模型：探测全是阻塞 I/O（DNS + TCP + TLS），所以在
+//! [`std::thread::scope`] 里开 `concurrency` 个 OS 线程当并发槽位，
+//! 每个槽位自己领地址、解析、请求、聚合，主线程只等整轮结束，不在循环里
+//! 逐条 `await`。命令层用 `tauri::async_runtime::spawn_blocking`（该运行时
+//! 默认多线程）把整轮挪出异步线程池，因此槽位可以真正同时跑在不同核心上。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -13,9 +19,22 @@ use crate::store::Store;
 use super::{Endpoint, ProbeOptions, ProbeOutcome, ProbeStatus};
 
 /// 地址间并发默认值与允许范围。
-pub const DEFAULT_CONCURRENCY: usize = 10;
+///
+/// 默认值不再是固定 10：按逻辑核数 × 2 取，并夹在 8–32 之间，
+/// 让多核机器真正把并发槽位铺满；用户设置里已有的值优先。
+pub const MIN_DEFAULT_CONCURRENCY: usize = 8;
 pub const MIN_CONCURRENCY: usize = 1;
 pub const MAX_CONCURRENCY: usize = 32;
+
+/// 逻辑核数 × 2，夹在 8–32；读不到核数时按 1 核算（即下限 8）。
+pub fn default_concurrency() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    cores
+        .saturating_mul(2)
+        .clamp(MIN_DEFAULT_CONCURRENCY, MAX_CONCURRENCY)
+}
 
 /// 每条地址默认采样次数。
 pub const DEFAULT_SAMPLES: usize = 3;
@@ -47,7 +66,7 @@ pub struct BatchOptions {
 
 impl Default for BatchOptions {
     fn default() -> Self {
-        Self::new(DEFAULT_SAMPLES, DEFAULT_CONCURRENCY)
+        Self::new(DEFAULT_SAMPLES, default_concurrency())
     }
 }
 
@@ -444,6 +463,41 @@ mod tests {
         assert_eq!(BatchOptions::new(3, 99).concurrency, 32);
         assert_eq!(BatchOptions::new(0, 10).samples, 1);
         assert_eq!(BatchOptions::new(99, 10).samples, 10);
+    }
+
+    #[test]
+    fn 默认并发按核数放大且夹在_8_到_32() {
+        let default = default_concurrency();
+        assert!((8..=32).contains(&default), "默认并发 {default} 超出 8–32");
+        assert_eq!(BatchOptions::default().concurrency, default);
+        // 显式传入的值仍然优先，不被默认值改写。
+        assert_eq!(BatchOptions::new(3, 5).concurrency, 5);
+    }
+
+    /// 用假探测器跑满并发槽位：既要真正并行（峰值 > 1），也不能越过上限。
+    #[test]
+    fn 假探测器下并发真正展开且不超上限() {
+        let prober = crate::probe::fake::FakeProber::new(vec![Attempt::responded(80)])
+            .with_delay(Duration::from_millis(25));
+        let items: Vec<BatchItem> = (0..12)
+            .map(|i| item(&format!("104.16.9.{i}"), 8443))
+            .collect();
+
+        let report = run_batch(
+            &prober,
+            &items,
+            &ProbeOptions::default(),
+            BatchOptions::new(1, 4),
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(report.counts().ok, 12);
+        let peak = prober.peak_concurrency();
+        assert!(peak <= 4, "并发峰值 {peak} 超过上限 4");
+        assert!(peak >= 2, "并发没有真正展开，峰值 {peak}");
+        assert_eq!(prober.calls().len(), 12);
     }
 
     /// 第一次采样后请求停止，其余地址应保持未测。

@@ -5,6 +5,7 @@ import {
   REQUEST_TIMEOUT_S,
   SPEED_PARAMS,
   createSettingsStore,
+  defaultConcurrency,
   normalizeSettings,
   selectColumnWidths,
   selectLastInput,
@@ -27,6 +28,21 @@ afterEach(() => {
 });
 
 describe("normalizeSettings", () => {
+  it("默认并发按核数放大并夹在 8–32", () => {
+    expect(defaultConcurrency(1)).toBe(8);
+    expect(defaultConcurrency(4)).toBe(8);
+    expect(defaultConcurrency(8)).toBe(16);
+    expect(defaultConcurrency(32)).toBe(32);
+    expect(defaultConcurrency(64)).toBe(32);
+    expect(DEFAULT_SETTINGS.concurrency).toBeGreaterThanOrEqual(8);
+    expect(DEFAULT_SETTINGS.concurrency).toBeLessThanOrEqual(32);
+  });
+
+  it("用户设置里的并发值优先，不被默认值覆盖", () => {
+    expect(normalizeSettings({ concurrency: 6 }).concurrency).toBe(6);
+    expect(normalizeSettings({ concurrency: 32 }).concurrency).toBe(32);
+  });
+
   it("缺字段时补齐默认值", () => {
     const settings = normalizeSettings({ maxLatencyMs: 350 });
     expect(settings.maxLatencyMs).toBe(350);
