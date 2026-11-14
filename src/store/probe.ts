@@ -193,6 +193,14 @@ function mergeProbeRow(
 }
 
 /**
+ * 实时结果的合并窗口（毫秒）。
+ *
+ * 整池上千行时 `probe:row` 会非常密集，150–200ms 一批既能看清进度，
+ * 又不会每条事件都触发整表重排；收尾的整轮报告不受这里影响，立即覆盖。
+ */
+export const PROBE_ROW_FLUSH_MS = 180;
+
+/**
  * 高频实时结果的合并队列：同一条地址的同一类结果只保留最后一次，
  * 每 `intervalMs` 最多触发一次写入，避免每条事件都整表重排。
  */
@@ -206,7 +214,7 @@ export type ProbeRowQueue = {
 
 export function createProbeRowQueue(
   handler: (rows: ProbeRowEvent[]) => void,
-  intervalMs = 50,
+  intervalMs = PROBE_ROW_FLUSH_MS,
 ): ProbeRowQueue {
   let pending = new Map<string, ProbeRowEvent>();
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -852,12 +860,12 @@ export async function subscribeProbeProgress(
 }
 
 /**
- * 订阅后端逐条推送的实时结果；内部按 50ms 合并同类结果，避免整表频繁重排。
- * 返回取消订阅函数，取消时丢弃尚未写出的结果。
+ * 订阅后端逐条推送的实时结果；内部按 [`PROBE_ROW_FLUSH_MS`] 合并同类结果，
+ * 避免整表频繁重排。返回取消订阅函数，取消时丢弃尚未写出的结果。
  */
 export async function subscribeProbeRow(
   handler: (rows: ProbeRowEvent[]) => void,
-  intervalMs = 50,
+  intervalMs = PROBE_ROW_FLUSH_MS,
 ): Promise<() => void> {
   if (!isTauriRuntime()) return () => {};
 

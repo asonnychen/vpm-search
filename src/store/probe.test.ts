@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  PROBE_ROW_FLUSH_MS,
   createProbeRowQueue,
   createProbeStore,
   normalizeBatchReport,
@@ -600,6 +601,45 @@ describe("实时结果事件", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("默认合并窗口是 180ms，同一批内同一行只留最后一次", () => {
+    vi.useFakeTimers();
+    try {
+      const batches: ProbeRowEvent[][] = [];
+      const queue = createProbeRowQueue((rows) => batches.push(rows));
+
+      queue.push(rowEvent({ latencyMs: 100 }));
+      queue.push(rowEvent({ latencyMs: 90 }));
+      queue.push(rowEvent({ latencyMs: 80 }));
+
+      // 窗口没到，一条都不写。
+      vi.advanceTimersByTime(PROBE_ROW_FLUSH_MS - 1);
+      expect(batches).toHaveLength(0);
+
+      vi.advanceTimersByTime(1);
+      expect(batches).toHaveLength(1);
+      expect(batches[0]).toHaveLength(1);
+      expect(batches[0][0].latencyMs).toBe(80);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("整轮报告立即生效，节流中的中间态不会拖后覆盖最终结果", async () => {
+    const store = createProbeStore(fakePersistence());
+    const queue = createProbeRowQueue((rows) => store.getState().applyRows(rows));
+
+    // 节流窗口里先攒一条中间态。
+    queue.push(rowEvent({ latencyMs: 999 }));
+    await store.getState().startBatch();
+
+    // 报告已经落地，立刻就是最终值。
+    expect(store.getState().results["104.16.1.1:8443"].latencyMs).toBe(80);
+
+    // 迟到的合并批被丢弃，不会把最终结果改回中间态。
+    queue.flush();
+    expect(store.getState().results["104.16.1.1:8443"].latencyMs).toBe(80);
   });
 
   it("取消订阅时丢弃未写出的结果", () => {
