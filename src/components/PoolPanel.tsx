@@ -101,27 +101,12 @@ export default function PoolPanel() {
                 "https://bestcf.pages.dev/domain/all.txt\nhttps://bestcf.pages.dev/domain/mini.txt\nhttps://bestcf.pages.dev/vps789/top10.txt"
               }
             />
-            <div className="h-7 shrink-0 flex items-center justify-between px-2 border-y border-line bg-panel-2/70 text-[12px] text-dim">
-              <span className="whitespace-nowrap">手动补充优选地址</span>
-              <span className="whitespace-nowrap">换行或分号分隔</span>
-            </div>
-            <textarea
-              spellCheck={false}
-              value={lastInput.manualAddresses}
-              onChange={(e) => patch({ lastInput: { manualAddresses: e.target.value } })}
-              className="num w-full h-[52px] bg-transparent p-2 text-[12px] leading-5 text-text outline-none resize-none placeholder:text-dim/80"
-              placeholder={
-                "162.159.198.1:8443#EDT导航优选域名 | BestCF.pages.dev\nyg6.ygkkk.dpdns.org:443#VPS789优选"
-              }
-            />
             <div className="shrink-0 flex items-center gap-2 px-2 py-2 border-t border-line bg-panel-2/40">
               <Btn
                 variant="primary"
                 disabled={fetchDisabled}
-                onClick={() =>
-                  void fetchPool(lastInput.manualAddresses, lastInput.sourceUrls)
-                }
-                title={fetchDisabled ? fetchReason : "抓取勾选的优选源与手动地址"}
+                onClick={() => void fetchPool(lastInput.sourceUrls)}
+                title={fetchDisabled ? fetchReason : "抓取勾选的优选源与上方填写的 txt 地址"}
                 className="h-7 px-2.5"
               >
                 {fetching ? "抓取中…" : "抓取选中源"}

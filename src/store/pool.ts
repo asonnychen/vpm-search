@@ -112,7 +112,6 @@ export type PoolPersistence = {
   fetchPool: (
     sourceUrls: string[],
     extraSourceUrls: string[],
-    manualAddresses: string,
   ) => Promise<unknown>;
   setChecked: (url: string, checked: boolean) => Promise<void>;
   /** 批量设置勾选，一次落库。 */
@@ -128,7 +127,7 @@ export type PoolStore = PoolSnapshot & {
   error: string | null;
   load: () => Promise<void>;
   refreshCatalog: () => Promise<void>;
-  fetchPool: (manualAddresses: string, extraSourceUrls?: string) => Promise<void>;
+  fetchPool: (extraSourceUrls?: string) => Promise<void>;
   toggleSource: (url: string, checked: boolean) => Promise<void>;
   /** 全选/取消全选：只作用于正常源，异常源不参与批量。 */
   setAllChecked: (checked: boolean) => Promise<void>;
@@ -174,7 +173,7 @@ export function createPoolStore(persistence: PoolPersistence) {
         }
       },
 
-      fetchPool: async (manualAddresses, extraSourceUrls = "") => {
+      fetchPool: async (extraSourceUrls = "") => {
         const urls = get()
           .sources.filter((s) => s.checked)
           .map((s) => s.url);
@@ -187,17 +186,15 @@ export function createPoolStore(persistence: PoolPersistence) {
               .filter((line) => line !== ""),
           ),
         );
-        if (urls.length === 0 && pasted.length === 0 && manualAddresses.trim() === "") {
-          set({ error: "没有勾选任何优选源，也没有手动地址" });
+        if (urls.length === 0 && pasted.length === 0) {
+          set({ error: "没有勾选任何优选源，也没有填写源地址" });
           return;
         }
 
         set({ fetching: true, error: null });
         try {
           apply(
-            normalizeSnapshot(
-              await persistence.fetchPool(urls, pasted, manualAddresses),
-            ),
+            normalizeSnapshot(await persistence.fetchPool(urls, pasted)),
           );
           set({ fetching: false });
         } catch (error) {
@@ -257,12 +254,11 @@ export const tauriPoolPersistence: PoolPersistence = {
   load: () => (isTauriRuntime() ? invoke<unknown>("get_pool") : Promise.resolve(null)),
   refreshCatalog: () =>
     isTauriRuntime() ? invoke<unknown>("refresh_source_catalog") : Promise.resolve(null),
-  fetchPool: (sourceUrls, extraSourceUrls, manualAddresses) =>
+  fetchPool: (sourceUrls, extraSourceUrls) =>
     isTauriRuntime()
       ? invoke<unknown>("fetch_pool", {
           sourceUrls,
           extraSourceUrls,
-          manualAddresses,
         })
       : Promise.resolve(null),
   setChecked: (url, checked) =>

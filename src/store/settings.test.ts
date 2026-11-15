@@ -102,7 +102,6 @@ describe("设置 store 的读写", () => {
     expect(selectThresholdMs(state)).toBe(350);
     expect(selectColumnWidths(state)[0]).toBe(100);
     expect(selectLastInput(state).sourceUrls).toBe("https://example.com/all.txt");
-    expect(selectLastInput(state).manualAddresses).toBe("");
   });
 
   it("修改后防抖保存整份设置", async () => {

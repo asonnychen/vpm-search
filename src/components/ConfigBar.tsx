@@ -36,7 +36,7 @@ export default function ConfigBar({
   /** 一键抓取：先刷新源清单，再抓取勾选的源。 */
   const fetchEverything = async () => {
     await refreshCatalog();
-    await fetchPool(lastInput.manualAddresses, lastInput.sourceUrls);
+    await fetchPool(lastInput.sourceUrls);
   };
 
   const runningSpeed = batch.running && batch.mode === "speed";

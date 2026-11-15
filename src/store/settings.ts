@@ -8,8 +8,6 @@ export const COLUMN_COUNT = 10;
 export type LastInput = {
   /** 优选源 txt 地址，每行一个。 */
   sourceUrls: string;
-  /** 手动补充的优选地址，换行或分号分隔。 */
-  manualAddresses: string;
 };
 
 export type SpeedParams = {
@@ -68,7 +66,7 @@ export function defaultConcurrency(
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  lastInput: { sourceUrls: "", manualAddresses: "" },
+  lastInput: { sourceUrls: "" },
   maxLatencyMs: 200,
   connectTimeoutS: 5,
   concurrency: defaultConcurrency(),
@@ -122,10 +120,6 @@ export function normalizeSettings(raw: unknown): Settings {
   return {
     lastInput: {
       sourceUrls: text(lastInput.sourceUrls, DEFAULT_SETTINGS.lastInput.sourceUrls),
-      manualAddresses: text(
-        lastInput.manualAddresses,
-        DEFAULT_SETTINGS.lastInput.manualAddresses,
-      ),
     },
     maxLatencyMs: numberIn(source.maxLatencyMs, DEFAULT_SETTINGS.maxLatencyMs, 1, 10_000),
     connectTimeoutS: numberIn(source.connectTimeoutS, DEFAULT_SETTINGS.connectTimeoutS, 1, 10),

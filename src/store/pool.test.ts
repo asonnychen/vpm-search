@@ -96,25 +96,23 @@ describe("池 store", () => {
     expect(state.duplicates).toBe(1);
   });
 
-  it("抓取只带勾选的源，并把手动地址与粘贴的源一起提交", async () => {
+  it("抓取只带勾选的源，并把粘贴的源一起提交", async () => {
     const fetchPool = vi.fn(async () => SNAPSHOT);
     const store = createPoolStore(fakePersistence({ fetchPool }));
     await store.getState().load();
 
     await store.getState().fetchPool(
-      "3.3.3.3:443#手动",
       "https://example.com/all.txt\n\n https://example.com/all.txt \nhttps://b.example.com/x.txt",
     );
 
     expect(fetchPool).toHaveBeenCalledWith(
       ["https://bestcf.pages.dev/domain/all.txt"],
       ["https://example.com/all.txt", "https://b.example.com/x.txt"],
-      "3.3.3.3:443#手动",
     );
     expect(store.getState().entries).toHaveLength(1);
   });
 
-  it("没有勾选也没有手动地址时直接给出提示", async () => {
+  it("没有勾选也没有填写源地址时直接给出提示", async () => {
     const fetchPool = vi.fn(async () => SNAPSHOT);
     const store = createPoolStore(
       fakePersistence({
