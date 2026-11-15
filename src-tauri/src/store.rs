@@ -484,12 +484,33 @@ impl Store {
         error: Option<&str>,
         fetched_at: &str,
     ) -> Result<()> {
+        // 抓取失败的源默认不勾选，避免一次网络抖动就让下一轮继续抓它；
+        // 成功的源保留用户原来的勾选状态。
         self.conn.execute(
             "UPDATE pool_source
-             SET entry_count = ?2, last_error = ?3, fetched_at = ?4
+             SET entry_count = ?2,
+                 last_error = ?3,
+                 fetched_at = ?4,
+                 checked = CASE WHEN ?3 IS NULL THEN checked ELSE 0 END
              WHERE url = ?1",
             rusqlite::params![url, i64::from(entry_count), error, fetched_at],
         )?;
+        Ok(())
+    }
+
+    /// 从源清单里删除若干源（本次抓取判定为无效的源）。
+    pub fn delete_pool_sources(&self, urls: &[String]) -> Result<()> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM pool_source WHERE url = ?1")?;
+            for url in urls {
+                stmt.execute([url])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -508,6 +529,36 @@ impl Store {
             "INSERT INTO test_run
                  (id, started_at, finished_at, params_json, total, ok_count, timeout_count, fail_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                run.id,
+                run.started_at,
+                run.finished_at,
+                run.params_json,
+                i64::from(run.total),
+                i64::from(run.ok_count),
+                i64::from(run.timeout_count),
+                i64::from(run.fail_count),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 写入或更新一条测试轮次。
+    ///
+    /// 增量保存要求轮次行在第一条结果落库前就存在（`test_result` 有外键），
+    /// 所以命令层先用它建占位轮次，结束时再用同一方法写最终统计。
+    pub fn upsert_test_run(&self, run: &TestRunRecord<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO test_run
+                 (id, started_at, finished_at, params_json, total, ok_count, timeout_count, fail_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 finished_at = excluded.finished_at,
+                 params_json = excluded.params_json,
+                 total = excluded.total,
+                 ok_count = excluded.ok_count,
+                 timeout_count = excluded.timeout_count,
+                 fail_count = excluded.fail_count",
             rusqlite::params![
                 run.id,
                 run.started_at,
@@ -542,6 +593,59 @@ impl Store {
         outcome: &crate::probe::ProbeOutcome,
         samples_json: &str,
     ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO test_result
+                 (run_id, host, port, alias, status, latency_ms, error, samples_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                run_id,
+                endpoint.host,
+                i64::from(endpoint.port),
+                alias,
+                outcome.status.as_str(),
+                outcome.latency_ms.map(|ms| ms as i64),
+                outcome.error,
+                samples_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按 `run_id + host + port` 更新或新建一条延迟结果。
+    ///
+    /// 增量保存与最终写入共用这一条路径：同一轮同一地址只保留最新一条，
+    /// 重复 flush 不会产生重复行。只写延迟相关列，不碰速度与归属地。
+    pub fn upsert_test_result_latency(
+        &self,
+        run_id: &str,
+        endpoint: &crate::probe::Endpoint,
+        alias: &str,
+        outcome: &crate::probe::ProbeOutcome,
+        samples_json: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE test_result
+             SET alias = ?4,
+                 status = ?5,
+                 latency_ms = ?6,
+                 error = ?7,
+                 samples_json = ?8
+             WHERE run_id = ?1 AND host = ?2 AND port = ?3",
+            rusqlite::params![
+                run_id,
+                endpoint.host,
+                i64::from(endpoint.port),
+                alias,
+                outcome.status.as_str(),
+                outcome.latency_ms.map(|ms| ms as i64),
+                outcome.error,
+                samples_json,
+            ],
+        )?;
+        if changed > 0 {
+            return Ok(());
+        }
+
         self.conn.execute(
             "INSERT INTO test_result
                  (run_id, host, port, alias, status, latency_ms, error, samples_json)
@@ -695,6 +799,7 @@ impl Store {
     }
 
     /// 读全部归属地缓存，用于启动一轮查询前预灌内存缓存。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn list_geo_cache(&self) -> Result<Vec<GeoCacheRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT ip, country, zh, en, asn
@@ -927,6 +1032,7 @@ pub struct TestResultRow {
 }
 
 /// `geo_cache` 的一行：IP 到归属地的缓存。
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeoCacheRow {
     pub ip: String,
@@ -1564,6 +1670,81 @@ mod tests {
         assert!(after < before, "删除后体积应下降：{before} -> {after}");
         // 已删除的轮次再删一次返回 false，不报错。
         assert!(!store.delete_test_run("run-a").unwrap());
+    }
+
+    #[test]
+    fn 延迟结果按轮次与地址去重并更新最新结论() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_test_run(&TestRunRecord {
+                id: "run-upsert",
+                started_at: "2026-11-13T00:00:00.000Z",
+                finished_at: "2026-11-13T00:00:00.000Z",
+                params_json: "{}",
+                total: 1,
+                ok_count: 0,
+                timeout_count: 0,
+                fail_count: 0,
+            })
+            .unwrap();
+        let endpoint = crate::probe::Endpoint::new("104.16.1.1", 8443);
+
+        store
+            .upsert_test_result_latency(
+                "run-upsert",
+                &endpoint,
+                "别名",
+                &crate::probe::ProbeOutcome::ok(120),
+                "[]",
+            )
+            .unwrap();
+        // 重复 flush 同一地址：更新而不是新增。
+        store
+            .upsert_test_result_latency(
+                "run-upsert",
+                &endpoint,
+                "别名",
+                &crate::probe::ProbeOutcome::ok(80),
+                "[]",
+            )
+            .unwrap();
+
+        assert_eq!(store.count_test_results().unwrap(), 1);
+        let rows = store.list_test_results("run-upsert").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].latency_ms, Some(80));
+        assert_eq!(rows[0].status, "ok");
+    }
+
+    #[test]
+    fn 抓取失败的源默认取消勾选() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_catalog(&catalog()).unwrap();
+        store
+            .record_source_fetch(
+                "https://bestcf.pages.dev/domain/all.txt",
+                0,
+                Some("请求超时（10s）"),
+                "2026-11-13T00:00:00.000Z",
+            )
+            .unwrap();
+
+        let sources = store.list_pool_sources().unwrap();
+        assert!(!sources[0].checked, "失败的源要取消勾选");
+        assert_eq!(sources[0].last_error.as_deref(), Some("请求超时（10s）"));
+        // 用户重新勾选后，成功的抓取保留勾选状态。
+        store
+            .set_source_checked("https://bestcf.pages.dev/domain/all.txt", true)
+            .unwrap();
+        store
+            .record_source_fetch(
+                "https://bestcf.pages.dev/domain/all.txt",
+                3,
+                None,
+                "2026-11-13T00:01:00.000Z",
+            )
+            .unwrap();
+        assert!(store.list_pool_sources().unwrap()[0].checked);
     }
 
     #[test]
