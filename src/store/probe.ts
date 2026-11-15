@@ -200,6 +200,9 @@ function mergeProbeRow(
  */
 export const PROBE_ROW_FLUSH_MS = 180;
 
+/** 点停止后最多等多久让后端收尾；超时就本地复位，避免界面卡在“测试中”。 */
+const CANCEL_WATCHDOG_MS = 8000;
+
 /**
  * 高频实时结果的合并队列：同一条地址的同一类结果只保留最后一次，
  * 每 `intervalMs` 最多触发一次写入，避免每条事件都整表重排。
@@ -769,11 +772,20 @@ export function createProbeStore(persistence: ProbePersistence) {
       if (get().batch.running) {
         set({ batch: { ...get().batch, stopping: true } });
       }
+      const runId = get().batch.runId;
       try {
         await persistence.cancelBatch();
       } catch (error) {
         set({ error: errorMessage(error) });
       }
+      // 兜底：后端若迟迟没有回报收尾，就把本地状态复位，避免界面永远停在“测试中”。
+      globalThis.setTimeout(() => {
+        const batch = get().batch;
+        if (batch.running && batch.runId === runId) {
+          markFinished(runId ?? "");
+          set({ batch: { ...batch, running: false, stopping: false, stopped: true } });
+        }
+      }, CANCEL_WATCHDOG_MS);
     },
 
     applyProgress: (progress) => {

@@ -696,16 +696,6 @@ export default function ResultsTable() {
                       >
                         {busy ? "测试中" : "重测"}
                       </button>
-                      <button
-                        type="button"
-                        className="size-5 grid place-items-center border border-line rounded-[2px] text-dim hover:text-text"
-                        title="详情"
-                      >
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <circle cx="12" cy="12" r="9" />
-                          <path d="M12 11v5M12 8h.01" />
-                        </svg>
-                      </button>
                     </div>
                   </td>
                 </tr>

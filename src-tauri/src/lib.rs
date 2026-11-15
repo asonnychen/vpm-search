@@ -1449,37 +1449,38 @@ async fn probe_geo_batch(
 ///
 /// 停止不依赖协作式取消：直接 kill 探测子进程，未完成的行由监督器收尾。
 #[tauri::command]
-fn probe_cancel(
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<bool, String> {
+async fn probe_cancel(app: tauri::AppHandle) -> Result<bool, String> {
     let trace = logs::new_trace_id();
     let started = Instant::now();
 
-    let result = (|| -> Result<(bool, Option<u32>), String> {
-        let guard = state
-            .batch
-            .lock()
-            .map_err(|_| "测试状态锁已损坏".to_string())?;
-        match guard.as_ref() {
-            Some(control) => {
-                control.cancel.store(true, Ordering::SeqCst);
-                let handle = control
-                    .worker
-                    .lock()
-                    .ok()
-                    .and_then(|slot| slot.clone());
-                let pid = handle.as_ref().map(|worker| worker.pid());
-                if let Some(worker) = handle.as_ref() {
-                    worker.kill()?;
-                }
-                Ok((true, pid))
-            }
-            None => Ok((false, None)),
+    // 放到阻塞线程池：kill 与锁等待都不能占住 IPC 线程，否则界面会像卡死。
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<(bool, Option<u32>), String> {
+        let state = app_for_task.state::<AppState>();
+        // 只在取句柄时短暂持锁，kill 放在锁外，避免与收尾线程互相等待。
+        let control = {
+            let guard = state
+                .batch
+                .lock()
+                .map_err(|_| "测试状态锁已损坏".to_string())?;
+            guard.as_ref().cloned()
+        };
+        let Some(control) = control else {
+            return Ok((false, None));
+        };
+        control.cancel.store(true, Ordering::SeqCst);
+        let worker = control.worker.lock().ok().and_then(|slot| slot.clone());
+        let pid = worker.as_ref().map(|worker| worker.pid());
+        if let Some(worker) = worker {
+            worker.kill()?;
         }
-    })();
+        Ok((true, pid))
+    })
+    .await
+    .map_err(|e| format!("停止任务异常结束：{e}"))?;
 
     let duration_ms = started.elapsed().as_millis() as u64;
+    let state = app.state::<AppState>();
     match &result {
         Ok((requested, pid)) => {
             log_app(
