@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), allow(dead_code))]
 //! 归属地：查优选地址本身的 IP（见 ADR-0007）。
 //!
 //! 直连探测不再有「出口 IP」这个概念，归属地只说明这条地址本身注册在哪个国家。
@@ -13,6 +14,7 @@ pub use offline::OfflineDb;
 pub use online::IpWhoIs;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -21,6 +23,27 @@ use serde::Serialize;
 use crate::probe::batch::{BatchEvent, BatchItem, BatchProgress};
 use crate::probe::{Endpoint, HostResolver, ProbeStatus};
 use crate::store::Store;
+
+/// 离线库候选路径：主程序同目录 → 同目录 resources → 开发期 resources。
+///
+/// 子进程（`--probe-worker`）没有 Tauri 资源目录，只能靠这几处定位离线库。
+pub fn offline_candidates() -> Vec<PathBuf> {
+    let file = offline::GEOIP_FILE;
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(offline::GEOIP_DIR).join(file));
+            candidates.push(dir.join("resources").join(offline::GEOIP_DIR).join(file));
+        }
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(offline::GEOIP_DIR)
+            .join(file),
+    );
+    candidates
+}
 
 /// 一条归属地记录（缓存与落库的最小单位）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -290,6 +313,7 @@ pub fn run_geo_batch(
                 if let Some(info) = &row.info {
                     event.country_zh = Some(info.zh.clone());
                     event.country_en = Some(info.en.clone());
+                    event.country = Some(info.country.clone());
                 }
                 on_event(BatchEvent::Row(event));
 

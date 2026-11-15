@@ -19,12 +19,19 @@ use crate::logs::LogWriter;
 
 /// 真探测器：每次探测临时建一个客户端，把探测主机名钉到目标地址。
 pub struct DirectProber {
-    writer: Arc<LogWriter>,
+    writer: Option<Arc<LogWriter>>,
 }
 
 impl DirectProber {
     pub fn new(writer: Arc<LogWriter>) -> Self {
-        Self { writer }
+        Self {
+            writer: Some(writer),
+        }
+    }
+
+    /// 子进程里的探测器：不写应用日志（探测日志由主进程统一收口）。
+    pub fn new_silent() -> Self {
+        Self { writer: None }
     }
 
     /// 建一个客户端：`no_proxy()` + 把 `speed.cloudflare.com` 解析到目标地址。
@@ -76,15 +83,29 @@ impl DirectProber {
             (status, _, Some(error)) => format!("{status} {error}"),
             (status, _, None) => status.to_string(),
         };
-        let _ = self.writer.append_probe_line(&format!(
-            "{}:{} -> {ip} {detail}",
-            endpoint.host, endpoint.port
-        ));
+        let _ = self.writer.as_ref().map(|writer| {
+            writer.append_probe_line(&format!(
+                "{}:{} -> {ip} {detail}",
+                endpoint.host, endpoint.port
+            ))
+        });
     }
 }
 
 impl Prober for DirectProber {
     fn measure_latency(&self, endpoint: &Endpoint, options: &ProbeOptions) -> ProbeOutcome {
+        self.measure_latency_samples(endpoint, options, LATENCY_SAMPLES)
+    }
+}
+
+impl DirectProber {
+    /// 按指定采样次数测延迟；任一次成功即取最小值。
+    pub fn measure_latency_samples(
+        &self,
+        endpoint: &Endpoint,
+        options: &ProbeOptions,
+        samples: usize,
+    ) -> ProbeOutcome {
         let ip = match resolve_host(&endpoint.host) {
             Ok(ip) => ip,
             Err(error) => return ProbeOutcome::fail(error),
@@ -99,13 +120,14 @@ impl Prober for DirectProber {
             Err(error) => return ProbeOutcome::fail(error),
         };
 
-        let mut samples = Vec::with_capacity(LATENCY_SAMPLES);
-        for _ in 0..LATENCY_SAMPLES {
+        let samples = samples.clamp(1, 10);
+        let mut outcomes = Vec::with_capacity(samples);
+        for _ in 0..samples {
             let outcome = classify(self.attempt(&client));
             self.log(endpoint, ip, &outcome);
-            samples.push(outcome);
+            outcomes.push(outcome);
         }
-        aggregate(&samples)
+        aggregate(&outcomes)
     }
 }
 
@@ -126,10 +148,12 @@ impl SpeedProber for DirectProber {
         let ip = resolve_host(&endpoint.host)?;
         let client = self.client(ip, endpoint.port, options.connect_timeout, speed.timeout)?;
         let mbps = download_streams(&client, speed, cancel)?;
-        let _ = self.writer.append_probe_line(&format!(
-            "{}:{} -> {ip} speed {mbps} MB/s",
-            endpoint.host, endpoint.port
-        ));
+        if let Some(writer) = self.writer.as_ref() {
+            let _ = writer.append_probe_line(&format!(
+                "{}:{} -> {ip} speed {mbps} MB/s",
+                endpoint.host, endpoint.port
+            ));
+        }
         Ok(mbps)
     }
 }

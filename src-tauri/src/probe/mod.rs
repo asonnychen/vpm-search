@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), allow(dead_code))]
 //! 直连边缘探测：不经过任何代理，直接对优选地址发起 TLS 请求。
 //!
 //! 设计要点（见 ADR-0007 与 ADR-0004）：
@@ -10,6 +11,8 @@ pub mod batch;
 pub mod direct;
 pub mod fake;
 pub mod speed;
+pub mod supervisor;
+pub mod worker;
 
 pub use direct::DirectProber;
 
@@ -191,6 +194,9 @@ pub struct RowEvent {
     pub speed_mbps: Option<f64>,
     pub country_zh: Option<String>,
     pub country_en: Option<String>,
+    /// 国家码；归属地结果带，其它模式为 `None`。
+    #[serde(default)]
+    pub country: Option<String>,
     pub colo: Option<String>,
     pub error: Option<String>,
 }
@@ -206,6 +212,7 @@ impl RowEvent {
             speed_mbps: None,
             country_zh: None,
             country_en: None,
+            country: None,
             colo: None,
             error: None,
         }
