@@ -2,6 +2,11 @@
 //!
 //! 所有请求显式 `no_proxy()`（见 ADR 0004），单源超时 10 秒；
 //! 单源失败只影响该源，合并逻辑保持为纯函数以便单测。
+//!
+//! 抓取结果分三种：
+//! - 有效源：解析出至少一条地址，进池；
+//! - 暂时失败：超时、连接失败，保留在清单里并标 `lastError`，默认不勾选；
+//! - 无效源：HTTP ≥ 400、内容不是合法 txt、解析为 0 条，直接丢弃。
 
 use std::time::Duration;
 
@@ -13,18 +18,17 @@ pub const CATALOG_URL: &str = "https://bestcf.pages.dev/";
 /// 单个源的抓取超时。
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 手动粘贴地址的来源标识。
-pub const MANUAL_SOURCE: &str = "手动";
-
-/// 一个源本次抓取的结果，成功与失败都记在同一条里。
+/// 一个源本次抓取的结果，成功、失败与丢弃都记在同一条里。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedSource {
     pub url: String,
     pub name: String,
     /// 成功时的响应正文。
     pub body: Option<String>,
-    /// 失败时的可读原因。
+    /// 暂时失败时的可读原因（保留源，默认不勾选）。
     pub error: Option<String>,
+    /// 判定为无效源的原因；有值时主进程会从 `pool_source` 删除它。
+    pub drop_reason: Option<String>,
     /// 本次抓取耗时（毫秒），写进应用日志。
     pub duration_ms: u64,
 }
@@ -45,21 +49,63 @@ pub struct SourceOutcome {
     pub url: String,
     pub name: String,
     pub entry_count: u32,
+    /// 暂时失败的原因；保留源并标记。
     pub error: Option<String>,
+    /// 无效源的原因；丢弃源。
+    pub drop_reason: Option<String>,
     pub duration_ms: u64,
 }
 
-/// 把各源的抓取结果与手动地址合并成最终池内容（按 `host:port` 去重）。
-pub fn assemble(sources: &[FetchedSource], manual_text: &str) -> PoolBuild {
+/// 判断响应正文是不是一份合法的 txt 优选源。
+pub fn is_valid_txt(body: &str) -> Result<(), String> {
+    if body.trim().is_empty() {
+        return Err("内容为空".to_string());
+    }
+    if body.contains('\0') {
+        return Err("内容包含二进制字符".to_string());
+    }
+    if body.contains('\u{FFFD}') {
+        return Err("内容不是合法 UTF-8 文本".to_string());
+    }
+    let head: String = body
+        .trim_start()
+        .chars()
+        .take(64)
+        .collect::<String>()
+        .to_lowercase();
+    if head.starts_with("<!doctype")
+        || head.starts_with("<html")
+        || head.starts_with("<?xml")
+        || head.starts_with("<head")
+    {
+        return Err("内容不是 txt".to_string());
+    }
+    Ok(())
+}
+
+/// 把各源的抓取结果合并成最终池内容（按 `host:port` 去重）。
+pub fn assemble(sources: &[FetchedSource]) -> PoolBuild {
     let mut build = PoolBuild::default();
 
     for source in sources {
+        if let Some(reason) = &source.drop_reason {
+            build.outcomes.push(SourceOutcome {
+                url: source.url.clone(),
+                name: source.name.clone(),
+                entry_count: 0,
+                error: None,
+                drop_reason: Some(reason.clone()),
+                duration_ms: source.duration_ms,
+            });
+            continue;
+        }
         if let Some(error) = &source.error {
             build.outcomes.push(SourceOutcome {
                 url: source.url.clone(),
                 name: source.name.clone(),
                 entry_count: 0,
                 error: Some(error.clone()),
+                drop_reason: None,
                 duration_ms: source.duration_ms,
             });
             continue;
@@ -67,11 +113,23 @@ pub fn assemble(sources: &[FetchedSource], manual_text: &str) -> PoolBuild {
         let body = source.body.as_deref().unwrap_or("");
         let outcome = parse_txt(body, &source.url);
         build.skipped += outcome.skipped;
+        if outcome.entries.is_empty() {
+            build.outcomes.push(SourceOutcome {
+                url: source.url.clone(),
+                name: source.name.clone(),
+                entry_count: 0,
+                error: None,
+                drop_reason: Some("解析结果为 0 条".to_string()),
+                duration_ms: source.duration_ms,
+            });
+            continue;
+        }
         build.outcomes.push(SourceOutcome {
             url: source.url.clone(),
             name: source.name.clone(),
             entry_count: outcome.entries.len() as u32,
             error: None,
+            drop_reason: None,
             duration_ms: source.duration_ms,
         });
         build
@@ -85,20 +143,6 @@ pub fn assemble(sources: &[FetchedSource], manual_text: &str) -> PoolBuild {
             }));
     }
 
-    // 手动地址放在最后，重复时保留抓取到的那条；换行与分号都算分隔符。
-    let manual_text = manual_text.replace(';', "\n");
-    let manual = parse_txt(&manual_text, "");
-    build.skipped += manual.skipped;
-    build
-        .candidates
-        .extend(manual.entries.into_iter().map(|entry| PoolCandidate {
-            host: entry.host,
-            port: entry.port,
-            alias: entry.alias,
-            source: MANUAL_SOURCE.to_string(),
-            source_url: None,
-        }));
-
     let (candidates, duplicates) = dedupe(build.candidates);
     build.candidates = candidates;
     build.duplicates = duplicates;
@@ -108,24 +152,50 @@ pub fn assemble(sources: &[FetchedSource], manual_text: &str) -> PoolBuild {
 /// 按 URL 抓取一个 txt 源，失败时返回可读原因。
 pub async fn fetch_source(client: &reqwest::Client, source: &CatalogSource) -> FetchedSource {
     let started = std::time::Instant::now();
-    let result = fetch_text(client, &source.url).await;
+    let response = client.get(&source.url).send().await;
     let duration_ms = started.elapsed().as_millis() as u64;
-    match result {
-        Ok(body) => FetchedSource {
-            url: source.url.clone(),
-            name: source.name.clone(),
-            body: Some(body),
-            error: None,
-            duration_ms,
-        },
-        Err(error) => FetchedSource {
-            url: source.url.clone(),
-            name: source.name.clone(),
-            body: None,
-            error: Some(error),
-            duration_ms,
-        },
+
+    let mut fetched = FetchedSource {
+        url: source.url.clone(),
+        name: source.name.clone(),
+        body: None,
+        error: None,
+        drop_reason: None,
+        duration_ms,
+    };
+
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            // 超时与连接失败只算「暂时失败」，源保留在清单里。
+            fetched.error = Some(if error.is_timeout() {
+                format!("请求超时（{}s）", SOURCE_TIMEOUT.as_secs())
+            } else {
+                format!("请求失败：{error}")
+            });
+            return fetched;
+        }
+    };
+
+    if !response.status().is_success() {
+        // HTTP ≥ 400 是确定的无效源，直接丢弃。
+        fetched.drop_reason = Some(format!("HTTP {}", response.status().as_u16()));
+        return fetched;
     }
+
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            fetched.error = Some(format!("读取响应失败：{error}"));
+            return fetched;
+        }
+    };
+
+    match is_valid_txt(&body) {
+        Ok(()) => fetched.body = Some(body),
+        Err(reason) => fetched.drop_reason = Some(reason),
+    }
+    fetched
 }
 
 /// 并发抓取所有源；单源失败不影响其它源。
@@ -176,6 +246,7 @@ mod tests {
             name: name.to_string(),
             body: Some(body.to_string()),
             error: None,
+            drop_reason: None,
             duration_ms: 12,
         }
     }
@@ -187,7 +258,8 @@ mod tests {
                 url: "https://bestcf.pages.dev/luoli/all.txt".to_string(),
                 name: "BestCF·luoli/all.txt".to_string(),
                 body: None,
-                error: Some("HTTP 404".to_string()),
+                error: Some("请求超时（10s）".to_string()),
+                drop_reason: None,
                 duration_ms: 34,
             },
             ok_source(
@@ -197,61 +269,101 @@ mod tests {
             ),
         ];
 
-        let build = assemble(&sources, "");
+        let build = assemble(&sources);
 
         assert_eq!(build.candidates.len(), 2);
-        assert_eq!(build.outcomes[0].error.as_deref(), Some("HTTP 404"));
+        assert_eq!(build.outcomes[0].error.as_deref(), Some("请求超时（10s）"));
+        assert_eq!(build.outcomes[0].drop_reason, None, "超时源要保留");
         assert_eq!(build.outcomes[0].entry_count, 0);
         assert_eq!(build.outcomes[1].entry_count, 2);
         assert_eq!(build.outcomes[1].duration_ms, 12);
     }
 
     #[test]
-    fn 手动地址与抓取结果合并去重() {
-        let sources = vec![ok_source(
-            "https://bestcf.pages.dev/domain/all.txt",
-            "BestCF·domain/all.txt",
-            "1.1.1.1:443#抓取\n2.2.2.2:443#抓取\n",
-        )];
-        // 换行与分号都能分隔；重复地址保留抓取到的那条。
-        let manual = "2.2.2.2:443#手动重复\n3.3.3.3:443#手动 | 备注;4.4.4.4:8443#第二条";
+    fn http_404_的源被丢弃() {
+        let sources = vec![FetchedSource {
+            url: "https://bestcf.pages.dev/missing/all.txt".to_string(),
+            name: "BestCF·missing/all.txt".to_string(),
+            body: None,
+            error: None,
+            drop_reason: Some("HTTP 404".to_string()),
+            duration_ms: 8,
+        }];
 
-        let build = assemble(&sources, manual);
-
-        assert_eq!(build.candidates.len(), 4);
-        assert_eq!(build.duplicates, 1);
-        let duplicate = build
-            .candidates
-            .iter()
-            .find(|c| c.host == "2.2.2.2")
-            .unwrap();
-        assert_eq!(duplicate.alias, "抓取");
-        assert_eq!(duplicate.source, "BestCF·domain/all.txt");
-
-        let manual_entry = build
-            .candidates
-            .iter()
-            .find(|c| c.host == "3.3.3.3")
-            .unwrap();
-        assert_eq!(manual_entry.source, MANUAL_SOURCE);
-        assert_eq!(manual_entry.alias, "手动 | 备注");
+        let build = assemble(&sources);
+        assert!(build.candidates.is_empty());
+        assert_eq!(build.outcomes[0].drop_reason.as_deref(), Some("HTTP 404"));
+        assert_eq!(build.outcomes[0].error, None);
     }
 
     #[test]
-    fn 分号分隔的手动地址也能解析() {
-        let build = assemble(&[], "1.1.1.1:443;2.2.2.2:443\n3.3.3.3:443");
-        assert_eq!(build.candidates.len(), 3);
-    }
+    fn 空内容与解析为零条的源被丢弃() {
+        // 抓取阶段判定空内容。
+        let sources = vec![FetchedSource {
+            url: "https://bestcf.pages.dev/empty/all.txt".to_string(),
+            name: "BestCF·empty/all.txt".to_string(),
+            body: None,
+            error: None,
+            drop_reason: Some("内容为空".to_string()),
+            duration_ms: 4,
+        }];
+        let build = assemble(&sources);
+        assert_eq!(build.outcomes[0].drop_reason.as_deref(), Some("内容为空"));
 
-    #[test]
-    fn 解析失败的行计入跳过数() {
+        // 有内容但一行地址都解析不出来。
         let sources = vec![ok_source(
-            "https://bestcf.pages.dev/domain/all.txt",
-            "BestCF·domain/all.txt",
-            "1.1.1.1:443\n坏行\n",
+            "https://bestcf.pages.dev/junk/all.txt",
+            "BestCF·junk/all.txt",
+            "这不是地址\n也不是地址\n",
         )];
-        let build = assemble(&sources, "也不是地址");
-        assert_eq!(build.candidates.len(), 1);
+        let build = assemble(&sources);
+        assert!(build.candidates.is_empty());
+        assert_eq!(
+            build.outcomes[0].drop_reason.as_deref(),
+            Some("解析结果为 0 条")
+        );
         assert_eq!(build.skipped, 2);
+    }
+
+    #[test]
+    fn 正常源不受过滤规则影响() {
+        let sources = vec![ok_source(
+            "https://bestcf.pages.dev/domain/all.txt",
+            "BestCF·domain/all.txt",
+            "1.1.1.1:443#一\n2.2.2.2:8443#二\n",
+        )];
+        let build = assemble(&sources);
+        assert_eq!(build.outcomes[0].drop_reason, None);
+        assert_eq!(build.outcomes[0].error, None);
+        assert_eq!(build.candidates.len(), 2);
+    }
+
+    #[test]
+    fn 合法_txt_判定() {
+        assert!(is_valid_txt("1.1.1.1:443#一\n").is_ok());
+        assert!(is_valid_txt("   ").is_err());
+        assert!(is_valid_txt("<!DOCTYPE html><html></html>").is_err());
+        assert!(is_valid_txt("a\0b").is_err());
+        assert!(is_valid_txt("坏\u{FFFD}字符").is_err());
+    }
+
+    #[test]
+    fn 重复地址只保留第一次出现() {
+        let sources = vec![
+            ok_source(
+                "https://bestcf.pages.dev/a/all.txt",
+                "BestCF·a/all.txt",
+                "1.1.1.1:443#一\n",
+            ),
+            ok_source(
+                "https://bestcf.pages.dev/b/all.txt",
+                "BestCF·b/all.txt",
+                "1.1.1.1:443#重复\n2.2.2.2:443#二\n",
+            ),
+        ];
+        let build = assemble(&sources);
+        assert_eq!(build.candidates.len(), 2);
+        assert_eq!(build.duplicates, 1);
+        assert_eq!(build.candidates[0].alias, "一");
     }
 }

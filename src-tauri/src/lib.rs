@@ -7,7 +7,7 @@ mod sources;
 mod store;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -20,7 +20,6 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 use logs::{AppLogRecord, LogEntry, LogKind, LogLevel, LogWriter, LogsSnapshot};
-use probe::Prober;
 
 /// 启动时与界面初次加载读回的日志行数上限。
 const LOG_READ_LIMIT: usize = 500;
@@ -30,15 +29,24 @@ pub struct AppState {
     /// 打开失败时为 `None`，此时命令返回错误但界面照常可用。
     store: Mutex<Option<Store>>,
     logs: Arc<LogWriter>,
-    /// 归属地查询器：离线库优先、在线兜底、按 IP 缓存。
-    geo: Arc<geo::GeoResolver>,
-    /// 正在跑的一轮批量测试；停止按钮通过它发信号。
+    /// 正在跑的一轮批量测试；停止按钮通过它 kill 子进程。
     batch: Mutex<Option<Arc<BatchControl>>>,
 }
 
-/// 一轮批量的停止信号。
+/// 一轮批量的停止信号与子进程句柄。
 struct BatchControl {
     cancel: AtomicBool,
+    /// 探测子进程；停止按钮直接 kill 它。
+    worker: Mutex<Option<Arc<dyn probe::supervisor::WorkerHandle>>>,
+}
+
+impl BatchControl {
+    fn new() -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            worker: Mutex::new(None),
+        }
+    }
 }
 
 impl AppState {
@@ -241,93 +249,307 @@ fn save_settings(
     saved
 }
 
-/// 内置离线归属地库的候选路径：打包后与主程序同目录 → 资源目录 → 开发期 resources。
+
+/// 一轮探测的公共执行流程：拉起子进程、逐行消费、按 30 秒增量保存。
 ///
-/// 文件缺失时归属地查询自动回落在线的 `ipwho.is`，应用不会因此启动失败。
-fn geo_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
-    let file = geo::offline::GEOIP_FILE;
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(geo::offline::GEOIP_DIR).join(file));
-            candidates.push(
-                dir.join("resources")
-                    .join(geo::offline::GEOIP_DIR)
-                    .join(file),
-            );
-        }
-    }
-    if let Ok(dir) = app.path().resource_dir() {
-        candidates.push(dir.join(geo::offline::GEOIP_DIR).join(file));
-        candidates.push(
-            dir.join("resources")
-                .join(geo::offline::GEOIP_DIR)
-                .join(file),
+/// 主进程在这里不发起任何网络请求；停止通过 [`BatchControl`] 直接 kill 子进程。
+struct ProbeWorkerSink {
+    app: tauri::AppHandle,
+    mode: String,
+    run_id: String,
+    /// 地址 → 别名，落库时补上。
+    aliases: std::collections::HashMap<(String, u16), String>,
+    total: usize,
+    completed: AtomicUsize,
+}
+
+impl probe::supervisor::SuperviseSink for ProbeWorkerSink {
+    fn row(&self, row: &probe::RowEvent) {
+        emit_row(&self.app, &self.run_id, &self.mode, row);
+        let done = self.completed.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.app.emit(
+            "probe:progress",
+            serde_json::json!({
+                "runId": self.run_id,
+                "mode": self.mode,
+                "completed": done,
+                "total": self.total,
+            }),
         );
     }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join(geo::offline::GEOIP_DIR)
-            .join(file),
-    );
-    candidates
-}
 
-/// 真正的探测在阻塞线程里跑，避免占住异步运行时。
-fn probe_blocking(
-    app: &tauri::AppHandle,
-    endpoint: &probe::Endpoint,
-    alias: &str,
-    run_id: &str,
-) -> Result<probe::ProbeOutcome, String> {
-    let state = app.state::<AppState>();
-
-    // 只短暂加锁读连接超时，测试期间不占着数据库。
-    let connect_timeout_s = {
-        let guard = state
-            .store
-            .lock()
-            .map_err(|_| "存储锁已损坏".to_string())?;
-        let Some(store) = guard.as_ref() else {
-            return Err("数据库不可用".to_string());
-        };
-        let settings = store.load_settings().map_err(|e| e.to_string())?;
-        settings.connect_timeout_s
-    };
-
-    let options = probe::ProbeOptions::from_connect_timeout_s(connect_timeout_s);
-    let prober = probe::DirectProber::new(state.logs.clone());
-
-    let started_at = logs::now_iso8601();
-    let outcome = prober.measure_latency(endpoint, &options);
-
-    // 结果落库：一条轮次 + 一条结果。写库失败不影响已经测出的结论。
-    {
-        let guard = state
-            .store
-            .lock()
-            .map_err(|_| "存储锁已损坏".to_string())?;
-        if let Some(store) = guard.as_ref() {
-            probe::persist_single(
-                store,
-                run_id,
-                &started_at,
-                &probe::SingleProbe {
-                    endpoint,
-                    alias,
-                    options,
-                },
-                &outcome,
-            )?;
+    fn flush(&self, rows: &[probe::RowEvent]) {
+        let started = Instant::now();
+        match persist_probe_rows(&self.app, &self.mode, &self.run_id, &self.aliases, rows) {
+            Ok(count) => log_app(
+                self.app.state::<AppState>().inner(),
+                &self.app,
+                AppLogRecord::new(LogLevel::Info, "probe", "run.flush")
+                    .trace(&self.run_id)
+                    .duration(started.elapsed().as_millis() as u64)
+                    .result(serde_json::json!({ "rows": count })),
+            ),
+            Err(message) => log_app(
+                self.app.state::<AppState>().inner(),
+                &self.app,
+                AppLogRecord::new(LogLevel::Error, "probe", "run.flush")
+                    .trace(&self.run_id)
+                    .duration(started.elapsed().as_millis() as u64)
+                    .error(&message, None),
+            ),
         }
     }
 
-    Ok(outcome)
+    fn bad_line(&self, line: &str) {
+        log_app(
+            self.app.state::<AppState>().inner(),
+            &self.app,
+            AppLogRecord::new(LogLevel::Warn, "probe", "probe.worker.line")
+                .trace(&self.run_id)
+                .error("跳过无法解析的探测行", Some(line)),
+        );
+    }
+
+    fn log(&self, level: LogLevel, text: &str) {
+        log_operation(
+            self.app.state::<AppState>().inner(),
+            &self.app,
+            level,
+            &self.run_id,
+            text,
+        );
+    }
 }
 
-/// 单条直连延迟：把一个优选地址解析到 IP 后直连边缘测三次。
-/// 单条直连延迟：把一个优选地址解析到 IP 后直连边缘测三次。
+/// 把一行结果按模式 upsert 进 `test_result`。
+///
+/// 延迟、测速、归属地各写自己的列，互不覆盖；同一轮同一地址只保留最新一条。
+fn upsert_probe_row(
+    store: &Store,
+    mode: &str,
+    run_id: &str,
+    alias: &str,
+    row: &probe::RowEvent,
+) -> Result<(), String> {
+    let endpoint = probe::Endpoint::new(row.host.clone(), row.port);
+    match mode {
+        "speed" => {
+            // 停止时没轮到的行不覆盖原有速度。
+            if row.status == probe::ProbeStatus::Untested {
+                return Ok(());
+            }
+            let outcome = probe::speed::SpeedOutcome {
+                status: row.status,
+                mbps: row.speed_mbps,
+                error: row.error.clone(),
+            };
+            store
+                .upsert_test_result_speed(run_id, &endpoint, alias, &outcome)
+                .map_err(|e| e.to_string())
+        }
+        "geo" => {
+            // 归属地失败不清空已有结论。
+            if row.status != probe::ProbeStatus::Ok {
+                return Ok(());
+            }
+            let info = geo::GeoInfo {
+                ip: row.host.clone(),
+                country: row.country.clone().unwrap_or_default(),
+                zh: row.country_zh.clone().unwrap_or_default(),
+                en: row.country_en.clone().unwrap_or_default(),
+                asn: None,
+                source: "worker".to_string(),
+            };
+            store
+                .upsert_test_result_geo(run_id, &endpoint, alias, &info)
+                .map_err(|e| e.to_string())?;
+            store
+                .upsert_geo_cache(
+                    &info.ip,
+                    &geo::GeoRecord {
+                        country: info.country,
+                        zh: info.zh,
+                        en: info.en,
+                        asn: None,
+                    },
+                )
+                .map_err(|e| e.to_string())
+        }
+        _ => {
+            let outcome = probe::ProbeOutcome {
+                status: row.status,
+                latency_ms: row.latency_ms,
+                error: row.error.clone(),
+            };
+            store
+                .upsert_test_result_latency(run_id, &endpoint, alias, &outcome, "[]")
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// 一批结果统一落库；增量保存与最终写入共用这一条路径。
+fn persist_probe_rows(
+    app: &tauri::AppHandle,
+    mode: &str,
+    run_id: &str,
+    aliases: &std::collections::HashMap<(String, u16), String>,
+    rows: &[probe::RowEvent],
+) -> Result<usize, String> {
+    let state = app.state::<AppState>();
+    let guard = state
+        .store
+        .lock()
+        .map_err(|_| "存储锁已损坏".to_string())?;
+    let Some(store) = guard.as_ref() else {
+        return Err("数据库不可用".to_string());
+    };
+    for row in rows {
+        let alias = aliases
+            .get(&(row.host.clone(), row.port))
+            .map(String::as_str)
+            .unwrap_or("");
+        upsert_probe_row(store, mode, run_id, alias, row)?;
+    }
+    Ok(rows.len())
+}
+
+/// 拉起子进程并监督到结束；返回全部目标一行一条的结果。
+async fn run_worker_job(
+    app: tauri::AppHandle,
+    mode: &'static str,
+    run_id: String,
+    items: Vec<probe::batch::BatchItem>,
+    task: probe::worker::WorkerTask,
+) -> Result<probe::supervisor::SupervisedRun, String> {
+    let state = app.state::<AppState>();
+
+    let control = Arc::new(BatchControl::new());
+    {
+        let mut guard = state
+            .batch
+            .lock()
+            .map_err(|_| "测试状态锁已损坏".to_string())?;
+        if guard.is_some() {
+            return Err("测试正在进行，请先停止或等待结束".to_string());
+        }
+        *guard = Some(control.clone());
+    }
+
+    let stderr_app = app.clone();
+    let stderr_run = run_id.clone();
+    let on_stderr: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line| {
+        log_app(
+            stderr_app.state::<AppState>().inner(),
+            &stderr_app,
+            AppLogRecord::new(LogLevel::Warn, "probe", "probe.worker.stderr")
+                .trace(&stderr_run)
+                .error(&line, None),
+        );
+    });
+
+    let handle = match probe::supervisor::ProcessWorker::spawn(&task, on_stderr) {
+        Ok(handle) => Arc::new(handle),
+        Err(message) => {
+            if let Ok(mut guard) = state.batch.lock() {
+                *guard = None;
+            }
+            return Err(message);
+        }
+    };
+    if let Ok(mut slot) = control.worker.lock() {
+        *slot = Some(handle.clone());
+    }
+
+    let aliases: std::collections::HashMap<(String, u16), String> = items
+        .iter()
+        .map(|item| {
+            (
+                (item.endpoint.host.clone(), item.endpoint.port),
+                item.alias.clone(),
+            )
+        })
+        .collect();
+    let targets: Vec<(String, u16)> = items
+        .iter()
+        .map(|item| (item.endpoint.host.clone(), item.endpoint.port))
+        .collect();
+    let total = targets.len();
+    let sink = Arc::new(ProbeWorkerSink {
+        app: app.clone(),
+        mode: mode.to_string(),
+        run_id: run_id.clone(),
+        aliases,
+        total,
+        completed: AtomicUsize::new(0),
+    });
+
+    let clock = probe::supervisor::SystemClock;
+    let flush_interval = probe::supervisor::FLUSH_INTERVAL;
+    let cancel = control.clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        probe::supervisor::supervise(
+            handle.as_ref(),
+            &probe::supervisor::SuperviseOptions {
+                targets: &targets,
+                cancel: &cancel.cancel,
+                clock: &clock,
+                flush_interval,
+            },
+            sink.as_ref(),
+        )
+    })
+    .await;
+
+    if let Ok(mut guard) = state.batch.lock() {
+        *guard = None;
+    }
+
+    joined.map_err(|e| format!("探测任务异常结束：{e}"))
+}
+
+/// 统计一轮结果的状态计数。
+fn count_rows(rows: &[probe::RowEvent]) -> (usize, usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize, 0usize);
+    for row in rows {
+        match row.status {
+            probe::ProbeStatus::Ok => counts.0 += 1,
+            probe::ProbeStatus::Timeout => counts.1 += 1,
+            probe::ProbeStatus::Fail => counts.2 += 1,
+            probe::ProbeStatus::Untested => counts.3 += 1,
+        }
+    }
+    counts
+}
+
+/// 一条批量结果的对外形状。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRowDto {
+    host: String,
+    port: u16,
+    alias: String,
+    status: &'static str,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+    /// 逐行采样；子进程协议只回报聚合结论，这里保留空数组以兼容旧契约。
+    samples: Vec<probe::ProbeOutcome>,
+}
+
+/// 一轮批量的完整结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchReportDto {
+    run_id: String,
+    total: usize,
+    completed: usize,
+    stopped: bool,
+    counts: probe::batch::BatchCounts,
+    rows: Vec<BatchRowDto>,
+}
+
+/// 单条直连延迟：同样交给子进程，主进程只落库与推事件。
 #[tauri::command]
 async fn probe_single(
     app: tauri::AppHandle,
@@ -340,32 +562,98 @@ async fn probe_single(
     let started = Instant::now();
     let endpoint = probe::Endpoint::new(host.trim().to_string(), port);
     let alias = alias.unwrap_or_default();
-    // 单条重测也是一轮，逐行事件用同一个 runId。
     let run_id = format!("run-{}", logs::new_span_id());
+    let started_at = logs::now_iso8601();
 
-    let result = tauri::async_runtime::spawn_blocking({
-        let app = app.clone();
-        let endpoint = endpoint.clone();
-        let alias = alias.clone();
-        let run_id = run_id.clone();
-        move || probe_blocking(&app, &endpoint, &alias, &run_id)
-    })
-    .await
-    .map_err(|e| format!("测试任务异常结束：{e}"))?;
+    let (connect_timeout_s, samples) = {
+        let state = app.state::<AppState>();
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        let settings = store.load_settings().map_err(|e| e.to_string())?;
+        store
+            .upsert_test_run(&store::TestRunRecord {
+                id: &run_id,
+                started_at: &started_at,
+                finished_at: &started_at,
+                params_json: "{\"mode\":\"latency\"}",
+                total: 1,
+                ok_count: 0,
+                timeout_count: 0,
+                fail_count: 0,
+            })
+            .map_err(|e| e.to_string())?;
+        (
+            settings.connect_timeout_s,
+            probe::LATENCY_SAMPLES,
+        )
+    };
+
+    let item = probe::batch::BatchItem::new(endpoint.clone(), alias.clone());
+    let task = probe::worker::WorkerTask {
+        mode: "delay".to_string(),
+        targets: vec![probe::worker::WorkerTarget {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+        }],
+        concurrency: 1,
+        connect_timeout_s,
+        sample_count: samples,
+        speed: probe::worker::WorkerSpeed::default(),
+    };
+
+    let result = run_worker_job(
+        app.clone(),
+        "delay",
+        run_id.clone(),
+        vec![item],
+        task,
+    )
+    .await;
 
     let duration_ms = started.elapsed().as_millis() as u64;
     let target = format!("{}:{}", endpoint.host, endpoint.port);
     let state = app.state::<AppState>();
 
-    match &result {
-        Ok(outcome) => {
-            // 单条重测也推一条逐行事件，界面不用等整轮结束。
-            emit_row(
-                &app,
-                &run_id,
-                "delay",
-                &probe::RowEvent::latency(&endpoint, outcome),
-            );
+    match result {
+        Ok(run) => {
+            let row = run
+                .rows
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    probe::RowEvent::new(&endpoint, probe::ProbeStatus::Untested)
+                });
+            let outcome = probe::ProbeOutcome {
+                status: row.status,
+                latency_ms: row.latency_ms,
+                error: row.error.clone(),
+            };
+
+            let finished_at = logs::now_iso8601();
+            {
+                let guard = state
+                    .store
+                    .lock()
+                    .map_err(|_| "存储锁已损坏".to_string())?;
+                if let Some(store) = guard.as_ref() {
+                    let (ok, timeout, fail, _) = count_rows(std::slice::from_ref(&row));
+                    let _ = store.upsert_test_run(&store::TestRunRecord {
+                        id: &run_id,
+                        started_at: &started_at,
+                        finished_at: &finished_at,
+                        params_json: "{\"mode\":\"latency\"}",
+                        total: 1,
+                        ok_count: ok as u32,
+                        timeout_count: timeout as u32,
+                        fail_count: fail as u32,
+                    });
+                }
+            }
 
             let mut record = logs::AppLogRecord::new(LogLevel::Info, "probe", "probe.latency")
                 .trace(&trace)
@@ -401,12 +689,12 @@ async fn probe_single(
                     LogLevel::Error,
                     format!("测试 {target} 失败：{}", outcome.error.as_deref().unwrap_or("")),
                 ),
-                probe::ProbeStatus::Untested => (
-                    LogLevel::Info,
-                    format!("测试 {target} 未测"),
-                ),
+                probe::ProbeStatus::Untested => {
+                    (LogLevel::Info, format!("测试 {target} 未测"))
+                }
             };
             log_operation(state.inner(), &app, level, &trace, &text);
+            Ok(outcome)
         }
         Err(message) => {
             log_app(
@@ -416,12 +704,7 @@ async fn probe_single(
                     .trace(&trace)
                     .span(&span)
                     .duration(duration_ms)
-                    .params(serde_json::json!({
-                        "host": endpoint.host,
-                        "port": endpoint.port,
-                        "alias": alias,
-                    }))
-                    .error(message, None),
+                    .error(&message, None),
             );
             log_operation(
                 state.inner(),
@@ -430,36 +713,9 @@ async fn probe_single(
                 &trace,
                 &format!("测试 {target} 无法开始：{message}"),
             );
+            Err(message)
         }
     }
-
-    result
-}
-
-/// 一条批量结果的对外形状。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchRowDto {
-    host: String,
-    port: u16,
-    alias: String,
-    status: &'static str,
-    latency_ms: Option<u64>,
-    error: Option<String>,
-    /// 三次原始采样，界面详情与历史回看用。
-    samples: Vec<probe::ProbeOutcome>,
-}
-
-/// 一轮批量的完整结果。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchReportDto {
-    run_id: String,
-    total: usize,
-    completed: usize,
-    stopped: bool,
-    counts: probe::batch::BatchCounts,
-    rows: Vec<BatchRowDto>,
 }
 
 /// 一键直连测延迟：整池地址按设置里的并发与采样次数跑一轮。
@@ -470,8 +726,7 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
     let run_id = format!("run-{}", logs::new_span_id());
     let state = app.state::<AppState>();
 
-    // 读设置与池：只短暂加锁，测试期间不占着数据库。
-    let (options, batch, entries) = {
+    let (connect_timeout_s, concurrency, entries) = {
         let guard = state
             .store
             .lock()
@@ -481,11 +736,8 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         };
         let settings = store.load_settings().map_err(|e| e.to_string())?;
         (
-            probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
-            probe::batch::BatchOptions::new(
-                probe::batch::DEFAULT_SAMPLES,
-                settings.concurrency as usize,
-            ),
+            settings.connect_timeout_s,
+            settings.concurrency as usize,
             store.list_pool_entries().map_err(|e| e.to_string())?,
         )
     };
@@ -503,32 +755,49 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
             )
         })
         .collect();
-
-    // 同一时间只允许一轮；测试中重复触发直接拒绝。
-    let control = Arc::new(BatchControl {
-        cancel: AtomicBool::new(false),
-    });
-    {
-        let mut guard = state
-            .batch
-            .lock()
-            .map_err(|_| "测试状态锁已损坏".to_string())?;
-        if guard.is_some() {
-            return Err("测试正在进行，请先停止或等待结束".to_string());
-        }
-        *guard = Some(control.clone());
-    }
+    let aliases: std::collections::HashMap<(String, u16), String> = items
+        .iter()
+        .map(|item| {
+            (
+                (item.endpoint.host.clone(), item.endpoint.port),
+                item.alias.clone(),
+            )
+        })
+        .collect();
 
     let started_at = logs::now_iso8601();
     let started = Instant::now();
     let params = serde_json::json!({
         "mode": "latency",
-        "connectTimeoutS": options.connect_timeout.as_secs(),
-        "requestTimeoutS": options.request_timeout.as_secs(),
-        "samples": batch.samples,
-        "concurrency": batch.concurrency,
+        "connectTimeoutS": connect_timeout_s,
+        "requestTimeoutS": probe::REQUEST_TIMEOUT_S,
+        "samples": probe::batch::DEFAULT_SAMPLES,
+        "concurrency": concurrency,
         "total": items.len(),
     });
+
+    // 先建占位轮次：增量保存的第一条结果需要满足外键。
+    {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        store
+            .upsert_test_run(&store::TestRunRecord {
+                id: &run_id,
+                started_at: &started_at,
+                finished_at: &started_at,
+                params_json: &params.to_string(),
+                total: items.len() as u32,
+                ok_count: 0,
+                timeout_count: 0,
+                fail_count: 0,
+            })
+            .map_err(|e| e.to_string())?;
+    }
 
     log_operation(
         state.inner(),
@@ -538,52 +807,27 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         &format!(
             "开始批量测试：{} 条，并发 {}，每条 {} 次采样",
             items.len(),
-            batch.concurrency,
-            batch.samples
+            concurrency,
+            probe::batch::DEFAULT_SAMPLES
         ),
     );
 
-    // 直连探测与调度都在阻塞线程里跑，进度通过事件推给界面。
-    let app_for_events = app.clone();
-    let run_for_events = run_id.clone();
-    let on_event = move |event: probe::batch::BatchEvent| match event {
-        probe::batch::BatchEvent::Progress(progress) => {
-            let _ = app_for_events.emit(
-                "probe:progress",
-                serde_json::json!({
-                    "runId": run_for_events,
-                    "mode": "latency",
-                    "completed": progress.completed,
-                    "total": progress.total,
-                }),
-            );
-        }
-        probe::batch::BatchEvent::Row(row) => {
-            emit_row(&app_for_events, &run_for_events, "delay", &row);
-        }
+    let task = probe::worker::WorkerTask {
+        mode: "delay".to_string(),
+        targets: items
+            .iter()
+            .map(|item| probe::worker::WorkerTarget {
+                host: item.endpoint.host.clone(),
+                port: item.endpoint.port,
+            })
+            .collect(),
+        concurrency,
+        connect_timeout_s,
+        sample_count: probe::batch::DEFAULT_SAMPLES,
+        speed: probe::worker::WorkerSpeed::default(),
     };
-    let cancel = control.clone();
-    let prober = probe::DirectProber::new(state.logs.clone());
-    let blocking_items = items.clone();
 
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        probe::batch::run_batch(
-            &prober,
-            &blocking_items,
-            &options,
-            batch,
-            &cancel.cancel,
-            &on_event,
-        )
-    })
-    .await;
-
-    // 无论成功、失败、停止还是任务异常，都要把这一轮从「正在跑」里摘掉。
-    if let Ok(mut guard) = state.batch.lock() {
-        *guard = None;
-    }
-
-    let report = joined.map_err(|e| format!("批量测试任务异常结束：{e}"))??;
+    let run = run_worker_job(app.clone(), "delay", run_id.clone(), items, task).await?;
     let finished_at = logs::now_iso8601();
     let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -595,21 +839,26 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         let Some(store) = guard.as_ref() else {
             return Err("数据库不可用".to_string());
         };
-        probe::batch::persist_batch(
-            store,
-            &run_id,
-            &started_at,
-            &finished_at,
-            &params,
-            &report,
-        )?;
+        let (ok, timeout, fail, _) = count_rows(&run.rows);
+        store
+            .upsert_test_run(&store::TestRunRecord {
+                id: &run_id,
+                started_at: &started_at,
+                finished_at: &finished_at,
+                params_json: &params.to_string(),
+                total: run.rows.len() as u32,
+                ok_count: ok as u32,
+                timeout_count: timeout as u32,
+                fail_count: fail as u32,
+            })
+            .map_err(|e| e.to_string())?;
     }
+    persist_probe_rows(&app, "delay", &run_id, &aliases, &run.rows)?;
 
-    // 每条地址一个 spanId，traceId 固定为 runId，同一轮可在日志里串起来。
-    for row in &report.rows {
+    for row in &run.rows {
         let span = logs::new_span_id();
         let mut record = AppLogRecord::new(
-            match row.outcome.status {
+            match row.status {
                 probe::ProbeStatus::Ok => LogLevel::Info,
                 probe::ProbeStatus::Timeout => LogLevel::Warn,
                 probe::ProbeStatus::Fail => LogLevel::Error,
@@ -621,22 +870,21 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         .trace(&run_id)
         .span(&span)
         .params(serde_json::json!({
-            "host": row.endpoint.host,
-            "port": row.endpoint.port,
-            "alias": row.alias,
-            "samples": row.samples.len(),
+            "host": row.host,
+            "port": row.port,
+            "alias": aliases.get(&(row.host.clone(), row.port)).cloned().unwrap_or_default(),
         }))
         .result(serde_json::json!({
-            "status": row.outcome.status.as_str(),
-            "latencyMs": row.outcome.latency_ms,
+            "status": row.status.as_str(),
+            "latencyMs": row.latency_ms,
         }));
-        if let Some(error) = &row.outcome.error {
+        if let Some(error) = &row.error {
             record = record.error(error, None);
         }
         log_app(state.inner(), &app, record);
     }
 
-    let counts = report.counts();
+    let (ok, timeout, fail, untested) = count_rows(&run.rows);
     log_app(
         state.inner(),
         &app,
@@ -645,17 +893,18 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
             .duration(duration_ms)
             .params(params.clone())
             .result(serde_json::json!({
-                "ok": counts.ok,
-                "timeout": counts.timeout,
-                "fail": counts.fail,
-                "untested": counts.untested,
-                "stopped": report.stopped,
+                "ok": ok,
+                "timeout": timeout,
+                "fail": fail,
+                "untested": untested,
+                "stopped": run.stopped,
+                "crashed": run.crashed,
             })),
     );
     log_operation(
         state.inner(),
         &app,
-        if report.stopped {
+        if run.stopped || run.crashed {
             LogLevel::Warn
         } else {
             LogLevel::Ok
@@ -663,27 +912,35 @@ async fn probe_batch(app: tauri::AppHandle) -> Result<BatchReportDto, String> {
         &run_id,
         &format!(
             "批量测试结束：成功 {} · 超时 {} · 失败 {} · 未测 {}（{}ms）",
-            counts.ok, counts.timeout, counts.fail, counts.untested, duration_ms
+            ok, timeout, fail, untested, duration_ms
         ),
     );
 
     Ok(BatchReportDto {
         run_id,
-        total: report.total,
-        completed: report.completed,
-        stopped: report.stopped,
-        counts,
-        rows: report
+        total: run.rows.len(),
+        completed: run.completed,
+        stopped: run.stopped,
+        counts: probe::batch::BatchCounts {
+            ok,
+            timeout,
+            fail,
+            untested,
+        },
+        rows: run
             .rows
             .into_iter()
             .map(|row| BatchRowDto {
-                host: row.endpoint.host,
-                port: row.endpoint.port,
-                alias: row.alias,
-                status: row.outcome.status.as_str(),
-                latency_ms: row.outcome.latency_ms,
-                error: row.outcome.error,
-                samples: row.samples,
+                alias: aliases
+                    .get(&(row.host.clone(), row.port))
+                    .cloned()
+                    .unwrap_or_default(),
+                host: row.host,
+                port: row.port,
+                status: row.status.as_str(),
+                latency_ms: row.latency_ms,
+                error: row.error,
+                samples: Vec::new(),
             })
             .collect(),
     })
@@ -723,8 +980,7 @@ struct SpeedReportDto {
 
 /// 一键多线程测速：整池地址或指定选中行，直连下载并换算 MB/s。
 ///
-/// 结果写进最近一轮 `test_result` 的速度字段，延迟列不受影响；
-/// 没有历史轮次时才新建一轮。停止后已开始的行标失败，未开始的行保持原值。
+/// 结果写进最近一轮 `test_result` 的速度字段，延迟列不受影响。
 #[tauri::command]
 async fn probe_speed_batch(
     app: tauri::AppHandle,
@@ -732,8 +988,7 @@ async fn probe_speed_batch(
 ) -> Result<SpeedReportDto, String> {
     let state = app.state::<AppState>();
 
-    // 读设置与池：只短暂加锁，测速期间不占着数据库。
-    let (options, concurrency, entries) = {
+    let (connect_timeout_s, concurrency, entries) = {
         let guard = state
             .store
             .lock()
@@ -743,7 +998,7 @@ async fn probe_speed_batch(
         };
         let settings = store.load_settings().map_err(|e| e.to_string())?;
         (
-            probe::ProbeOptions::from_connect_timeout_s(settings.connect_timeout_s),
+            settings.connect_timeout_s,
             settings.concurrency as usize,
             store.list_pool_entries().map_err(|e| e.to_string())?,
         )
@@ -775,30 +1030,14 @@ async fn probe_speed_batch(
         return Err("没有可测速的地址，请先抓取优选源或选中行".to_string());
     }
 
-    let speed = probe::speed::SpeedOptions::default();
-
-    // 与延迟测试共用同一个「正在跑」槽位：同一时间只允许一轮。
-    let control = Arc::new(BatchControl {
-        cancel: AtomicBool::new(false),
-    });
-    {
-        let mut guard = state
-            .batch
-            .lock()
-            .map_err(|_| "测试状态锁已损坏".to_string())?;
-        if guard.is_some() {
-            return Err("测试正在进行，请先停止或等待结束".to_string());
-        }
-        *guard = Some(control.clone());
-    }
-
+    let speed = probe::worker::WorkerSpeed::default();
     let started_at = logs::now_iso8601();
     let started = Instant::now();
     let params = serde_json::json!({
         "mode": "speed",
         "streams": speed.streams,
-        "sizeMb": speed.total_bytes / 1_000_000,
-        "timeoutS": speed.timeout.as_secs(),
+        "sizeMb": speed.bytes / 1_000_000,
+        "timeoutS": speed.timeout_s,
         "concurrency": concurrency,
         "total": items.len(),
     });
@@ -817,7 +1056,7 @@ async fn probe_speed_batch(
             None => {
                 let id = format!("run-{}", logs::new_span_id());
                 store
-                    .insert_test_run(&store::TestRunRecord {
+                    .upsert_test_run(&store::TestRunRecord {
                         id: &id,
                         started_at: &started_at,
                         finished_at: &started_at,
@@ -833,6 +1072,16 @@ async fn probe_speed_batch(
         }
     };
 
+    let aliases: std::collections::HashMap<(String, u16), String> = items
+        .iter()
+        .map(|item| {
+            (
+                (item.endpoint.host.clone(), item.endpoint.port),
+                item.alias.clone(),
+            )
+        })
+        .collect();
+
     log_operation(
         state.inner(),
         &app,
@@ -842,70 +1091,34 @@ async fn probe_speed_batch(
             "开始测速：{} 条，{} 流 × {}MB，并发 {}，上限 {}s",
             items.len(),
             speed.streams,
-            speed.total_bytes / 1_000_000,
+            speed.bytes / 1_000_000,
             concurrency,
-            speed.timeout.as_secs()
+            speed.timeout_s
         ),
     );
 
-    let app_for_events = app.clone();
-    let run_for_events = run_id.clone();
-    let on_event = move |event: probe::batch::BatchEvent| match event {
-        probe::batch::BatchEvent::Progress(progress) => {
-            let _ = app_for_events.emit(
-                "probe:progress",
-                serde_json::json!({
-                    "runId": run_for_events,
-                    "mode": "speed",
-                    "completed": progress.completed,
-                    "total": progress.total,
-                }),
-            );
-        }
-        probe::batch::BatchEvent::Row(row) => {
-            emit_row(&app_for_events, &run_for_events, "speed", &row);
-        }
+    let task = probe::worker::WorkerTask {
+        mode: "speed".to_string(),
+        targets: items
+            .iter()
+            .map(|item| probe::worker::WorkerTarget {
+                host: item.endpoint.host.clone(),
+                port: item.endpoint.port,
+            })
+            .collect(),
+        concurrency,
+        connect_timeout_s,
+        sample_count: 1,
+        speed,
     };
 
-    let cancel = control.clone();
-    let prober = probe::DirectProber::new(state.logs.clone());
-    let blocking_items = items.clone();
-
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        probe::speed::run_speed_batch(
-            &prober,
-            &blocking_items,
-            &options,
-            &speed,
-            concurrency,
-            &cancel.cancel,
-            &on_event,
-        )
-    })
-    .await;
-
-    // 无论成功、失败、停止还是任务异常，都要把这一轮从「正在跑」里摘掉。
-    if let Ok(mut guard) = state.batch.lock() {
-        *guard = None;
-    }
-
-    let report = joined.map_err(|e| format!("测速任务异常结束：{e}"))??;
+    let run = run_worker_job(app.clone(), "speed", run_id.clone(), items, task).await?;
     let duration_ms = started.elapsed().as_millis() as u64;
+    persist_probe_rows(&app, "speed", &run_id, &aliases, &run.rows)?;
 
-    {
-        let guard = state
-            .store
-            .lock()
-            .map_err(|_| "存储锁已损坏".to_string())?;
-        let Some(store) = guard.as_ref() else {
-            return Err("数据库不可用".to_string());
-        };
-        probe::speed::persist_speed(store, &run_id, &report.rows)?;
-    }
-
-    for row in &report.rows {
+    for row in &run.rows {
         let mut record = AppLogRecord::new(
-            match row.outcome.status {
+            match row.status {
                 probe::ProbeStatus::Ok => LogLevel::Info,
                 probe::ProbeStatus::Fail => LogLevel::Warn,
                 probe::ProbeStatus::Timeout => LogLevel::Warn,
@@ -917,21 +1130,21 @@ async fn probe_speed_batch(
         .trace(&run_id)
         .span(&logs::new_span_id())
         .params(serde_json::json!({
-            "host": row.endpoint.host,
-            "port": row.endpoint.port,
-            "alias": row.alias,
+            "host": row.host,
+            "port": row.port,
+            "alias": aliases.get(&(row.host.clone(), row.port)).cloned().unwrap_or_default(),
         }))
         .result(serde_json::json!({
-            "status": row.outcome.status.as_str(),
-            "mbps": row.outcome.mbps,
+            "status": row.status.as_str(),
+            "mbps": row.speed_mbps,
         }));
-        if let Some(error) = &row.outcome.error {
+        if let Some(error) = &row.error {
             record = record.error(error, None);
         }
         log_app(state.inner(), &app, record);
     }
 
-    let counts = report.counts();
+    let (ok, _, fail, untested) = count_rows(&run.rows);
     log_app(
         state.inner(),
         &app,
@@ -940,16 +1153,17 @@ async fn probe_speed_batch(
             .duration(duration_ms)
             .params(params.clone())
             .result(serde_json::json!({
-                "ok": counts.ok,
-                "fail": counts.fail,
-                "untested": counts.untested,
-                "stopped": report.stopped,
+                "ok": ok,
+                "fail": fail,
+                "untested": untested,
+                "stopped": run.stopped,
+                "crashed": run.crashed,
             })),
     );
     log_operation(
         state.inner(),
         &app,
-        if report.stopped {
+        if run.stopped || run.crashed {
             LogLevel::Warn
         } else {
             LogLevel::Ok
@@ -957,26 +1171,29 @@ async fn probe_speed_batch(
         &run_id,
         &format!(
             "测速结束：成功 {} · 失败 {} · 未测 {}（{}ms）",
-            counts.ok, counts.fail, counts.untested, duration_ms
+            ok, fail, untested, duration_ms
         ),
     );
 
     Ok(SpeedReportDto {
         run_id,
-        total: report.total,
-        completed: report.completed,
-        stopped: report.stopped,
-        counts,
-        rows: report
+        total: run.rows.len(),
+        completed: run.completed,
+        stopped: run.stopped,
+        counts: probe::speed::SpeedCounts { ok, fail, untested },
+        rows: run
             .rows
             .into_iter()
             .map(|row| SpeedRowDto {
-                host: row.endpoint.host,
-                port: row.endpoint.port,
-                alias: row.alias,
-                status: row.outcome.status.as_str(),
-                mbps: row.outcome.mbps,
-                error: row.outcome.error,
+                alias: aliases
+                    .get(&(row.host.clone(), row.port))
+                    .cloned()
+                    .unwrap_or_default(),
+                host: row.host,
+                port: row.port,
+                status: row.status.as_str(),
+                mbps: row.speed_mbps,
+                error: row.error,
             })
             .collect(),
     })
@@ -1011,9 +1228,6 @@ struct GeoReportDto {
 }
 
 /// 一键查归属地：整池或选中行，查地址本身解析出的 IP 的归属地。
-///
-/// 结果写进最近一轮 `test_result` 的归属地列，延迟、速度不受影响；
-/// 查询失败的行只留空归属地，不清空已有结论。
 #[tauri::command]
 async fn probe_geo_batch(
     app: tauri::AppHandle,
@@ -1021,8 +1235,7 @@ async fn probe_geo_batch(
 ) -> Result<GeoReportDto, String> {
     let state = app.state::<AppState>();
 
-    // 读设置与池：只短暂加锁，查询期间不占着数据库。
-    let (concurrency, entries) = {
+    let (connect_timeout_s, concurrency, entries) = {
         let guard = state
             .store
             .lock()
@@ -1032,6 +1245,7 @@ async fn probe_geo_batch(
         };
         let settings = store.load_settings().map_err(|e| e.to_string())?;
         (
+            settings.connect_timeout_s,
             settings.concurrency as usize,
             store.list_pool_entries().map_err(|e| e.to_string())?,
         )
@@ -1063,21 +1277,6 @@ async fn probe_geo_batch(
         return Err("没有可查归属地的地址，请先抓取优选源或选中行".to_string());
     }
 
-    // 与延迟、测速共用同一个「正在跑」槽位：同一时间只允许一轮。
-    let control = Arc::new(BatchControl {
-        cancel: AtomicBool::new(false),
-    });
-    {
-        let mut guard = state
-            .batch
-            .lock()
-            .map_err(|_| "测试状态锁已损坏".to_string())?;
-        if guard.is_some() {
-            return Err("测试正在进行，请先停止或等待结束".to_string());
-        }
-        *guard = Some(control.clone());
-    }
-
     let started_at = logs::now_iso8601();
     let started = Instant::now();
     let params = serde_json::json!({
@@ -1100,7 +1299,7 @@ async fn probe_geo_batch(
             None => {
                 let id = format!("run-{}", logs::new_span_id());
                 store
-                    .insert_test_run(&store::TestRunRecord {
+                    .upsert_test_run(&store::TestRunRecord {
                         id: &id,
                         started_at: &started_at,
                         finished_at: &started_at,
@@ -1116,100 +1315,46 @@ async fn probe_geo_batch(
         }
     };
 
-    // 落库的缓存先灌进内存，同一 IP 不重复查询。
-    let cached = {
-        let guard = state
-            .store
-            .lock()
-            .map_err(|_| "存储锁已损坏".to_string())?;
-        match guard.as_ref() {
-            Some(store) => store
-                .list_geo_cache()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|row| (row.ip, row.record))
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        }
-    };
-    state.geo.preload(cached);
+    let aliases: std::collections::HashMap<(String, u16), String> = items
+        .iter()
+        .map(|item| {
+            (
+                (item.endpoint.host.clone(), item.endpoint.port),
+                item.alias.clone(),
+            )
+        })
+        .collect();
 
-    let offline_ready = geo_candidates(&app).iter().any(|path| path.is_file());
     log_operation(
         state.inner(),
         &app,
         LogLevel::Info,
         &run_id,
-        &format!(
-            "开始查询归属地：{} 条，并发 {}，离线库{}",
-            items.len(),
-            concurrency,
-            if offline_ready {
-                "已就绪"
-            } else {
-                "不可用（改用在线源）"
-            }
-        ),
+        &format!("开始查询归属地：{} 条，并发 {}", items.len(), concurrency),
     );
 
-    let app_for_events = app.clone();
-    let run_for_events = run_id.clone();
-    let on_event = move |event: probe::batch::BatchEvent| match event {
-        probe::batch::BatchEvent::Progress(progress) => {
-            let _ = app_for_events.emit(
-                "probe:progress",
-                serde_json::json!({
-                    "runId": run_for_events,
-                    "mode": "geo",
-                    "completed": progress.completed,
-                    "total": progress.total,
-                }),
-            );
-        }
-        probe::batch::BatchEvent::Row(row) => {
-            emit_row(&app_for_events, &run_for_events, "geo", &row);
-        }
+    let task = probe::worker::WorkerTask {
+        mode: "geo".to_string(),
+        targets: items
+            .iter()
+            .map(|item| probe::worker::WorkerTarget {
+                host: item.endpoint.host.clone(),
+                port: item.endpoint.port,
+            })
+            .collect(),
+        concurrency,
+        connect_timeout_s,
+        sample_count: 1,
+        speed: probe::worker::WorkerSpeed::default(),
     };
 
-    let cancel = control.clone();
-    let blocking_items = items.clone();
-    let resolver = state.geo.clone();
-    let host_resolver = probe::SystemResolver;
-
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        geo::run_geo_batch(
-            &host_resolver,
-            &resolver,
-            &blocking_items,
-            concurrency,
-            &cancel.cancel,
-            &on_event,
-        )
-    })
-    .await;
-
-    // 无论成功、失败、停止还是任务异常，都要把这一轮从「正在跑」里摘掉。
-    if let Ok(mut guard) = state.batch.lock() {
-        *guard = None;
-    }
-
-    let report = joined.map_err(|e| format!("归属地查询任务异常结束：{e}"))?;
+    let run = run_worker_job(app.clone(), "geo", run_id.clone(), items, task).await?;
     let duration_ms = started.elapsed().as_millis() as u64;
+    persist_probe_rows(&app, "geo", &run_id, &aliases, &run.rows)?;
 
-    {
-        let guard = state
-            .store
-            .lock()
-            .map_err(|_| "存储锁已损坏".to_string())?;
-        let Some(store) = guard.as_ref() else {
-            return Err("数据库不可用".to_string());
-        };
-        geo::persist_geo(store, &run_id, &report.rows)?;
-    }
-
-    for row in &report.rows {
+    for row in &run.rows {
         let mut record = AppLogRecord::new(
-            if row.info.is_some() {
+            if row.status == probe::ProbeStatus::Ok {
                 LogLevel::Info
             } else {
                 LogLevel::Warn
@@ -1220,32 +1365,26 @@ async fn probe_geo_batch(
         .trace(&run_id)
         .span(&logs::new_span_id())
         .params(serde_json::json!({
-            "host": row.endpoint.host,
-            "port": row.endpoint.port,
-            "alias": row.alias,
+            "host": row.host,
+            "port": row.port,
+            "alias": aliases.get(&(row.host.clone(), row.port)).cloned().unwrap_or_default(),
         }));
-        match &row.info {
-            Some(info) => {
-                record = record.result(serde_json::json!({
-                    "ip": info.ip,
-                    "country": info.country,
-                    "zh": info.zh,
-                    "en": info.en,
-                    "asn": info.asn,
-                    "source": info.source,
-                }));
-            }
-            None => {
-                record = record.error(
-                    row.error.as_deref().unwrap_or("归属地查询没有结论"),
-                    None,
-                );
-            }
+        if row.status == probe::ProbeStatus::Ok {
+            record = record.result(serde_json::json!({
+                "country": row.country,
+                "zh": row.country_zh,
+                "en": row.country_en,
+            }));
+        } else {
+            record = record.error(
+                row.error.as_deref().unwrap_or("归属地查询没有结论"),
+                None,
+            );
         }
         log_app(state.inner(), &app, record);
     }
 
-    let counts = report.counts();
+    let (ok, _, fail, untested) = count_rows(&run.rows);
     log_app(
         state.inner(),
         &app,
@@ -1254,16 +1393,17 @@ async fn probe_geo_batch(
             .duration(duration_ms)
             .params(params.clone())
             .result(serde_json::json!({
-                "ok": counts.ok,
-                "fail": counts.fail,
-                "untested": counts.untested,
-                "stopped": report.stopped,
+                "ok": ok,
+                "fail": fail,
+                "untested": untested,
+                "stopped": run.stopped,
+                "crashed": run.crashed,
             })),
     );
     log_operation(
         state.inner(),
         &app,
-        if counts.fail > 0 {
+        if fail > 0 || run.stopped || run.crashed {
             LogLevel::Warn
         } else {
             LogLevel::Ok
@@ -1271,37 +1411,33 @@ async fn probe_geo_batch(
         &run_id,
         &format!(
             "归属地查询结束：成功 {} · 失败 {} · 未测 {}（{}ms）",
-            counts.ok, counts.fail, counts.untested, duration_ms
+            ok, fail, untested, duration_ms
         ),
     );
 
     Ok(GeoReportDto {
         run_id,
-        total: report.total,
-        completed: report.completed,
-        stopped: report.stopped,
-        counts,
-        rows: report
+        total: run.rows.len(),
+        completed: run.completed,
+        stopped: run.stopped,
+        counts: geo::GeoCounts { ok, fail, untested },
+        rows: run
             .rows
             .into_iter()
             .map(|row| {
-                let status = if row.info.is_some() {
-                    "ok"
-                } else if row.error.is_some() {
-                    "fail"
-                } else {
-                    "untested"
-                };
-                let info = row.info;
+                let status = row.status.as_str();
                 GeoRowDto {
-                    host: row.endpoint.host,
-                    port: row.endpoint.port,
-                    alias: row.alias,
+                    alias: aliases
+                        .get(&(row.host.clone(), row.port))
+                        .cloned()
+                        .unwrap_or_default(),
+                    host: row.host,
+                    port: row.port,
                     status,
-                    country: info.as_ref().map(|info| info.country.clone()),
-                    zh: info.as_ref().map(|info| info.zh.clone()),
-                    en: info.as_ref().map(|info| info.en.clone()),
-                    asn: info.as_ref().and_then(|info| info.asn),
+                    country: row.country,
+                    zh: row.country_zh,
+                    en: row.country_en,
+                    asn: None,
                     error: row.error,
                 }
             })
@@ -1310,6 +1446,8 @@ async fn probe_geo_batch(
 }
 
 /// 请求停止当前批量测试；没有在跑时返回 `false`。
+///
+/// 停止不依赖协作式取消：直接 kill 探测子进程，未完成的行由监督器收尾。
 #[tauri::command]
 fn probe_cancel(
     state: tauri::State<'_, AppState>,
@@ -1318,7 +1456,7 @@ fn probe_cancel(
     let trace = logs::new_trace_id();
     let started = Instant::now();
 
-    let result = (|| -> Result<bool, String> {
+    let result = (|| -> Result<(bool, Option<u32>), String> {
         let guard = state
             .batch
             .lock()
@@ -1326,34 +1464,49 @@ fn probe_cancel(
         match guard.as_ref() {
             Some(control) => {
                 control.cancel.store(true, Ordering::SeqCst);
-                Ok(true)
+                let handle = control
+                    .worker
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                let pid = handle.as_ref().map(|worker| worker.pid());
+                if let Some(worker) = handle.as_ref() {
+                    worker.kill()?;
+                }
+                Ok((true, pid))
             }
-            None => Ok(false),
+            None => Ok((false, None)),
         }
     })();
 
     let duration_ms = started.elapsed().as_millis() as u64;
     match &result {
-        Ok(requested) => {
+        Ok((requested, pid)) => {
             log_app(
                 state.inner(),
                 &app,
                 AppLogRecord::new(LogLevel::Info, "probe", "probe.cancel")
                     .trace(&trace)
                     .duration(duration_ms)
-                    .result(serde_json::json!({ "requested": requested })),
+                    .result(serde_json::json!({ "requested": requested, "pid": pid })),
             );
+            let text = if *requested {
+                format!(
+                    "已停止，终止探测进程 pid={}",
+                    pid.map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "未知".to_string())
+                )
+            } else {
+                "没有正在运行的测试，忽略停止请求".to_string()
+            };
             log_operation(
                 state.inner(),
                 &app,
                 LogLevel::Info,
                 &trace,
-                if *requested {
-                    "已请求停止当前测试"
-                } else {
-                    "没有正在运行的测试，忽略停止请求"
-                },
+                &text,
             );
+            Ok(*requested)
         }
         Err(message) => {
             log_app(
@@ -1371,9 +1524,9 @@ fn probe_cancel(
                 &trace,
                 &format!("请求停止测试失败：{message}"),
             );
+            Err(message.clone())
         }
     }
-    result
 }
 
 /// 历史入口的一轮测试：时间、参数快照与统计。
@@ -1947,17 +2100,19 @@ async fn refresh_source_catalog(
     snapshot
 }
 
-/// 抓取选中的优选源并把手动地址一起并入池。
+/// 抓取选中的优选源并合并进池。
 ///
 /// 单源失败只把错误记到该源上，其余源照常解析；全部失败也返回快照，
 /// 让界面能逐源标红，而不是整块报错。每个源一个 spanId，耗时与结果写进应用日志。
+///
+/// 无效源（HTTP ≥ 400、内容不是合法 txt、解析为 0 条）直接从源清单删除；
+/// 超时与连接失败保留源并标 `lastError`，默认不勾选，避免一次抖动误删。
 #[tauri::command]
 async fn fetch_pool(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     source_urls: Vec<String>,
     extra_source_urls: Vec<String>,
-    manual_addresses: String,
 ) -> Result<PoolSnapshot, String> {
     let trace = logs::new_trace_id();
     let started = Instant::now();
@@ -2032,14 +2187,17 @@ async fn fetch_pool(
 
     let client = fetch::build_client()?;
     let fetched = fetch::fetch_all(&client, &catalog).await;
-    let build = fetch::assemble(&fetched, &manual_addresses);
+    let build = fetch::assemble(&fetched);
 
     // 每个源一个 spanId：记录耗时与结果，失败的带上错误。
     for outcome in &build.outcomes {
         let span = logs::new_span_id();
+        let dropped = outcome.drop_reason.is_some();
         let mut record = AppLogRecord::new(
             if outcome.error.is_some() {
                 LogLevel::Error
+            } else if dropped {
+                LogLevel::Warn
             } else {
                 LogLevel::Info
             },
@@ -2053,21 +2211,34 @@ async fn fetch_pool(
             "url": outcome.url,
             "name": outcome.name,
         }))
-        .result(serde_json::json!({ "entries": outcome.entry_count }));
+        .result(serde_json::json!({
+            "entries": outcome.entry_count,
+            "dropped": dropped,
+        }));
         if let Some(error) = &outcome.error {
             record = record.error(error, None);
         }
+        if let Some(reason) = &outcome.drop_reason {
+            record = record.error(reason, None);
+        }
         log_app(state.inner(), &app, record);
 
-        match &outcome.error {
-            Some(error) => log_operation(
+        match (&outcome.error, &outcome.drop_reason) {
+            (Some(error), _) => log_operation(
                 state.inner(),
                 &app,
                 LogLevel::Error,
                 &trace,
                 &format!("源 {} 抓取失败：{error}", outcome.name),
             ),
-            None => log_operation(
+            (None, Some(reason)) => log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Warn,
+                &trace,
+                &format!("源 {} 已丢弃：{reason}", outcome.name),
+            ),
+            (None, None) => log_operation(
                 state.inner(),
                 &app,
                 LogLevel::Info,
@@ -2078,6 +2249,23 @@ async fn fetch_pool(
                 ),
             ),
         }
+    }
+
+    let dropped: Vec<String> = build
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.drop_reason.is_some())
+        .map(|outcome| outcome.name.clone())
+        .collect();
+    if !dropped.is_empty() {
+        let preview = dropped.iter().take(5).cloned().collect::<Vec<_>>().join("、");
+        log_operation(
+            state.inner(),
+            &app,
+            LogLevel::Warn,
+            &trace,
+            &format!("过滤掉 {} 个无效源：{}", dropped.len(), preview),
+        );
     }
 
     let fetched_at = logs::now_iso8601();
@@ -2093,7 +2281,19 @@ async fn fetch_pool(
         store
             .replace_pool_entries(&build.candidates, &fetched_at)
             .map_err(|e| e.to_string())?;
+        let dropped_urls: Vec<String> = build
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.drop_reason.is_some())
+            .map(|outcome| outcome.url.clone())
+            .collect();
+        store
+            .delete_pool_sources(&dropped_urls)
+            .map_err(|e| e.to_string())?;
         for outcome in &build.outcomes {
+            if outcome.drop_reason.is_some() {
+                continue;
+            }
             store
                 .record_source_fetch(
                     &outcome.url,
@@ -2120,30 +2320,31 @@ async fn fetch_pool(
             .duration(duration_ms)
             .params(serde_json::json!({
                 "sources": build.outcomes.len(),
-                "manual": manual_addresses.lines().count(),
             }))
             .result(serde_json::json!({
                 "entries": build.candidates.len(),
                 "duplicates": build.duplicates,
                 "skipped": build.skipped,
                 "failedSources": failed,
+                "droppedSources": dropped.len(),
             })),
     );
     log_operation(
         state.inner(),
         &app,
-        if failed > 0 {
+        if failed > 0 || !dropped.is_empty() {
             LogLevel::Warn
         } else {
             LogLevel::Ok
         },
         &trace,
         &format!(
-            "抓取完成：解析 {} 条，去重后 {} 条，跳过 {} 行，失败源 {} 个（{}ms）",
+            "抓取完成：解析 {} 条，去重后 {} 条，跳过 {} 行，失败源 {} 个，过滤无效源 {} 个（{}ms）",
             build.candidates.len() + build.duplicates,
             build.candidates.len(),
             build.skipped,
             failed,
+            dropped.len(),
             duration_ms
         ),
     );
@@ -2541,6 +2742,11 @@ fn migrate_legacy_db(new_db: &Path, legacy_db: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// 子进程入口：`main` 在进入 Tauri 之前调用它，不初始化窗口。
+pub fn run_probe_worker() -> i32 {
+    probe::worker::run()
+}
+
 /// 单实例插件必须是第一个注册的插件，否则第二个实例可能先创建窗口。
 pub fn run() {
     tauri::Builder::default()
@@ -2622,12 +2828,40 @@ pub fn run() {
             app.manage(AppState {
                 store: Mutex::new(store),
                 logs: log_writer,
-                geo: Arc::new(geo::GeoResolver::new(geo_candidates(app.handle()))),
                 batch: Mutex::new(None),
             });
 
             spawn_daily_log_cleanup(app.handle().clone());
             Ok(())
+        })
+        // 关窗时先停掉探测子进程，等监督器把已完成的行 flush 完再退出。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let app = window.app_handle();
+                let state = app.state::<AppState>();
+                if let Ok(guard) = state.batch.lock() {
+                    if let Some(control) = guard.as_ref() {
+                        control.cancel.store(true, Ordering::SeqCst);
+                        if let Ok(slot) = control.worker.lock() {
+                            if let Some(worker) = slot.as_ref() {
+                                let _ = worker.kill();
+                            }
+                        }
+                    }
+                }
+                // 最多等 2 秒让监督器收尾并落库；超时也允许退出。
+                for _ in 0..100 {
+                    let done = state
+                        .batch
+                        .lock()
+                        .map(|guard| guard.is_none())
+                        .unwrap_or(true);
+                    if done {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -2686,6 +2920,7 @@ mod packaging_tests {
             speed_mbps: Some(12.3),
             country_zh: Some("加拿大".to_string()),
             country_en: Some("Canada".to_string()),
+            country: Some("CA".to_string()),
             colo: None,
             error: None,
         };
@@ -2708,6 +2943,7 @@ mod packaging_tests {
             keys,
             vec![
                 "colo",
+                "country",
                 "countryEn",
                 "countryZh",
                 "error",
