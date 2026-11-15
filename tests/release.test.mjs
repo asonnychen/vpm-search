@@ -74,7 +74,7 @@ test("版本号在包描述、Tauri 配置、Cargo 清单三处一致", () => {
   const cargo = read("src-tauri/Cargo.toml");
   const cargoVersion = cargo.match(/^version = "([^"]+)"$/m)?.[1];
 
-  assert.equal(pkg.version, "0.1.0");
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
   assert.equal(conf.version, pkg.version);
   assert.equal(cargoVersion, pkg.version);
 });

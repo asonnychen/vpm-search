@@ -42,7 +42,7 @@ test("单实例插件已声明并注册", () => {
 test("包名与 Rust 清单一致", () => {
   const cargo = read("src-tauri/Cargo.toml");
   assert.match(cargo, /^name = "vpm-search"$/m);
-  assert.match(cargo, /^version = "0\.1\.0"$/m);
   const pkg = readJson("package.json");
-  assert.equal(pkg.version, "0.1.0");
+  assert.match(cargo, new RegExp(`^version = "${pkg.version.replace(/\./g, "\\.")}"$`, "m"));
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
 });
