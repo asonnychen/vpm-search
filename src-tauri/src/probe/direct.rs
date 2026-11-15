@@ -14,7 +14,7 @@ use super::{
     classify, resolve_host, Attempt, Endpoint, HostResolver, ProbeOptions, ProbeOutcome, Prober,
     REQUEST_TIMEOUT_S,
 };
-use super::{LATENCY_SAMPLES, PROBE_HOST, PROBE_URL};
+use super::{probe_url, LATENCY_SAMPLES, PROBE_HOST};
 use crate::logs::LogWriter;
 
 /// 真探测器：每次探测临时建一个客户端，把探测主机名钉到目标地址。
@@ -50,15 +50,15 @@ impl DirectProber {
             // 每次探测都重新建连，避免连接复用把握手时间从延迟里抹掉。
             .pool_max_idle_per_host(0)
             // TLS SNI 与 Host 仍是探测主机名，TCP 却落在优选地址上。
-            .resolve(PROBE_HOST, SocketAddr::new(ip, port))
+            .resolve(PROBE_HOST, SocketAddr::new(ip, 0))
             .build()
             .map_err(|e| format!("创建探测客户端失败：{e}"))
     }
 
     /// 一次探测：连不上记失败，连上但没在超时内响应记超时。
-    fn attempt(&self, client: &reqwest::blocking::Client) -> Attempt {
+    fn attempt(&self, client: &reqwest::blocking::Client, port: u16) -> Attempt {
         let started = Instant::now();
-        match client.get(PROBE_URL).send() {
+        match client.get(probe_url(port)).send() {
             Ok(response) if response.status().is_success() => {
                 Attempt::responded(started.elapsed().as_millis() as u64)
             }
@@ -123,7 +123,7 @@ impl DirectProber {
         let samples = samples.clamp(1, 10);
         let mut outcomes = Vec::with_capacity(samples);
         for _ in 0..samples {
-            let outcome = classify(self.attempt(&client));
+            let outcome = classify(self.attempt(&client, endpoint.port));
             self.log(endpoint, ip, &outcome);
             outcomes.push(outcome);
         }
@@ -147,7 +147,7 @@ impl SpeedProber for DirectProber {
     ) -> Result<f64, String> {
         let ip = resolve_host(&endpoint.host)?;
         let client = self.client(ip, endpoint.port, options.connect_timeout, speed.timeout)?;
-        let mbps = download_streams(&client, speed, cancel)?;
+        let mbps = download_streams(&client, speed, endpoint.port, cancel)?;
         if let Some(writer) = self.writer.as_ref() {
             let _ = writer.append_probe_line(&format!(
                 "{}:{} -> {ip} speed {mbps} MB/s",

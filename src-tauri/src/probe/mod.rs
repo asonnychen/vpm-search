@@ -33,10 +33,15 @@ pub const LATENCY_SAMPLES: usize = 3;
 
 /// 探测主机名：TLS SNI 与 Host 都是它，连接却落在优选地址上。
 pub const PROBE_HOST: &str = "speed.cloudflare.com";
+/// 探测路径；端口按目标地址动态拼接（reqwest 的 resolve 只替换 IP，不替换端口）。
+pub const PROBE_PATH: &str = "/__down?bytes=0";
+
+/// 按目标端口拼出探测 URL：端口必须写在 URL 里，否则永远走 443。
+pub fn probe_url(port: u16) -> String {
+    format!("https://{PROBE_HOST}:{port}{PROBE_PATH}")
+}
 
 /// 延迟探测端点；`bytes=0` 只取响应头，不计传输时间。
-pub const PROBE_URL: &str = "https://speed.cloudflare.com/__down?bytes=0";
-
 /// 把底层错误摘要收拾成可读文案（去掉首尾空白）。
 pub fn describe_error(error: &str) -> String {
     error.trim().to_string()

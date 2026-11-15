@@ -106,9 +106,11 @@ pub fn evaluate(bytes: &[u64], elapsed: Duration, limit: Duration) -> Result<f64
 pub fn download_streams(
     client: &reqwest::blocking::Client,
     speed: &SpeedOptions,
+    port: u16,
     cancel: &AtomicBool,
 ) -> Result<f64, String> {
-    let url = speed.url();
+    // 端口必须写在 URL 里：reqwest 的 resolve 只替换 IP，不替换端口。
+    let url = format!("https://{}:{port}/__down?bytes={}", super::PROBE_HOST, speed.bytes_per_stream());
     let per_stream = speed.bytes_per_stream();
     let started = std::time::Instant::now();
 
