@@ -19,6 +19,8 @@ export default function PoolPanel() {
   const refreshCatalog = usePoolStore((state) => state.refreshCatalog);
   const fetchPool = usePoolStore((state) => state.fetchPool);
   const toggleSource = usePoolStore((state) => state.toggleSource);
+  const setAllChecked = usePoolStore((state) => state.setAllChecked);
+  const invertChecked = usePoolStore((state) => state.invertChecked);
   const batch = useProbeStore(selectProbeBatch);
 
   // 抓取、刷新与测试互斥：池子内容在换的时候不让重复发起，测试进行中也不抓。
@@ -32,6 +34,11 @@ export default function PoolPanel() {
 
   const checkedCount = sources.filter((s) => s.checked).length;
   const failedCount = sources.filter((s) => s.lastError).length;
+  // 批量勾选只作用于正常源：异常源不参与全选/反选。
+  const normalSources = sources.filter((s) => !s.broken);
+  const allNormalChecked =
+    normalSources.length > 0 && normalSources.every((s) => s.checked);
+  const someNormalChecked = normalSources.some((s) => s.checked);
 
   /** 每个源的前三条地址，作为抓取结果的快速预览。 */
   const previews = new Map<string, string[]>();
@@ -142,10 +149,63 @@ export default function PoolPanel() {
           <div className="border border-line rounded-[3px] bg-panel overflow-hidden flex flex-col">
             <div className="h-7 shrink-0 flex items-center justify-between px-2 border-b border-line bg-panel-2/70 text-[12px] text-dim">
               <span className="whitespace-nowrap">已抓取的优选源</span>
-              <span className="num whitespace-nowrap">
-                {checkedCount} / {sources.length} 勾选
-                {failedCount > 0 ? ` · ${failedCount} 个异常` : ""}
-              </span>
+              <div className="flex items-center gap-2 whitespace-nowrap">
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={allNormalChecked ? true : someNormalChecked ? "mixed" : false}
+                  aria-label="全选正常源 / 取消全选"
+                  title={
+                    normalSources.length === 0
+                      ? "还没有可勾选的正常源"
+                      : allNormalChecked
+                        ? "取消勾选所有正常源"
+                        : "勾选所有正常源（异常源不参与）"
+                  }
+                  disabled={normalSources.length === 0}
+                  onClick={() => void setAllChecked(!allNormalChecked)}
+                  className={cn(
+                    "size-3.5 grid place-items-center border rounded-[2px] leading-none",
+                    normalSources.length === 0
+                      ? "border-line-2 text-transparent cursor-not-allowed"
+                      : allNormalChecked || someNormalChecked
+                        ? "border-accent bg-accent text-white"
+                        : "border-line-2 text-transparent hover:border-muted",
+                  )}
+                >
+                  {allNormalChecked ? (
+                    <svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden>
+                      <path
+                        d="M2.6 6.3 4.7 8.4 9.4 3.6"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  ) : someNormalChecked ? (
+                    <span className="block w-[7px] h-[2px] rounded-full bg-white" />
+                  ) : null}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void invertChecked()}
+                  disabled={normalSources.length === 0}
+                  title="只在正常源之间翻转，异常源保持原样"
+                  className={cn(
+                    "text-[12px] leading-none",
+                    normalSources.length === 0
+                      ? "text-dim cursor-not-allowed"
+                      : "text-dim hover:text-accent",
+                  )}
+                >
+                  反选
+                </button>
+                <span className="num">
+                  {checkedCount} / {sources.length} 勾选
+                  {failedCount > 0 ? ` · ${failedCount} 个异常` : ""}
+                </span>
+              </div>
             </div>
             <div className="p-1.5 flex-1 min-h-[96px] max-h-[220px] overflow-auto flex flex-col gap-1">
               {sources.length === 0 ? (

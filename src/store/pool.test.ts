@@ -47,6 +47,7 @@ function fakePersistence(overrides: Partial<PoolPersistence> = {}): PoolPersiste
     refreshCatalog: vi.fn(async () => SNAPSHOT),
     fetchPool: vi.fn(async () => SNAPSHOT),
     setChecked: vi.fn(async () => {}),
+    setChecks: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -160,5 +161,61 @@ describe("池 store", () => {
       "https://bestcf.pages.dev/luoli/all.txt",
       true,
     );
+  });
+
+  it("全选只勾正常源，异常源不参与", async () => {
+    const setChecks = vi.fn(async () => {});
+    const store = createPoolStore(fakePersistence({ setChecks }));
+    await store.getState().load();
+
+    await store.getState().setAllChecked(true);
+
+    const [normal, broken] = store.getState().sources;
+    expect(normal!.checked).toBe(true);
+    expect(broken!.checked).toBe(false);
+    // 一次批量落库，只带正常源。
+    expect(setChecks).toHaveBeenCalledTimes(1);
+    expect(setChecks).toHaveBeenCalledWith([
+      { url: "https://bestcf.pages.dev/domain/all.txt", checked: true },
+    ]);
+  });
+
+  it("再次全选会取消所有正常源", async () => {
+    const store = createPoolStore(fakePersistence());
+    await store.getState().load();
+
+    await store.getState().setAllChecked(false);
+
+    expect(store.getState().sources[0]!.checked).toBe(false);
+  });
+
+  it("反选只翻转正常源，手动勾选的异常源保持原样", async () => {
+    const setChecks = vi.fn(async () => {});
+    const store = createPoolStore(fakePersistence({ setChecks }));
+    await store.getState().load();
+    await store.getState().toggleSource("https://bestcf.pages.dev/luoli/all.txt", true);
+
+    await store.getState().invertChecked();
+
+    const [normal, broken] = store.getState().sources;
+    expect(normal!.checked).toBe(false);
+    expect(broken!.checked).toBe(true);
+    expect(setChecks).toHaveBeenCalledWith([
+      { url: "https://bestcf.pages.dev/domain/all.txt", checked: false },
+    ]);
+  });
+
+  it("没有正常源时批量操作不落库", async () => {
+    const setChecks = vi.fn(async () => {});
+    const store = createPoolStore(fakePersistence());
+    await store.getState().load();
+    store.setState({
+      sources: store.getState().sources.map((s) => ({ ...s, broken: true })),
+    });
+
+    await store.getState().setAllChecked(true);
+    await store.getState().invertChecked();
+
+    expect(setChecks).not.toHaveBeenCalled();
   });
 });

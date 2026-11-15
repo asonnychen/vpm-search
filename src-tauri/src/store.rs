@@ -409,6 +409,22 @@ impl Store {
         Ok(())
     }
 
+    /// 一次事务批量设置勾选状态；未知 url 静默忽略。
+    pub fn set_source_checks(&self, checks: &[(String, bool)]) -> Result<()> {
+        if checks.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE pool_source SET checked = ?2 WHERE url = ?1")?;
+            for (url, checked) in checks {
+                stmt.execute(rusqlite::params![url, i64::from(*checked)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 用本次抓取的结果整体替换池内容。池是快照，不做增量合并。
     pub fn replace_pool_entries(&self, candidates: &[PoolCandidate], added_at: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -1206,6 +1222,12 @@ mod tests {
         assert!(sources[0].checked);
         assert!(!sources[1].checked);
         assert!(sources[1].broken);
+    }
+
+    #[test]
+    fn 手动勾选的异常源在刷新清单后保留() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_catalog(&catalog()).unwrap();
 
         // 用户手动勾上异常源后，再刷新清单不应被覆盖。
         store
@@ -1213,6 +1235,24 @@ mod tests {
             .unwrap();
         store.upsert_catalog(&catalog()).unwrap();
         let sources = store.list_pool_sources().unwrap();
+        assert!(sources[1].checked);
+    }
+
+    #[test]
+    fn 批量设置勾选状态忽略未知地址() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_catalog(&catalog()).unwrap();
+
+        store
+            .set_source_checks(&[
+                ("https://bestcf.pages.dev/domain/all.txt".to_string(), false),
+                ("https://bestcf.pages.dev/luoli/all.txt".to_string(), true),
+                ("https://bestcf.pages.dev/not-there.txt".to_string(), true),
+            ])
+            .unwrap();
+
+        let sources = store.list_pool_sources().unwrap();
+        assert!(!sources[0].checked);
         assert!(sources[1].checked);
     }
 

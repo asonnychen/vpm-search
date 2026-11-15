@@ -2219,6 +2219,82 @@ fn set_source_checked(
     result
 }
 
+/// 批量勾选/取消勾选（全选、反选），一次事务落库。
+#[derive(Debug, serde::Deserialize)]
+struct SourceCheck {
+    url: String,
+    checked: bool,
+}
+
+#[tauri::command]
+fn set_source_checks(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    checks: Vec<SourceCheck>,
+) -> Result<(), String> {
+    let trace = logs::new_trace_id();
+    let started = Instant::now();
+    let total = checks.len();
+    let selected = checks.iter().filter(|check| check.checked).count();
+    let pairs: Vec<(String, bool)> = checks
+        .into_iter()
+        .map(|check| (check.url, check.checked))
+        .collect();
+
+    let result = (|| -> Result<(), String> {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "存储锁已损坏".to_string())?;
+        let Some(store) = guard.as_ref() else {
+            return Err("数据库不可用".to_string());
+        };
+        store
+            .set_source_checks(&pairs)
+            .map_err(|e| format!("批量保存优选源勾选状态失败：{e}"))
+    })();
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(()) => {
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Info, "sources", "source.checks")
+                    .trace(&trace)
+                    .duration(duration_ms)
+                    .params(serde_json::json!({ "total": total, "selected": selected })),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Info,
+                &trace,
+                &format!("批量更新优选源勾选：{selected} / {total} 个勾选"),
+            );
+        }
+        Err(message) => {
+            log_app(
+                state.inner(),
+                &app,
+                AppLogRecord::new(LogLevel::Error, "sources", "source.checks")
+                    .trace(&trace)
+                    .duration(duration_ms)
+                    .params(serde_json::json!({ "total": total, "selected": selected }))
+                    .error(message, None),
+            );
+            log_operation(
+                state.inner(),
+                &app,
+                LogLevel::Error,
+                &trace,
+                &format!("批量更新优选源勾选失败：{message}"),
+            );
+        }
+    }
+    result
+}
+
 /// 导出结果：取消时 `cancelled` 为真，不写文件也不算失败。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2560,6 +2636,7 @@ pub fn run() {
             refresh_source_catalog,
             fetch_pool,
             set_source_checked,
+            set_source_checks,
             get_logs,
             clear_logs,
             probe_single,

@@ -115,6 +115,8 @@ export type PoolPersistence = {
     manualAddresses: string,
   ) => Promise<unknown>;
   setChecked: (url: string, checked: boolean) => Promise<void>;
+  /** 批量设置勾选，一次落库。 */
+  setChecks: (checks: Array<{ url: string; checked: boolean }>) => Promise<void>;
 };
 
 export type PoolStore = PoolSnapshot & {
@@ -128,6 +130,10 @@ export type PoolStore = PoolSnapshot & {
   refreshCatalog: () => Promise<void>;
   fetchPool: (manualAddresses: string, extraSourceUrls?: string) => Promise<void>;
   toggleSource: (url: string, checked: boolean) => Promise<void>;
+  /** 全选/取消全选：只作用于正常源，异常源不参与批量。 */
+  setAllChecked: (checked: boolean) => Promise<void>;
+  /** 反选：只在正常源之间翻转。 */
+  invertChecked: () => Promise<void>;
 };
 
 export function createPoolStore(persistence: PoolPersistence) {
@@ -210,6 +216,38 @@ export function createPoolStore(persistence: PoolPersistence) {
           set({ error: errorMessage(error) });
         }
       },
+
+      setAllChecked: async (checked) => {
+        const targets = get().sources.filter((s) => !s.broken);
+        if (targets.length === 0) return;
+        const urls = new Set(targets.map((s) => s.url));
+        set({
+          sources: get().sources.map((s) => (urls.has(s.url) ? { ...s, checked } : s)),
+        });
+        try {
+          await persistence.setChecks(targets.map((s) => ({ url: s.url, checked })));
+        } catch (error) {
+          set({ error: errorMessage(error) });
+        }
+      },
+
+      invertChecked: async () => {
+        const targets = get().sources.filter((s) => !s.broken);
+        if (targets.length === 0) return;
+        const next = new Map(targets.map((s) => [s.url, !s.checked]));
+        set({
+          sources: get().sources.map((s) =>
+            next.has(s.url) ? { ...s, checked: next.get(s.url)! } : s,
+          ),
+        });
+        try {
+          await persistence.setChecks(
+            [...next].map(([url, checked]) => ({ url, checked })),
+          );
+        } catch (error) {
+          set({ error: errorMessage(error) });
+        }
+      },
     };
   });
 }
@@ -230,6 +268,10 @@ export const tauriPoolPersistence: PoolPersistence = {
   setChecked: (url, checked) =>
     isTauriRuntime()
       ? invoke<void>("set_source_checked", { url, checked }).then(() => undefined)
+      : Promise.resolve(),
+  setChecks: (checks) =>
+    isTauriRuntime()
+      ? invoke<void>("set_source_checks", { checks }).then(() => undefined)
       : Promise.resolve(),
 };
 
